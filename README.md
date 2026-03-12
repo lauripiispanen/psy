@@ -36,9 +36,22 @@ psy ps
 
 ## Install
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap lauripiispanen/tap
+brew install psy
+```
+
+### From source
+
 ```bash
 cargo install --path .
 ```
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/lauripiispanen/psy/releases) — builds available for x86_64 and aarch64 on Linux, macOS, and Windows.
 
 ## CLI
 
