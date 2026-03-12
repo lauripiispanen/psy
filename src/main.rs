@@ -166,7 +166,10 @@ fn main() {
                         if let Ok(ps) = serde_json::from_value::<PsResponse>(data.clone()) {
                             print_ps_table(&ps);
                         } else {
-                            println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&data).unwrap_or_default()
+                            );
                         }
                     } else {
                         println!("No processes");
@@ -204,11 +207,7 @@ fn main() {
                     std::process::exit(1);
                 }
             } else {
-                let req = Request::logs(LogsArgs {
-                    name,
-                    tail,
-                    stream,
-                });
+                let req = Request::logs(LogsArgs { name, tail, stream });
                 send_and_print(req);
             }
         }
@@ -238,7 +237,10 @@ fn send_and_print(req: Request) {
     match client::send_command(req) {
         Ok(resp) if resp.ok => {
             if let Some(data) = resp.data {
-                println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
             }
         }
         Ok(resp) => {
@@ -276,15 +278,12 @@ fn print_ps_table(ps: &PsResponse) {
         return;
     }
     println!(
-        "{:<20} {:<8} {:<12} {:<12} {}",
-        "NAME", "PID", "STATUS", "RESTART", "UPTIME"
+        "{:<20} {:<8} {:<12} {:<12} UPTIME",
+        "NAME", "PID", "STATUS", "RESTART"
     );
     println!("{}", "-".repeat(64));
     for p in &ps.processes {
-        let pid_str = p
-            .pid
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".into());
+        let pid_str = p.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
         let uptime = p
             .uptime_secs
             .map(|s| format!("{s}s"))

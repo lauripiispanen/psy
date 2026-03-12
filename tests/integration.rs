@@ -37,7 +37,7 @@ impl PsyRoot {
         let pid = child.id();
 
         // Give root time to create its socket and start listening.
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(2));
 
         // Build the expected socket path (mirrors platform::socket_path).
         let sock = Self::socket_path_for(pid);
@@ -56,7 +56,7 @@ impl PsyRoot {
 
     #[cfg(windows)]
     fn socket_path_for(pid: u32) -> String {
-        format!("\\\\.\\pipe\\psy-{pid}")
+        format!(r"\\.\pipe\psy-{pid}")
     }
 
     /// Run a psy subcommand against this root, returning the Output.
@@ -107,9 +107,12 @@ fn sleep_cmd(secs: u64) -> Vec<String> {
 
 #[cfg(windows)]
 fn sleep_cmd(secs: u64) -> Vec<String> {
+    // ping sends one ICMP per second; -n (secs+1) waits ~secs seconds
     vec![
-        "cmd".into(), "/c".into(), "timeout".into(),
-        "/t".into(), secs.to_string(), "/nobreak".into(),
+        "ping".into(),
+        "-n".into(),
+        (secs + 1).to_string(),
+        "127.0.0.1".into(),
     ]
 }
 
@@ -262,10 +265,7 @@ fn test_down() {
 
     // Verify the socket is gone (Unix) or connection fails.
     let out = root.psy(&["ps"]);
-    assert!(
-        !out.status.success(),
-        "ps should fail after down"
-    );
+    assert!(!out.status.success(), "ps should fail after down");
 
     #[cfg(unix)]
     {
@@ -291,7 +291,8 @@ fn test_name_validation() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let combined = format!("{stdout}{stderr}");
     assert!(
-        !out.status.success() || combined.to_lowercase().contains("invalid")
+        !out.status.success()
+            || combined.to_lowercase().contains("invalid")
             || combined.to_lowercase().contains("error"),
         "invalid name should produce an error, got: {combined}"
     );
@@ -383,9 +384,27 @@ fn test_env_passing() {
     let root = PsyRoot::start(&to_refs(&sl));
 
     #[cfg(unix)]
-    let print_env = vec!["run", "envchild", "--env", "MY_VAR=hello123", "--", "sh", "-c", "echo $MY_VAR"];
+    let print_env = vec![
+        "run",
+        "envchild",
+        "--env",
+        "MY_VAR=hello123",
+        "--",
+        "sh",
+        "-c",
+        "echo $MY_VAR",
+    ];
     #[cfg(windows)]
-    let print_env = vec!["run", "envchild", "--env", "MY_VAR=hello123", "--", "cmd", "/c", "echo %MY_VAR%"];
+    let print_env = vec![
+        "run",
+        "envchild",
+        "--env",
+        "MY_VAR=hello123",
+        "--",
+        "cmd",
+        "/c",
+        "echo %MY_VAR%",
+    ];
 
     root.psy(&print_env);
     thread::sleep(Duration::from_secs(1));
@@ -405,12 +424,20 @@ fn test_logs_tail() {
 
     #[cfg(unix)]
     let many_lines = vec![
-        "run", "liner", "--", "sh", "-c",
+        "run",
+        "liner",
+        "--",
+        "sh",
+        "-c",
         "for i in $(seq 1 100); do echo line-$i; done",
     ];
     #[cfg(windows)]
     let many_lines = vec![
-        "run", "liner", "--", "cmd", "/c",
+        "run",
+        "liner",
+        "--",
+        "cmd",
+        "/c",
         "for /L %i in (1,1,100) do @echo line-%i",
     ];
 

@@ -8,6 +8,12 @@ use std::time::Duration;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{self, Pid};
 
+/// Holds the read and write ends of the death pipe.
+pub struct DeathPipe {
+    pub read_fd: RawFd,
+    pub write_fd: RawFd,
+}
+
 // ---------------------------------------------------------------------------
 // Root process setup
 // ---------------------------------------------------------------------------
@@ -67,10 +73,12 @@ pub fn pre_exec_hook() -> impl FnMut() -> io::Result<()> + Send + Sync + 'static
 ///
 /// Returns `(read_fd, write_fd)`. The root process keeps the write end open;
 /// child processes inherit the read end and watch for EOF.
-pub fn create_death_pipe() -> io::Result<(RawFd, RawFd)> {
-    let (read_fd, write_fd) =
-        unistd::pipe().map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    Ok((read_fd.into_raw_fd(), write_fd.into_raw_fd()))
+pub fn create_death_pipe() -> io::Result<DeathPipe> {
+    let (read_fd, write_fd) = unistd::pipe().map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+    Ok(DeathPipe {
+        read_fd: read_fd.into_raw_fd(),
+        write_fd: write_fd.into_raw_fd(),
+    })
 }
 
 /// Spawn a background thread that blocks on `read_fd`.
@@ -120,20 +128,18 @@ const UNIX_SOCK_MAX: usize = 104;
 ///
 /// If the resulting path is too long for a Unix domain socket (>= 104 bytes)
 /// we fall back to a shorter `/tmp/psy-<uid>/<pid>.sock` path.
-pub fn socket_path(pid: u32) -> PathBuf {
+pub fn socket_path(pid: u32) -> String {
     let uid = unistd::getuid();
     let candidate = primary_socket_dir(uid).join(format!("{pid}.sock"));
 
     if candidate.as_os_str().len() < UNIX_SOCK_MAX {
-        candidate
+        candidate.to_string_lossy().to_string()
     } else {
-        // Fallback to the shortest form we can manage.
-        let fallback = PathBuf::from(format!("/tmp/psy-{uid}/{pid}.sock"));
-        if fallback.as_os_str().len() < UNIX_SOCK_MAX {
+        let fallback = format!("/tmp/psy-{uid}/{pid}.sock");
+        if fallback.len() < UNIX_SOCK_MAX {
             fallback
         } else {
-            // Extremely unlikely, but be safe.
-            PathBuf::from(format!("/tmp/p-{pid}.sock"))
+            format!("/tmp/p-{pid}.sock")
         }
     }
 }

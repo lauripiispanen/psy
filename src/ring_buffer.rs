@@ -236,9 +236,7 @@ mod tests {
     #[test]
     fn display_format() {
         let line = LogLine {
-            timestamp: "2025-03-12T10:15:32.123Z"
-                .parse::<DateTime<Utc>>()
-                .unwrap(),
+            timestamp: "2025-03-12T10:15:32.123Z".parse::<DateTime<Utc>>().unwrap(),
             stream: Stream::Stdout,
             content: "content here".into(),
         };

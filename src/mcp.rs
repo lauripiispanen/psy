@@ -258,11 +258,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 Some("stderr") => StreamFilter::Stderr,
                 _ => StreamFilter::All,
             };
-            let req = Request::logs(LogsArgs {
-                name,
-                tail,
-                stream,
-            });
+            let req = Request::logs(LogsArgs { name, tail, stream });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
                 let text = resp
@@ -365,11 +361,7 @@ pub fn run() -> Result<(), String> {
         let req: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = JsonRpcResponse::error(
-                    None,
-                    -32700,
-                    format!("Parse error: {e}"),
-                );
+                let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
                 write_response(&mut out, &resp);
                 continue;
             }

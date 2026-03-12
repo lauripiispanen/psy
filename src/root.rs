@@ -1,13 +1,9 @@
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::os::unix::io::RawFd;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::sync::{watch, Mutex};
 
 use crate::platform;
@@ -29,15 +25,11 @@ pub type RootResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct SharedRoot {
     pub process_table: Arc<Mutex<HashMap<String, ProcessEntry>>>,
-    pub socket_path: PathBuf,
+    pub socket_path: String,
     pub psy_sock: String,
     pub psy_root_pid: u32,
     #[allow(dead_code)]
-    #[cfg(unix)]
-    pub death_pipe_write_fd: RawFd,
-    #[allow(dead_code)]
-    #[cfg(unix)]
-    pub death_pipe_read_fd: RawFd,
+    pub death_pipe: platform::DeathPipe,
     pub shutting_down: Arc<AtomicBool>,
     pub main_exit_tx: watch::Sender<Option<i32>>,
 }
@@ -53,24 +45,27 @@ pub struct PsyRoot {
 
 impl PsyRoot {
     pub fn new(_name: String) -> RootResult<Self> {
-        // Platform-specific root setup (setsid / subreaper)
+        // Platform-specific root setup (setsid / subreaper / Job Object)
         platform::setup_root();
 
         // Create the death pipe
-        let (death_pipe_read_fd, death_pipe_write_fd) = platform::create_death_pipe()?;
+        let death_pipe = platform::create_death_pipe()?;
 
         let pid = std::process::id();
         let socket_path = platform::socket_path(pid);
 
         // Clean up any stale socket from a previous run
-        platform::cleanup_stale_socket(&socket_path)?;
+        platform::cleanup_stale_socket(std::path::Path::new(&socket_path))?;
 
-        // Ensure the parent directory exists
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // Ensure the parent directory exists (Unix sockets need this)
+        #[cfg(unix)]
+        if let Some(parent) = std::path::Path::new(&socket_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
         }
 
-        let psy_sock = socket_path.to_string_lossy().to_string();
+        let psy_sock = socket_path.clone();
         let (main_exit_tx, main_exit_rx) = watch::channel(None);
 
         let shared = Arc::new(SharedRoot {
@@ -78,8 +73,7 @@ impl PsyRoot {
             socket_path,
             psy_sock,
             psy_root_pid: pid,
-            death_pipe_write_fd,
-            death_pipe_read_fd,
+            death_pipe,
             shutting_down: Arc::new(AtomicBool::new(false)),
             main_exit_tx,
         });
@@ -93,16 +87,15 @@ impl PsyRoot {
     /// Run the psy root server.
     ///
     /// `main_command` — the main process command (or `None` to use `$SHELL`).
-    /// `start_mcp` — whether to also launch an MCP server child.
     ///
     /// Returns the main process exit code.
-    pub async fn run(
-        mut self,
-        main_command: Option<Vec<String>>,
-    ) -> RootResult<i32> {
+    pub async fn run(mut self, main_command: Option<Vec<String>>) -> RootResult<i32> {
         // Determine the main command
         let main_cmd = main_command.unwrap_or_else(|| {
+            #[cfg(unix)]
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            #[cfg(windows)]
+            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
             vec![shell]
         });
 
@@ -117,11 +110,7 @@ impl PsyRoot {
                 true,
             );
 
-            let child = spawn_child(
-                &mut entry,
-                &self.shared.psy_sock,
-                self.shared.psy_root_pid,
-            )?;
+            let child = spawn_child(&mut entry, &self.shared.psy_sock, self.shared.psy_root_pid)?;
             entry.child = Some(child);
             table.insert("main".into(), entry);
         }
@@ -236,10 +225,7 @@ async fn handle_ps(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let table = root.process_table.lock().await;
     let processes: Vec<ProcessInfo> = table.values().map(|e| e.to_ps_entry()).collect();
     let ps_response = PsResponse { processes };
-    Response::ok(
-        &req.id,
-        Some(serde_json::to_value(ps_response).unwrap()),
-    )
+    Response::ok(&req.id, Some(serde_json::to_value(ps_response).unwrap()))
 }
 
 async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
@@ -307,14 +293,9 @@ async fn handle_stop(root: &Arc<SharedRoot>, req: &Request) -> Response {
         match table.get(&args.name) {
             Some(entry) if entry.state == ProcessState::Running => entry.pid,
             Some(_) => {
-                return Response::err(
-                    &req.id,
-                    format!("process '{}' is not running", args.name),
-                )
+                return Response::err(&req.id, format!("process '{}' is not running", args.name))
             }
-            None => {
-                return Response::err(&req.id, format!("process '{}' not found", args.name))
-            }
+            None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
         }
     };
 
@@ -353,12 +334,7 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
                 entry.env.clone(),
                 entry.restart_policy,
             ),
-            None => {
-                return Response::err(
-                    &req.id,
-                    format!("process '{}' not found", args.name),
-                )
-            }
+            None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
         }
     };
 
@@ -379,13 +355,7 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         let mut table = root.process_table.lock().await;
         table.remove(&args.name);
 
-        let mut entry = ProcessEntry::new(
-            args.name.clone(),
-            command,
-            env,
-            restart_policy,
-            false,
-        );
+        let mut entry = ProcessEntry::new(args.name.clone(), command, env, restart_policy, false);
 
         let child = match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
@@ -519,8 +489,8 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
 
             entry.pid = None;
 
-            let do_restart = !root.shutting_down.load(Ordering::Relaxed)
-                && should_restart(entry, exit_code);
+            let do_restart =
+                !root.shutting_down.load(Ordering::Relaxed) && should_restart(entry, exit_code);
             let backoff = calculate_backoff(entry.restarts);
             let is_main = entry.is_main;
 
@@ -563,11 +533,12 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
 }
 
 // ---------------------------------------------------------------------------
-// Socket listener
+// Socket listener — platform-specific
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 async fn run_socket_listener(root: Arc<SharedRoot>) -> RootResult<()> {
-    let listener = UnixListener::bind(&root.socket_path)?;
+    let listener = tokio::net::UnixListener::bind(&root.socket_path)?;
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -578,7 +549,7 @@ async fn run_socket_listener(root: Arc<SharedRoot>) -> RootResult<()> {
 
         let root_clone = Arc::clone(&root);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(root_clone, stream).await {
+            if let Err(e) = handle_unix_connection(root_clone, stream).await {
                 eprintln!("psy: connection error: {e}");
             }
         });
@@ -587,7 +558,8 @@ async fn run_socket_listener(root: Arc<SharedRoot>) -> RootResult<()> {
     Ok(())
 }
 
-async fn handle_connection(
+#[cfg(unix)]
+async fn handle_unix_connection(
     root: Arc<SharedRoot>,
     stream: tokio::net::UnixStream,
 ) -> RootResult<()> {
@@ -625,11 +597,96 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Handle a logs_follow request: stream log lines until the client disconnects.
+#[cfg(unix)]
 async fn handle_logs_follow(
     root: &Arc<SharedRoot>,
     req: &Request,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> RootResult<()> {
+    handle_logs_follow_impl(root, req, writer).await
+}
+
+// Windows: use tokio named pipes for IPC.
+#[cfg(windows)]
+async fn run_socket_listener(root: Arc<SharedRoot>) -> RootResult<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let pipe_name = &root.socket_path;
+
+    // Create the first pipe instance.
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(pipe_name)?;
+
+    loop {
+        // Wait for a client to connect.
+        server.connect().await?;
+        let connected = server;
+
+        // Create the next server instance immediately so clients don't get NotFound.
+        server = ServerOptions::new().create(pipe_name)?;
+
+        if root.shutting_down.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let root_clone = Arc::clone(&root);
+        tokio::spawn(async move {
+            if let Err(e) = handle_named_pipe_connection(root_clone, connected).await {
+                eprintln!("psy: connection error: {e}");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn handle_named_pipe_connection(
+    root: Arc<SharedRoot>,
+    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+) -> RootResult<()> {
+    let (reader, mut writer) = tokio::io::split(pipe);
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req: Request = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let err_resp = Response::err("", format!("invalid JSON: {e}"));
+                let mut json = serde_json::to_string(&err_resp)?;
+                json.push('\n');
+                writer.write_all(json.as_bytes()).await?;
+                continue;
+            }
+        };
+
+        if req.cmd == CMD_LOGS_FOLLOW {
+            handle_logs_follow_impl(&root, &req, &mut writer).await?;
+            return Ok(());
+        }
+
+        let resp = handle_request(&root, req).await;
+        let mut json = serde_json::to_string(&resp)?;
+        json.push('\n');
+        writer.write_all(json.as_bytes()).await?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared logs_follow implementation (generic over AsyncWrite)
+// ---------------------------------------------------------------------------
+
+async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
+    root: &Arc<SharedRoot>,
+    req: &Request,
+    writer: &mut W,
 ) -> RootResult<()> {
     let args: LogsArgs = match req
         .args

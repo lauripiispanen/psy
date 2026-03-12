@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+#[cfg(unix)]
 use crate::platform;
 use crate::protocol::{ProcessInfo, RestartPolicy};
 use crate::ring_buffer::{RingBuffer, Stream};
@@ -169,8 +170,18 @@ pub fn spawn_child(
     // Unix-specific pre_exec hook
     #[cfg(unix)]
     {
-        let mut hook = platform::pre_exec_hook();
-        unsafe { cmd.pre_exec(move || hook()) };
+        let hook = platform::pre_exec_hook();
+        unsafe { cmd.pre_exec(hook) };
+    }
+
+    // Windows: create each child in its own process group so
+    // GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) targets only
+    // that process and not the entire console session.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
     let mut child = cmd.spawn()?;
@@ -203,10 +214,7 @@ pub fn spawn_child(
 // ---------------------------------------------------------------------------
 
 /// Read lines from a child's stdout and push them into the ring buffer.
-pub async fn capture_output(
-    stdout: tokio::process::ChildStdout,
-    buf: Arc<RingBuffer>,
-) {
+pub async fn capture_output(stdout: tokio::process::ChildStdout, buf: Arc<RingBuffer>) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -215,10 +223,7 @@ pub async fn capture_output(
 }
 
 /// Read lines from a child's stderr and push them into the ring buffer.
-async fn capture_stderr(
-    stderr: tokio::process::ChildStderr,
-    buf: Arc<RingBuffer>,
-) {
+async fn capture_stderr(stderr: tokio::process::ChildStderr, buf: Arc<RingBuffer>) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
