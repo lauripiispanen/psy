@@ -1,0 +1,456 @@
+//! MCP (Model Context Protocol) JSON-RPC 2.0 server over stdin/stdout.
+//!
+//! On startup it connects to the psy root via PSY_SOCK so it can relay
+//! tool calls as psy protocol commands.
+
+use std::collections::HashMap;
+use std::io::{self, BufRead, Write};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::client;
+use crate::protocol::{
+    LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy, RunArgs, StopArgs, StreamFilter,
+};
+
+// ---------------------------------------------------------------------------
+// JSON-RPC types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcRequest {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    #[serde(default)]
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+}
+
+impl JsonRpcResponse {
+    fn success(id: Option<Value>, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn error(id: Option<Value>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool schema definitions
+// ---------------------------------------------------------------------------
+
+fn tool_schemas() -> Value {
+    json!({
+        "tools": [
+            {
+                "name": "psy_run",
+                "description": "Start a new managed process",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Unique name for the process"
+                        },
+                        "command": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Command and arguments to run"
+                        },
+                        "restart": {
+                            "type": "string",
+                            "enum": ["no", "on_failure", "always"],
+                            "description": "Restart policy (default: no)"
+                        },
+                        "env": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "description": "Additional environment variables"
+                        }
+                    },
+                    "required": ["name", "command"]
+                }
+            },
+            {
+                "name": "psy_ps",
+                "description": "List all managed processes and their status",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "psy_logs",
+                "description": "Retrieve recent log output from a managed process",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Process name"
+                        },
+                        "tail": {
+                            "type": "integer",
+                            "description": "Number of lines to return (default: 50)"
+                        },
+                        "stream": {
+                            "type": "string",
+                            "enum": ["all", "stdout", "stderr"],
+                            "description": "Which output stream to show (default: all)"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "psy_stop",
+                "description": "Stop a running managed process",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Process name to stop"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "psy_restart",
+                "description": "Restart a managed process",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Process name to restart"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            }
+        ]
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tool call dispatch
+// ---------------------------------------------------------------------------
+
+fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
+    match tool_name {
+        "psy_run" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: name")?
+                .to_string();
+            let command: Vec<String> = args
+                .get("command")
+                .and_then(|v| v.as_array())
+                .ok_or("missing required parameter: command")?
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            let restart = match args.get("restart").and_then(|v| v.as_str()) {
+                Some("on_failure") => RestartPolicy::OnFailure,
+                Some("always") => RestartPolicy::Always,
+                _ => RestartPolicy::No,
+            };
+            let env: HashMap<String, String> = args
+                .get("env")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let req = Request::run(RunArgs {
+                name,
+                command,
+                restart,
+                env,
+            });
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                Ok(json!({
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&resp.data).unwrap_or_default()
+                }))
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
+        }
+
+        "psy_ps" => {
+            let req = Request::ps();
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                let text = if let Some(data) = &resp.data {
+                    if let Ok(ps) = serde_json::from_value::<PsResponse>(data.clone()) {
+                        format_ps_table(&ps)
+                    } else {
+                        serde_json::to_string_pretty(data).unwrap_or_default()
+                    }
+                } else {
+                    "No processes".to_string()
+                };
+                Ok(json!({ "type": "text", "text": text }))
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
+        }
+
+        "psy_logs" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: name")?
+                .to_string();
+            let tail = args
+                .get("tail")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .or(Some(50));
+            let stream = match args.get("stream").and_then(|v| v.as_str()) {
+                Some("stdout") => StreamFilter::Stdout,
+                Some("stderr") => StreamFilter::Stderr,
+                _ => StreamFilter::All,
+            };
+            let req = Request::logs(LogsArgs {
+                name,
+                tail,
+                stream,
+            });
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                let text = resp
+                    .data
+                    .map(|d| serde_json::to_string_pretty(&d).unwrap_or_default())
+                    .unwrap_or_else(|| "(no output)".into());
+                Ok(json!({ "type": "text", "text": text }))
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
+        }
+
+        "psy_stop" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: name")?
+                .to_string();
+            let req = Request::stop(StopArgs { name });
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                Ok(json!({ "type": "text", "text": "stopped" }))
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
+        }
+
+        "psy_restart" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: name")?
+                .to_string();
+            let req = Request::restart(RestartArgs { name });
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                Ok(json!({ "type": "text", "text": "restarted" }))
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
+        }
+
+        _ => Err(format!("unknown tool: {tool_name}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn format_ps_table(ps: &PsResponse) -> String {
+    if ps.processes.is_empty() {
+        return "No processes running".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<20} {:<8} {:<12} {:<12} {}\n",
+        "NAME", "PID", "STATUS", "RESTART", "UPTIME"
+    ));
+    out.push_str(&"-".repeat(64));
+    out.push('\n');
+    for p in &ps.processes {
+        let pid_str = p.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let uptime = p
+            .uptime_secs
+            .map(|s| format!("{s}s"))
+            .unwrap_or_else(|| "-".into());
+        let restart = format!("{:?}", p.restart_policy).to_lowercase();
+        out.push_str(&format!(
+            "{:<20} {:<8} {:<12} {:<12} {}\n",
+            p.name, pid_str, p.status, restart, uptime
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+/// Run the MCP server, reading JSON-RPC requests from stdin and writing
+/// responses to stdout.
+pub fn run() -> Result<(), String> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let reader = stdin.lock();
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = JsonRpcResponse::error(
+                    None,
+                    -32700,
+                    format!("Parse error: {e}"),
+                );
+                write_response(&mut out, &resp);
+                continue;
+            }
+        };
+
+        let resp = dispatch(&req);
+        if let Some(resp) = resp {
+            write_response(&mut out, &resp);
+        }
+    }
+
+    Ok(())
+}
+
+fn write_response(out: &mut impl Write, resp: &JsonRpcResponse) {
+    if let Ok(json) = serde_json::to_string(resp) {
+        let _ = writeln!(out, "{json}");
+        let _ = out.flush();
+    }
+}
+
+fn dispatch(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    match req.method.as_str() {
+        "initialize" => {
+            let result = json!({
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {
+                    "name": "psy",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "tools": {}
+                }
+            });
+            Some(JsonRpcResponse::success(req.id.clone(), result))
+        }
+
+        // `initialized` is a notification (no id) -- no response required.
+        "notifications/initialized" | "initialized" => None,
+
+        "tools/list" => {
+            let schemas = tool_schemas();
+            Some(JsonRpcResponse::success(req.id.clone(), schemas))
+        }
+
+        "tools/call" => {
+            let params = req.params.as_ref();
+            let tool_name = params
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let arguments = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or(json!({}));
+
+            match handle_tool_call(tool_name, &arguments) {
+                Ok(content) => {
+                    let result = json!({
+                        "content": [content],
+                        "isError": false
+                    });
+                    Some(JsonRpcResponse::success(req.id.clone(), result))
+                }
+                Err(e) => {
+                    let result = json!({
+                        "content": [{
+                            "type": "text",
+                            "text": e
+                        }],
+                        "isError": true
+                    });
+                    Some(JsonRpcResponse::success(req.id.clone(), result))
+                }
+            }
+        }
+
+        _ => Some(JsonRpcResponse::error(
+            req.id.clone(),
+            -32601,
+            format!("Method not found: {}", req.method),
+        )),
+    }
+}
