@@ -11,25 +11,12 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test-unix:
+  test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --verbose
-      - name: Unit tests
-        run: cargo test --verbose
-      - name: Integration tests
-        run: cargo test --verbose -- --ignored --nocapture
-
-  test-windows:
-    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
