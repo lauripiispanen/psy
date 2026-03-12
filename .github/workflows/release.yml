@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run tests
+        run: cargo test --verbose
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      - name: Package binary (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../psy-${{ matrix.target }}.tar.gz psy
+          cd ../../..
+          shasum -a 256 psy-${{ matrix.target }}.tar.gz > psy-${{ matrix.target }}.tar.gz.sha256
+        shell: bash
+
+      - name: Package binary (Windows)
+        if: contains(matrix.target, 'windows')
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../psy-${{ matrix.target }}.zip psy.exe
+          cd ../../..
+          certutil -hashfile psy-${{ matrix.target }}.zip SHA256 | findstr /v "hash" > psy-${{ matrix.target }}.zip.sha256
+        shell: cmd
+
+      - name: Upload artifact (Unix)
+        if: "!contains(matrix.target, 'windows')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: psy-${{ matrix.target }}
+          path: |
+            psy-${{ matrix.target }}.tar.gz
+            psy-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload artifact (Windows)
+        if: contains(matrix.target, 'windows')
+        uses: actions/upload-artifact@v4
+        with:
+          name: psy-${{ matrix.target }}
+          path: |
+            psy-${{ matrix.target }}.zip
+            psy-${{ matrix.target }}.zip.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Generate release notes from commits
+        id: notes
+        run: |
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${{ github.ref_name }}"
+          else
+            RANGE="${{ github.ref_name }}"
+          fi
+          # Build notes from commit subjects (skip version bump / tag commits)
+          NOTES=$(git log --pretty=format:"- %s" "$RANGE" --no-merges | grep -v -i "^- bump version\|^- v[0-9]\|^- chore" || true)
+          if [ -z "$NOTES" ]; then
+            NOTES="Maintenance release."
+          fi
+          # Write to file to preserve newlines
+          echo "$NOTES" > /tmp/release-notes.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          body_path: /tmp/release-notes.txt
+          files: |
+            artifacts/psy-*.tar.gz
+            artifacts/psy-*.zip
+            artifacts/psy-*.sha256
