@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 
 use crate::client;
 use crate::protocol::{
-    LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy, RunArgs, StopArgs, StreamFilter,
+    HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
+    RunArgs, StopArgs, StreamFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,26 @@ fn tool_schemas() -> Value {
                             "type": "string",
                             "enum": ["all", "stdout", "stderr"],
                             "description": "Which output stream to show (default: all)"
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "Show logs since this RFC 3339 timestamp (e.g. 2026-03-12T20:00:00Z)"
+                        },
+                        "until": {
+                            "type": "string",
+                            "description": "Show logs until this RFC 3339 timestamp"
+                        },
+                        "grep": {
+                            "type": "string",
+                            "description": "Filter logs by case-insensitive substring match"
+                        },
+                        "run": {
+                            "type": "integer",
+                            "description": "Show logs from a specific run ID (see psy_history)"
+                        },
+                        "previous": {
+                            "type": "boolean",
+                            "description": "Show logs from the previous run (before the current one)"
                         }
                     },
                     "required": ["name"]
@@ -163,6 +184,20 @@ fn tool_schemas() -> Value {
                         "name": {
                             "type": "string",
                             "description": "Process name to restart"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "psy_history",
+                "description": "Show run history for a managed process. Use this to check if a process has been crashing repeatedly, and to find run IDs for querying past logs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Process name"
                         }
                     },
                     "required": ["name"]
@@ -211,6 +246,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 command,
                 restart,
                 env,
+                attach: false,
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
@@ -258,7 +294,36 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 Some("stderr") => StreamFilter::Stderr,
                 _ => StreamFilter::All,
             };
-            let req = Request::logs(LogsArgs { name, tail, stream });
+            let since = args
+                .get("since")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let until = args
+                .get("until")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let grep = args
+                .get("grep")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let run = args
+                .get("run")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            let previous = args
+                .get("previous")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let req = Request::logs(LogsArgs {
+                name,
+                tail,
+                stream,
+                since,
+                until,
+                grep,
+                run,
+                previous,
+            });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
                 let text = resp
@@ -281,6 +346,30 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
                 Ok(json!({ "type": "text", "text": "stopped" }))
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
+        }
+
+        "psy_history" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: name")?
+                .to_string();
+            let req = Request::history(HistoryArgs { name });
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                let text = if let Some(data) = &resp.data {
+                    if let Ok(history) = serde_json::from_value::<HistoryResponse>(data.clone()) {
+                        format_history_table(&history)
+                    } else {
+                        serde_json::to_string_pretty(data).unwrap_or_default()
+                    }
+                } else {
+                    "No history".to_string()
+                };
+                Ok(json!({ "type": "text", "text": text }))
             } else {
                 Err(resp.error.unwrap_or_else(|| "unknown error".into()))
             }
@@ -337,6 +426,38 @@ fn format_ps_table(ps: &PsResponse) -> String {
         out.push_str(&format!(
             "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}\n",
             p.name, pid_str, p.status, exit_str, uptime, p.restarts, restart
+        ));
+    }
+    out
+}
+
+fn format_history_table(history: &HistoryResponse) -> String {
+    if history.runs.is_empty() {
+        return format!("No runs recorded for '{}'", history.name);
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<6} {:<10} {:<8} {:<28} {}\n",
+        "RUN", "STATUS", "EXIT", "STARTED", "DURATION"
+    ));
+    out.push_str(&"-".repeat(68));
+    out.push('\n');
+    for r in &history.runs {
+        let exit_str = if let Some(sig) = &r.signal {
+            sig.clone()
+        } else {
+            r.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into())
+        };
+        let started = r.started_at.as_deref().unwrap_or("-");
+        let duration = r
+            .duration_secs
+            .map(|s| format_uptime(s))
+            .unwrap_or_else(|| "-".into());
+        out.push_str(&format!(
+            "{:<6} {:<10} {:<8} {:<28} {}\n",
+            r.run_id, r.status, exit_str, started, duration
         ));
     }
     out

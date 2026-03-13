@@ -35,6 +35,21 @@ pub struct LogLineResponse {
     pub content: String,
 }
 
+/// Stdin data sent from client to root during an attach session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StdinData {
+    pub stdin: String,
+}
+
+/// Sent by root when an attach session ends because the child exited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetachNotice {
+    pub detached: bool,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 // ---------------------------------------------------------------------------
 // Commands (as constants for easy matching)
 // ---------------------------------------------------------------------------
@@ -46,6 +61,7 @@ pub const CMD_LOGS_FOLLOW: &str = "logs_follow";
 pub const CMD_STOP: &str = "stop";
 pub const CMD_RESTART: &str = "restart";
 pub const CMD_DOWN: &str = "down";
+pub const CMD_HISTORY: &str = "history";
 
 // ---------------------------------------------------------------------------
 // Argument / payload types
@@ -59,6 +75,8 @@ pub struct RunArgs {
     pub restart: RestartPolicy,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub attach: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -77,6 +95,41 @@ pub struct LogsArgs {
     pub tail: Option<usize>,
     #[serde(default)]
     pub stream: StreamFilter,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub grep: Option<String>,
+    #[serde(default)]
+    pub run: Option<u32>,
+    #[serde(default)]
+    pub previous: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryArgs {
+    pub name: String,
+}
+
+// ---------------------------------------------------------------------------
+// History response payload
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunInfo {
+    pub run_id: u32,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub started_at: Option<String>,
+    pub duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub name: String,
+    pub runs: Vec<RunInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -182,6 +235,13 @@ impl Request {
 
     pub fn down() -> Self {
         Self::new(CMD_DOWN, None)
+    }
+
+    pub fn history(args: HistoryArgs) -> Self {
+        Self::new(
+            CMD_HISTORY,
+            Some(serde_json::to_value(args).expect("serialize HistoryArgs")),
+        )
     }
 }
 

@@ -8,7 +8,8 @@ use tokio::sync::{watch, Mutex};
 
 use crate::platform;
 use crate::process::{
-    calculate_backoff, should_restart, spawn_child, validate_name, ProcessEntry, ProcessState,
+    calculate_backoff, should_restart, spawn_child, spawn_child_attached, validate_name,
+    ProcessEntry, ProcessState,
 };
 use crate::protocol::*;
 use crate::ring_buffer::Stream as RBStream;
@@ -192,21 +193,27 @@ async fn wait_for_exit_or_signal(
 // Request handling
 // ---------------------------------------------------------------------------
 
-async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> Response {
+enum HandleResult {
+    Response(Response),
+    AttachSession { name: String, response: Response },
+}
+
+async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
     match req.cmd.as_str() {
         CMD_RUN => handle_run(root, &req).await,
-        CMD_PS => handle_ps(root, &req).await,
-        CMD_LOGS => handle_logs(root, &req).await,
-        CMD_STOP => handle_stop(root, &req).await,
-        CMD_RESTART => handle_restart(root, &req).await,
-        CMD_DOWN => handle_down(root, &req).await,
-        _ => Response::err(&req.id, format!("unknown command: {}", req.cmd)),
+        CMD_PS => HandleResult::Response(handle_ps(root, &req).await),
+        CMD_LOGS => HandleResult::Response(handle_logs(root, &req).await),
+        CMD_STOP => HandleResult::Response(handle_stop(root, &req).await),
+        CMD_RESTART => HandleResult::Response(handle_restart(root, &req).await),
+        CMD_DOWN => HandleResult::Response(handle_down(root, &req).await),
+        CMD_HISTORY => HandleResult::Response(handle_history(root, &req).await),
+        _ => HandleResult::Response(Response::err(&req.id, format!("unknown command: {}", req.cmd))),
     }
 }
 
-async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> Response {
+async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> HandleResult {
     if root.shutting_down.load(Ordering::Relaxed) {
-        return Response::err(&req.id, "server is shutting down");
+        return HandleResult::Response(Response::err(&req.id, "server is shutting down"));
     }
 
     let args: RunArgs = match req
@@ -215,25 +222,37 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> Response {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
     {
         Some(a) => a,
-        None => return Response::err(&req.id, "invalid or missing run args"),
+        None => return HandleResult::Response(Response::err(&req.id, "invalid or missing run args")),
     };
 
     if !validate_name(&args.name) {
-        return Response::err(
+        return HandleResult::Response(Response::err(
             &req.id,
             "invalid name: must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,62}",
-        );
+        ));
     }
 
+    let attach = args.attach;
     let mut table = root.process_table.lock().await;
 
     // Allow replacing stopped/failed tombstones; only reject if still running
-    if let Some(existing) = table.get(&args.name) {
+    // Preserve run history from the old entry
+    let old_history = if let Some(existing) = table.get_mut(&args.name) {
         if existing.state == ProcessState::Running {
-            return Response::err(&req.id, format!("process '{}' is already running", args.name));
+            return HandleResult::Response(Response::err(
+                &req.id,
+                format!("process '{}' is already running", args.name),
+            ));
         }
+        // Archive the old entry's current run, then take its history
+        existing.archive_current_run();
+        let history = std::mem::take(&mut existing.run_history);
+        let next_id = existing.current_run_id;
         table.remove(&args.name);
-    }
+        Some((history, next_id))
+    } else {
+        None
+    };
 
     let mut entry = ProcessEntry::new(
         args.name.clone(),
@@ -243,9 +262,22 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> Response {
         false,
     );
 
-    let child = match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
-        Ok(c) => c,
-        Err(e) => return Response::err(&req.id, format!("spawn failed: {e}")),
+    // Restore history from previous incarnation
+    if let Some((history, next_id)) = old_history {
+        entry.run_history = history;
+        entry.current_run_id = next_id;
+    }
+
+    let child = if attach {
+        match spawn_child_attached(&mut entry, &root.psy_sock, root.psy_root_pid) {
+            Ok(c) => c,
+            Err(e) => return HandleResult::Response(Response::err(&req.id, format!("spawn failed: {e}"))),
+        }
+    } else {
+        match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
+            Ok(c) => c,
+            Err(e) => return HandleResult::Response(Response::err(&req.id, format!("spawn failed: {e}"))),
+        }
     };
 
     entry.child = Some(child);
@@ -255,14 +287,21 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> Response {
 
     // Spawn a monitor task for this child
     let root_clone = Arc::clone(root);
+    let monitor_name = name.clone();
     tokio::spawn(async move {
-        monitor_child(root_clone, name).await;
+        monitor_child(root_clone, monitor_name).await;
     });
 
-    Response::ok(
+    let response = Response::ok(
         &req.id,
         Some(serde_json::json!({ "name": args.name, "status": "running" })),
-    )
+    );
+
+    if attach {
+        HandleResult::AttachSession { name, response }
+    } else {
+        HandleResult::Response(response)
+    }
 }
 
 async fn handle_ps(root: &Arc<SharedRoot>, req: &Request) -> Response {
@@ -282,15 +321,63 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
         None => return Response::err(&req.id, "invalid or missing logs args"),
     };
 
+    let since = args
+        .since
+        .as_deref()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        })
+        .transpose();
+    let since = match since {
+        Ok(s) => s,
+        Err(e) => return Response::err(&req.id, format!("invalid since timestamp: {e}")),
+    };
+
+    let until = args
+        .until
+        .as_deref()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        })
+        .transpose();
+    let until = match until {
+        Ok(u) => u,
+        Err(e) => return Response::err(&req.id, format!("invalid until timestamp: {e}")),
+    };
+
     let table = root.process_table.lock().await;
     let entry = match table.get(&args.name) {
         Some(e) => e,
         None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
     };
 
+    // Resolve which run's buffers to use
+    let (stdout_buf, stderr_buf) = if args.previous {
+        // --previous: the run before the current one
+        if entry.run_history.is_empty() {
+            return Response::err(&req.id, "no previous run");
+        }
+        let prev = entry.run_history.last().unwrap();
+        (Arc::clone(&prev.stdout_buf), Arc::clone(&prev.stderr_buf))
+    } else if let Some(run_id) = args.run {
+        if run_id == entry.current_run_id {
+            (Arc::clone(&entry.stdout_buf), Arc::clone(&entry.stderr_buf))
+        } else {
+            match entry.run_history.iter().find(|r| r.run_id == run_id) {
+                Some(record) => (Arc::clone(&record.stdout_buf), Arc::clone(&record.stderr_buf)),
+                None => return Response::err(&req.id, format!("run {} not found", run_id)),
+            }
+        }
+    } else {
+        (Arc::clone(&entry.stdout_buf), Arc::clone(&entry.stderr_buf))
+    };
+
     // Collect lines from both stdout and stderr buffers, merge by timestamp
-    let stdout_lines = entry.stdout_buf.lines(None, args.stream);
-    let stderr_lines = entry.stderr_buf.lines(None, args.stream);
+    let grep_ref = args.grep.as_deref();
+    let stdout_lines = stdout_buf.lines(None, args.stream, since, until, grep_ref);
+    let stderr_lines = stderr_buf.lines(None, args.stream, since, until, grep_ref);
 
     let mut all_lines: Vec<_> = stdout_lines
         .into_iter()
@@ -371,8 +458,8 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         None => return Response::err(&req.id, "invalid or missing restart args"),
     };
 
-    // Get info needed to stop and respawn, and preserve log buffers
-    let (pid, command, env, restart_policy, stdout_buf, stderr_buf) = {
+    // Get info needed to stop and respawn
+    let (pid, command, env, restart_policy) = {
         let mut table = root.process_table.lock().await;
         match table.get_mut(&args.name) {
             Some(entry) => {
@@ -382,8 +469,6 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
                     entry.command.clone(),
                     entry.env.clone(),
                     entry.restart_policy,
-                    Arc::clone(&entry.stdout_buf),
-                    Arc::clone(&entry.stderr_buf),
                 )
             }
             None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
@@ -402,14 +487,21 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Remove old entry and re-create, preserving log buffers
+    // Archive current run and re-create with fresh buffers
     {
         let mut table = root.process_table.lock().await;
+        // Archive the old run's state and take the history
+        let (history, next_id) = if let Some(old) = table.get_mut(&args.name) {
+            old.archive_current_run();
+            (std::mem::take(&mut old.run_history), old.current_run_id)
+        } else {
+            (Vec::new(), 1)
+        };
         table.remove(&args.name);
 
         let mut entry = ProcessEntry::new(args.name.clone(), command, env, restart_policy, false);
-        entry.stdout_buf = stdout_buf;
-        entry.stderr_buf = stderr_buf;
+        entry.run_history = history;
+        entry.current_run_id = next_id;
 
         let child = match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
@@ -442,6 +534,33 @@ async fn handle_down(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let _ = root.main_exit_tx.send(Some(0));
 
     Response::ok(&req.id, Some(serde_json::json!({ "status": "shutdown" })))
+}
+
+async fn handle_history(root: &Arc<SharedRoot>, req: &Request) -> Response {
+    let args: HistoryArgs = match req
+        .args
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(a) => a,
+        None => return Response::err(&req.id, "invalid or missing history args"),
+    };
+
+    let table = root.process_table.lock().await;
+    let entry = match table.get(&args.name) {
+        Some(e) => e,
+        None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
+    };
+
+    let mut runs: Vec<RunInfo> = entry.run_history.iter().map(|r| r.to_run_info()).collect();
+    runs.push(entry.current_run_info());
+
+    let history = HistoryResponse {
+        name: args.name,
+        runs,
+    };
+
+    Response::ok(&req.id, Some(serde_json::to_value(history).unwrap()))
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +704,9 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
 
             entry.restarts += 1;
 
+            // Archive the completed run and start fresh buffers
+            entry.archive_current_run();
+
             match spawn_child(entry, &root.psy_sock, root.psy_root_pid) {
                 Ok(child) => {
                     entry.child = Some(child);
@@ -634,7 +756,8 @@ async fn handle_unix_connection(
     stream: tokio::net::UnixStream,
 ) -> RootResult<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut buf_reader = BufReader::new(reader);
+    let mut lines = (&mut buf_reader).lines();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -658,10 +781,29 @@ async fn handle_unix_connection(
             return Ok(());
         }
 
-        let resp = handle_request(&root, req).await;
-        let mut json = serde_json::to_string(&resp)?;
-        json.push('\n');
-        writer.write_all(json.as_bytes()).await?;
+        let result = handle_request(&root, req).await;
+        match result {
+            HandleResult::Response(resp) => {
+                let mut json = serde_json::to_string(&resp)?;
+                json.push('\n');
+                writer.write_all(json.as_bytes()).await?;
+            }
+            HandleResult::AttachSession { name, response } => {
+                let mut json = serde_json::to_string(&response)?;
+                json.push('\n');
+                writer.write_all(json.as_bytes()).await?;
+                // Enter bidirectional attach session
+                handle_attach_session_impl(
+                    &root,
+                    &response.id,
+                    &name,
+                    &mut buf_reader,
+                    &mut writer,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
     }
 
     Ok(())
@@ -717,7 +859,8 @@ async fn handle_named_pipe_connection(
     pipe: tokio::net::windows::named_pipe::NamedPipeServer,
 ) -> RootResult<()> {
     let (reader, mut writer) = tokio::io::split(pipe);
-    let mut lines = BufReader::new(reader).lines();
+    let mut buf_reader = BufReader::new(reader);
+    let mut lines = (&mut buf_reader).lines();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -740,10 +883,28 @@ async fn handle_named_pipe_connection(
             return Ok(());
         }
 
-        let resp = handle_request(&root, req).await;
-        let mut json = serde_json::to_string(&resp)?;
-        json.push('\n');
-        writer.write_all(json.as_bytes()).await?;
+        let result = handle_request(&root, req).await;
+        match result {
+            HandleResult::Response(resp) => {
+                let mut json = serde_json::to_string(&resp)?;
+                json.push('\n');
+                writer.write_all(json.as_bytes()).await?;
+            }
+            HandleResult::AttachSession { name, response } => {
+                let mut json = serde_json::to_string(&response)?;
+                json.push('\n');
+                writer.write_all(json.as_bytes()).await?;
+                handle_attach_session_impl(
+                    &root,
+                    &response.id,
+                    &name,
+                    &mut buf_reader,
+                    &mut writer,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
     }
 
     Ok(())
@@ -773,6 +934,14 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
         }
     };
 
+    let since = args
+        .since
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let grep = args.grep.clone();
+
     let (mut stdout_rx, mut stderr_rx) = {
         let table = root.process_table.lock().await;
         let entry = match table.get(&args.name) {
@@ -786,9 +955,10 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
             }
         };
 
-        // Send existing tail lines first
-        let stdout_lines = entry.stdout_buf.lines(None, args.stream);
-        let stderr_lines = entry.stderr_buf.lines(None, args.stream);
+        // Send existing tail lines first (with since/grep filtering)
+        let grep_ref = grep.as_deref();
+        let stdout_lines = entry.stdout_buf.lines(None, args.stream, since, None, grep_ref);
+        let stderr_lines = entry.stderr_buf.lines(None, args.stream, since, None, grep_ref);
 
         let mut all_lines: Vec<_> = stdout_lines
             .into_iter()
@@ -854,6 +1024,25 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
             continue;
         }
 
+        // Apply since filter for streamed lines
+        if let Some(ref s) = since {
+            if log_line.timestamp < *s {
+                continue;
+            }
+        }
+
+        // Apply grep filter for streamed lines
+        if let Some(ref pattern) = grep {
+            if !pattern.is_empty()
+                && !log_line
+                    .content
+                    .to_lowercase()
+                    .contains(&pattern.to_lowercase())
+            {
+                continue;
+            }
+        }
+
         let stream_kind = match log_line.stream {
             RBStream::Stdout => StreamKind::Stdout,
             RBStream::Stderr => StreamKind::Stderr,
@@ -872,6 +1061,140 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
         if writer.write_all(json.as_bytes()).await.is_err() {
             // Client disconnected
             break;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Attach session implementation (generic over AsyncRead + AsyncWrite)
+// ---------------------------------------------------------------------------
+
+async fn handle_attach_session_impl<R, W>(
+    root: &Arc<SharedRoot>,
+    req_id: &str,
+    name: &str,
+    reader: &mut R,
+    writer: &mut W,
+) -> RootResult<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (mut stdout_rx, mut stderr_rx) = {
+        let table = root.process_table.lock().await;
+        let entry = match table.get(name) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        (entry.stdout_buf.subscribe(), entry.stderr_buf.subscribe())
+    };
+
+    let mut stdin_buf = String::new();
+    loop {
+        stdin_buf.clear();
+        tokio::select! {
+            // Read stdin from client
+            result = reader.read_line(&mut stdin_buf) => {
+                match result {
+                    Ok(0) | Err(_) => {
+                        // Client disconnected — detach but don't kill child
+                        break;
+                    }
+                    Ok(_) => {
+                        // Parse as StdinData
+                        if let Ok(stdin_data) = serde_json::from_str::<crate::protocol::StdinData>(&stdin_buf) {
+                            let mut table = root.process_table.lock().await;
+                            if let Some(entry) = table.get_mut(name) {
+                                if let Some(ref mut stdin_handle) = entry.stdin_handle {
+                                    let _ = stdin_handle.write_all(stdin_data.stdin.as_bytes()).await;
+                                    let _ = stdin_handle.flush().await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Forward stdout
+            result = stdout_rx.recv() => {
+                match result {
+                    Ok(log_line) => {
+                        let stream_kind = match log_line.stream {
+                            RBStream::Stdout => StreamKind::Stdout,
+                            RBStream::Stderr => StreamKind::Stderr,
+                        };
+                        let log_resp = LogLineResponse {
+                            id: req_id.to_string(),
+                            name: name.to_string(),
+                            timestamp: log_line.timestamp.to_rfc3339(),
+                            stream: stream_kind,
+                            content: log_line.content,
+                        };
+                        let mut json = serde_json::to_string(&log_resp).unwrap_or_default();
+                        json.push('\n');
+                        if writer.write_all(json.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Child exited — send detach notice
+                        let exit_code = {
+                            let table = root.process_table.lock().await;
+                            table.get(name).and_then(|e| e.exit_status)
+                        };
+                        let notice = crate::protocol::DetachNotice {
+                            detached: true,
+                            reason: "exited".into(),
+                            exit_code,
+                        };
+                        let mut json = serde_json::to_string(&notice).unwrap_or_default();
+                        json.push('\n');
+                        let _ = writer.write_all(json.as_bytes()).await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            // Forward stderr
+            result = stderr_rx.recv() => {
+                match result {
+                    Ok(log_line) => {
+                        let stream_kind = match log_line.stream {
+                            RBStream::Stdout => StreamKind::Stdout,
+                            RBStream::Stderr => StreamKind::Stderr,
+                        };
+                        let log_resp = LogLineResponse {
+                            id: req_id.to_string(),
+                            name: name.to_string(),
+                            timestamp: log_line.timestamp.to_rfc3339(),
+                            stream: stream_kind,
+                            content: log_line.content,
+                        };
+                        let mut json = serde_json::to_string(&log_resp).unwrap_or_default();
+                        json.push('\n');
+                        if writer.write_all(json.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let exit_code = {
+                            let table = root.process_table.lock().await;
+                            table.get(name).and_then(|e| e.exit_status)
+                        };
+                        let notice = crate::protocol::DetachNotice {
+                            detached: true,
+                            reason: "exited".into(),
+                            exit_code,
+                        };
+                        let mut json = serde_json::to_string(&notice).unwrap_or_default();
+                        json.push('\n');
+                        let _ = writer.write_all(json.as_bytes()).await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
         }
     }
 

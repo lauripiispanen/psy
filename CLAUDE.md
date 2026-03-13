@@ -38,7 +38,7 @@ psy/
 
 ### Core Infrastructure
 - [x] `Cargo.toml` — dependencies, profile settings
-- [x] `src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, stop, restart, down, mcp, version)
+- [x] `src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, mcp, version)
 - [x] `src/protocol.rs` — NDJSON request/response types (Request, Response, serde)
 
 ### Process Management
@@ -74,12 +74,17 @@ psy/
 - [x] `psy run <name> -- <command>` — send run command to root via PSY_SOCK
 - [x] `psy run --restart <policy>` — restart policy
 - [x] `psy run --env KEY=VAL` — extra env vars
-- [ ] `psy run --attach` — connect terminal stdin/stdout to child
+- [x] `psy run --attach` — connect terminal stdin/stdout to child
 - [x] `psy ps` — send ps command, format table output
 - [x] `psy logs <name>` — dump captured logs
 - [x] `psy logs --tail <n>` — last N lines
 - [x] `psy logs -f` — follow mode (stream until Ctrl-C)
 - [x] `psy logs --stdout / --stderr` — filter by stream
+- [x] `psy logs --since` / `--until` — time-based log filtering (relative or RFC 3339)
+- [x] `psy logs --grep` — case-insensitive substring filtering
+- [x] `psy logs --run <id>` — view logs from a specific run
+- [x] `psy logs --previous` — view logs from the run before current
+- [x] `psy history <name>` — show run history table
 - [x] `psy stop <name>` — send stop command
 - [x] `psy restart <name>` — send restart command
 - [x] `psy down` — send down command
@@ -96,7 +101,7 @@ psy/
 - [x] Main process stdin/stdout/stderr passthrough (not captured)
 - [x] When main exits → teardown all children → exit with main's exit code
 - [x] Main fails to start → print error, exit 1, no event loop
-- [ ] Signal handling: SIGTERM, SIGINT → initiate teardown (not yet wired)
+- [x] Signal handling: SIGTERM, SIGINT → initiate teardown
 
 ### Platform: Shared (`src/platform/mod.rs`)
 - [x] Pipe trick: root creates pipe, holds write end, children inherit read end
@@ -127,6 +132,7 @@ psy/
 - [x] `psy_logs` tool — get logs with tail/stream params
 - [x] `psy_stop` tool — stop named process
 - [x] `psy_restart` tool — restart named process
+- [x] `psy_history` tool — show run history for a process
 - [x] Connect to root via `PSY_SOCK` internally
 
 ### Log Output Format

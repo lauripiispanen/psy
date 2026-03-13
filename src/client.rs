@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
 use serde_json;
 
-use crate::protocol::{LogsArgs, Request, Response, StreamFilter};
+use crate::protocol::{
+    LogsArgs, Request, Response, RestartPolicy, RunArgs, StreamFilter, StdinData,
+};
 
 /// Read PSY_SOCK from the environment, returning a friendly error if unset.
 fn sock_path() -> Result<String, String> {
@@ -106,7 +109,12 @@ pub fn send_command(request: Request) -> Result<Response, String> {
 
 /// Follow logs for a named process, printing each line to stdout until the
 /// connection is closed or the user presses Ctrl-C.
-pub fn follow_logs(name: &str, stream: StreamFilter) -> Result<(), String> {
+pub fn follow_logs(
+    name: &str,
+    stream: StreamFilter,
+    since: Option<String>,
+    grep: Option<String>,
+) -> Result<(), String> {
     let path = sock_path()?;
     let (mut reader, mut writer) = transport::connect_streaming(&path)?;
 
@@ -114,6 +122,11 @@ pub fn follow_logs(name: &str, stream: StreamFilter) -> Result<(), String> {
         name: name.to_string(),
         tail: None,
         stream,
+        since,
+        until: None,
+        grep,
+        run: None,
+        previous: false,
     });
     let mut payload =
         serde_json::to_string(&request).map_err(|e| format!("serialize error: {e}"))?;
@@ -123,6 +136,112 @@ pub fn follow_logs(name: &str, stream: StreamFilter) -> Result<(), String> {
         .map_err(|e| format!("write error: {e}"))?;
     writer.flush().map_err(|e| format!("flush error: {e}"))?;
 
+    stream_log_lines(&mut reader)
+}
+
+/// Run a process in attach mode: forward stdin to the child, stream output back.
+pub fn run_attached(
+    name: &str,
+    command: Vec<String>,
+    restart: RestartPolicy,
+    env: HashMap<String, String>,
+) -> Result<(), String> {
+    let path = sock_path()?;
+    let (mut reader, mut writer) = transport::connect_streaming(&path)?;
+
+    let request = Request::run(RunArgs {
+        name: name.to_string(),
+        command,
+        restart,
+        env,
+        attach: true,
+    });
+    let mut payload =
+        serde_json::to_string(&request).map_err(|e| format!("serialize error: {e}"))?;
+    payload.push('\n');
+    writer
+        .write_all(payload.as_bytes())
+        .map_err(|e| format!("write error: {e}"))?;
+    writer.flush().map_err(|e| format!("flush error: {e}"))?;
+
+    // Read initial response
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read error: {e}"))?;
+    if line.is_empty() {
+        return Err("Connection closed before response".to_string());
+    }
+    let response: Response =
+        serde_json::from_str(&line).map_err(|e| format!("deserialize error: {e}"))?;
+    if !response.ok {
+        return Err(response.error.unwrap_or_else(|| "unknown error".into()));
+    }
+
+    // Spawn a thread to read stdin and forward to the root
+    let writer_clone = writer
+        .try_clone()
+        .map_err(|e| format!("clone error: {e}"))?;
+    let name_owned = name.to_string();
+    std::thread::spawn(move || {
+        stdin_forwarder(writer_clone, &name_owned);
+    });
+
+    // Read output from root and print
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&buf) {
+                    // Check if it's a detach notice
+                    if parsed.get("detached").is_some() {
+                        let reason = parsed
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let exit_code = parsed.get("exit_code").and_then(|v| v.as_i64());
+                        eprintln!("detached from {name}: {reason}");
+                        if let Some(code) = exit_code {
+                            std::process::exit(code as i32);
+                        }
+                        break;
+                    }
+                    // Regular log line
+                    let ts = parsed
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let stream = parsed
+                        .get("stream")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stdout");
+                    let content = parsed
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let _ = writeln!(out, "[{ts} {stream}] {content}");
+                } else {
+                    let _ = out.write_all(buf.as_bytes());
+                }
+                let _ = out.flush();
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn stream_log_lines(reader: &mut impl BufRead) -> Result<(), String> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut line = String::new();
@@ -157,4 +276,30 @@ pub fn follow_logs(name: &str, stream: StreamFilter) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn stdin_forwarder(mut writer: impl Write, _name: &str) {
+    let stdin = io::stdin();
+    let reader = stdin.lock();
+    for line_result in reader.lines() {
+        match line_result {
+            Ok(line) => {
+                let data = StdinData {
+                    stdin: format!("{line}\n"),
+                };
+                let mut payload = match serde_json::to_string(&data) {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                payload.push('\n');
+                if writer.write_all(payload.as_bytes()).is_err() {
+                    break;
+                }
+                if writer.flush().is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }

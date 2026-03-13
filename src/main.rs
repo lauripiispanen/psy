@@ -8,10 +8,12 @@ pub mod root;
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 
 use protocol::{
-    LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy, RunArgs, StopArgs, StreamFilter,
+    HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
+    RunArgs, StopArgs, StreamFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,6 +52,9 @@ enum Commands {
         /// Environment variables (KEY=VAL)
         #[arg(long = "env", value_name = "KEY=VAL")]
         envs: Vec<String>,
+        /// Attach terminal stdin/stdout to the child process
+        #[arg(long)]
+        attach: bool,
         /// Command to run
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -76,6 +81,26 @@ enum Commands {
         /// Show only stderr
         #[arg(long)]
         stderr: bool,
+        /// Show logs since time (e.g. 5m, 1h, 2026-03-12T20:00:00Z)
+        #[arg(long)]
+        since: Option<String>,
+        /// Show logs until time (e.g. 1m, 2026-03-12T21:00:00Z)
+        #[arg(long)]
+        until: Option<String>,
+        /// Filter logs by substring (case-insensitive)
+        #[arg(long)]
+        grep: Option<String>,
+        /// Show logs from a specific run ID
+        #[arg(long)]
+        run: Option<u32>,
+        /// Show logs from the previous run
+        #[arg(long)]
+        previous: bool,
+    },
+    /// Show run history for a process
+    History {
+        /// Process name
+        name: String,
     },
     /// Stop a managed process
     Stop {
@@ -145,17 +170,31 @@ fn main() {
             name,
             restart,
             envs,
+            attach,
             command,
         } => {
             let restart_policy = parse_restart_policy(&restart);
             let env = parse_env_args(&envs);
-            let req = Request::run(RunArgs {
-                name,
-                command,
-                restart: restart_policy,
-                env,
-            });
-            send_and_print(req);
+            if attach {
+                if let Err(e) = client::run_attached(
+                    &name,
+                    command,
+                    restart_policy,
+                    env,
+                ) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            } else {
+                let req = Request::run(RunArgs {
+                    name,
+                    command,
+                    restart: restart_policy,
+                    env,
+                    attach: false,
+                });
+                send_and_print(req);
+            }
         }
 
         Commands::Ps { all: _all } => {
@@ -192,6 +231,11 @@ fn main() {
             tail,
             stdout,
             stderr,
+            since,
+            until,
+            grep,
+            run,
+            previous,
         } => {
             let stream = if stdout {
                 StreamFilter::Stdout
@@ -201,13 +245,44 @@ fn main() {
                 StreamFilter::All
             };
 
+            // Parse time specs on the client side, send absolute timestamps
+            let since_abs = since.map(|s| {
+                parse_time_spec(&s).unwrap_or_else(|e| {
+                    eprintln!("error: invalid --since: {e}");
+                    std::process::exit(1);
+                })
+            });
+            let until_abs = until.map(|s| {
+                parse_time_spec(&s).unwrap_or_else(|e| {
+                    eprintln!("error: invalid --until: {e}");
+                    std::process::exit(1);
+                })
+            });
+
+            let since_str = since_abs.map(|t| t.to_rfc3339());
+            let until_str = until_abs.map(|t| t.to_rfc3339());
+
             if follow {
-                if let Err(e) = client::follow_logs(&name, stream) {
+                if let Err(e) = client::follow_logs(
+                    &name,
+                    stream,
+                    since_str.clone(),
+                    grep.clone(),
+                ) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             } else {
-                let req = Request::logs(LogsArgs { name, tail, stream });
+                let req = Request::logs(LogsArgs {
+                    name,
+                    tail,
+                    stream,
+                    since: since_str,
+                    until: until_str,
+                    grep,
+                    run,
+                    previous,
+                });
                 match client::send_command(req) {
                     Ok(resp) if resp.ok => {
                         if let Some(data) = resp.data {
@@ -241,6 +316,34 @@ fn main() {
                         eprintln!("error: {e}");
                         std::process::exit(1);
                     }
+                }
+            }
+        }
+
+        Commands::History { name } => {
+            let req = Request::history(HistoryArgs { name });
+            match client::send_command(req) {
+                Ok(resp) if resp.ok => {
+                    if let Some(data) = resp.data {
+                        if let Ok(history) =
+                            serde_json::from_value::<HistoryResponse>(data.clone())
+                        {
+                            print_history_table(&history);
+                        } else {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&data).unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
                 }
             }
         }
@@ -285,6 +388,47 @@ fn send_and_print(req: Request) {
             std::process::exit(1);
         }
     }
+}
+
+/// Parse a time specification: either a relative duration (e.g. "5m", "1h", "30s", "2d")
+/// or an absolute RFC 3339 / ISO 8601 timestamp.
+fn parse_time_spec(s: &str) -> Result<DateTime<Utc>, String> {
+    // Try relative duration first: <N>s, <N>m, <N>h, <N>d
+    let s_trimmed = s.trim();
+    if let Some(num_str) = s_trimmed.strip_suffix('s') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(Utc::now() - chrono::Duration::seconds(n as i64));
+        }
+    }
+    if let Some(num_str) = s_trimmed.strip_suffix('m') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(Utc::now() - chrono::Duration::minutes(n as i64));
+        }
+    }
+    if let Some(num_str) = s_trimmed.strip_suffix('h') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(Utc::now() - chrono::Duration::hours(n as i64));
+        }
+    }
+    if let Some(num_str) = s_trimmed.strip_suffix('d') {
+        if let Ok(n) = num_str.parse::<u64>() {
+            return Ok(Utc::now() - chrono::Duration::days(n as i64));
+        }
+    }
+
+    // Try RFC 3339 with timezone
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s_trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // Try ISO 8601 without timezone (assume UTC)
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s_trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(naive.and_utc());
+    }
+
+    Err(format!(
+        "expected relative duration (e.g. 5s, 10m, 1h, 2d) or RFC 3339 timestamp, got: {s}"
+    ))
 }
 
 fn parse_restart_policy(s: &str) -> RestartPolicy {
@@ -332,6 +476,36 @@ fn print_ps_table(ps: &PsResponse) {
         println!(
             "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}",
             p.name, pid_str, p.status, exit_str, uptime, p.restarts, restart
+        );
+    }
+}
+
+fn print_history_table(history: &HistoryResponse) {
+    if history.runs.is_empty() {
+        println!("No runs recorded for '{}'", history.name);
+        return;
+    }
+    println!(
+        "{:<6} {:<10} {:<8} {:<28} {}",
+        "RUN", "STATUS", "EXIT", "STARTED", "DURATION"
+    );
+    println!("{}", "-".repeat(68));
+    for r in &history.runs {
+        let exit_str = if let Some(sig) = &r.signal {
+            sig.clone()
+        } else {
+            r.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into())
+        };
+        let started = r.started_at.as_deref().unwrap_or("-");
+        let duration = r
+            .duration_secs
+            .map(|s| format_uptime(s))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<6} {:<10} {:<8} {:<28} {}",
+            r.run_id, r.status, exit_str, started, duration
         );
     }
 }

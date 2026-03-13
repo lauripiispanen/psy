@@ -592,3 +592,402 @@ fn test_ps_shows_exit_and_restarts() {
         "ps should show exit code 42 for exiter, got: {exiter_line}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v0.3 — Log filtering tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_logs_since() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let echo = sh_c("echo hello-since");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "sinceproc", "--"];
+    run_args.extend(echo_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // --since 1h should include all recent logs
+    let logs = root.psy_stdout(&["logs", "sinceproc", "--since", "1h"]);
+    assert!(
+        logs.contains("hello-since"),
+        "logs --since 1h should include recent output, got: {logs}"
+    );
+
+    // --since 1s from way in the future should return nothing meaningful
+    // (We test with an absolute timestamp far in the past to verify filtering works)
+    let logs2 = root.psy_stdout(&["logs", "sinceproc", "--since", "2099-01-01T00:00:00Z"]);
+    assert!(
+        !logs2.contains("hello-since"),
+        "logs --since far future should exclude old output, got: {logs2}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_until() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let echo = sh_c("echo hello-until");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "untilproc", "--"];
+    run_args.extend(echo_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // --until far in the past should return nothing
+    let logs = root.psy_stdout(&["logs", "untilproc", "--until", "2020-01-01T00:00:00Z"]);
+    assert!(
+        !logs.contains("hello-until"),
+        "logs --until past should exclude output, got: {logs}"
+    );
+
+    // --until far in the future should include everything
+    let logs2 = root.psy_stdout(&["logs", "untilproc", "--until", "2099-01-01T00:00:00Z"]);
+    assert!(
+        logs2.contains("hello-until"),
+        "logs --until future should include output, got: {logs2}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_grep() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    #[cfg(unix)]
+    let multi = vec![
+        "run",
+        "grepproc",
+        "--",
+        "sh",
+        "-c",
+        "echo 'ERROR: something failed' && echo 'INFO: all good' && echo 'error: another one'",
+    ];
+    #[cfg(windows)]
+    let multi = vec![
+        "run",
+        "grepproc",
+        "--",
+        "cmd",
+        "/c",
+        "echo ERROR: something failed && echo INFO: all good && echo error: another one",
+    ];
+
+    root.psy(&multi);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "grepproc", "--grep", "error"]);
+    assert!(
+        logs.to_lowercase().contains("error"),
+        "grep should return lines containing 'error', got: {logs}"
+    );
+    assert!(
+        !logs.contains("INFO: all good"),
+        "grep should not return non-matching lines, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_grep_no_match() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let echo = sh_c("echo hello-world");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "grepnone", "--"];
+    run_args.extend(echo_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "grepnone", "--grep", "NONEXISTENT"]);
+    // Should have no content lines (only empty or no output)
+    let content_lines: Vec<_> = logs.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        content_lines.is_empty(),
+        "grep with no matches should return empty, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v0.3 — Attach mode tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_attach_output_and_exit() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Build owned args for the thread
+    let echo = sh_c("echo attached-output && sleep 1");
+    let mut run_args: Vec<String> = vec!["run", "--attach", "attacher", "--"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    run_args.extend(echo);
+
+    // Run it in a thread since --attach blocks
+    let sock = root.sock.clone();
+    let bin = psy_bin();
+    let handle = std::thread::spawn(move || {
+        let args_refs: Vec<&str> = run_args.iter().map(|s| s.as_str()).collect();
+        let output = Command::new(bin)
+            .args(&args_refs)
+            .env("PSY_SOCK", &sock)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run psy run --attach");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    });
+
+    // Wait and then check that the process was registered
+    thread::sleep(Duration::from_secs(1));
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("attacher"),
+        "attached process should appear in ps, got: {ps}"
+    );
+
+    // Wait for the attach to complete
+    let output = handle.join().expect("attach thread panicked");
+    assert!(
+        output.contains("attached-output"),
+        "attach should stream output, got: {output}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_attach_detach_keeps_running() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Start a long-running process with --attach, then kill the client
+    let long_sl = sleep_cmd(999);
+    let mut run_args: Vec<String> = vec!["run", "--attach", "detacher", "--"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    run_args.extend(long_sl);
+
+    let run_refs: Vec<&str> = run_args.iter().map(|s| s.as_str()).collect();
+    let mut child = Command::new(psy_bin())
+        .args(&run_refs)
+        .env("PSY_SOCK", &root.sock)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start attached process");
+
+    thread::sleep(Duration::from_secs(2));
+
+    // Kill the client (simulates Ctrl-C / detach)
+    let _ = child.kill();
+    let _ = child.wait();
+
+    thread::sleep(Duration::from_millis(500));
+
+    // The process should still be running in the root
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("detacher") && ps.contains("running"),
+        "detached process should still be running, got: {ps}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v0.3 — History & per-run logs tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_history_shows_runs() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run a process that exits, then re-run with the same name
+    let echo1 = sh_c("echo run-one");
+    let echo1_refs = to_refs(&echo1);
+    let mut run_args = vec!["run", "hist", "--"];
+    run_args.extend(echo1_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // Re-run (tombstone replacement)
+    let echo2 = sh_c("echo run-two");
+    let echo2_refs = to_refs(&echo2);
+    let mut run_args2 = vec!["run", "hist", "--"];
+    run_args2.extend(echo2_refs);
+    root.psy(&run_args2);
+    thread::sleep(Duration::from_secs(1));
+
+    let history = root.psy_stdout(&["history", "hist"]);
+    assert!(
+        history.contains("RUN") && history.contains("STATUS"),
+        "history should show header, got: {history}"
+    );
+    // Should show run 1 and run 2
+    assert!(
+        history.contains("1") && history.contains("2"),
+        "history should show both runs, got: {history}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_previous_run() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run a process that outputs a marker then exits
+    let echo1 = sh_c("echo FIRST_RUN_MARKER");
+    let echo1_refs = to_refs(&echo1);
+    let mut run_args = vec!["run", "prevlog", "--"];
+    run_args.extend(echo1_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // Re-run with a different marker
+    let echo2 = sh_c("echo SECOND_RUN_MARKER");
+    let echo2_refs = to_refs(&echo2);
+    let mut run_args2 = vec!["run", "prevlog", "--"];
+    run_args2.extend(echo2_refs);
+    root.psy(&run_args2);
+    thread::sleep(Duration::from_secs(1));
+
+    // Default logs should show current run
+    let logs = root.psy_stdout(&["logs", "prevlog"]);
+    assert!(
+        logs.contains("SECOND_RUN_MARKER"),
+        "default logs should show current run, got: {logs}"
+    );
+    assert!(
+        !logs.contains("FIRST_RUN_MARKER"),
+        "default logs should not show previous run, got: {logs}"
+    );
+
+    // --previous should show the first run
+    let prev_logs = root.psy_stdout(&["logs", "prevlog", "--previous"]);
+    assert!(
+        prev_logs.contains("FIRST_RUN_MARKER"),
+        "--previous should show first run, got: {prev_logs}"
+    );
+    assert!(
+        !prev_logs.contains("SECOND_RUN_MARKER"),
+        "--previous should not show current run, got: {prev_logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_run_id() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run a process, let it exit, re-run
+    let echo1 = sh_c("echo RUN1_OUTPUT");
+    let echo1_refs = to_refs(&echo1);
+    let mut run_args = vec!["run", "runid", "--"];
+    run_args.extend(echo1_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    let echo2 = sh_c("echo RUN2_OUTPUT");
+    let echo2_refs = to_refs(&echo2);
+    let mut run_args2 = vec!["run", "runid", "--"];
+    run_args2.extend(echo2_refs);
+    root.psy(&run_args2);
+    thread::sleep(Duration::from_secs(1));
+
+    // --run 1 should show first run's output
+    let logs1 = root.psy_stdout(&["logs", "runid", "--run", "1"]);
+    assert!(
+        logs1.contains("RUN1_OUTPUT"),
+        "--run 1 should show first run, got: {logs1}"
+    );
+
+    // --run 2 should show second run's output
+    let logs2 = root.psy_stdout(&["logs", "runid", "--run", "2"]);
+    assert!(
+        logs2.contains("RUN2_OUTPUT"),
+        "--run 2 should show second run, got: {logs2}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_run_with_grep() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    #[cfg(unix)]
+    let cmd1 = vec![
+        "run", "greprun", "--", "sh", "-c",
+        "echo 'ERROR: old crash' && echo 'INFO: ok'",
+    ];
+    #[cfg(windows)]
+    let cmd1 = vec![
+        "run", "greprun", "--", "cmd", "/c",
+        "echo ERROR: old crash && echo INFO: ok",
+    ];
+    root.psy(&cmd1);
+    thread::sleep(Duration::from_secs(1));
+
+    let echo2 = sh_c("echo new-run-output");
+    let echo2_refs = to_refs(&echo2);
+    let mut run_args2 = vec!["run", "greprun", "--"];
+    run_args2.extend(echo2_refs);
+    root.psy(&run_args2);
+    thread::sleep(Duration::from_secs(1));
+
+    // --run 1 --grep "error" should filter old run's logs
+    let logs = root.psy_stdout(&["logs", "greprun", "--run", "1", "--grep", "error"]);
+    assert!(
+        logs.to_lowercase().contains("error"),
+        "--run 1 --grep error should find errors, got: {logs}"
+    );
+    assert!(
+        !logs.contains("INFO: ok"),
+        "grep should filter out non-matching lines, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_history_after_restart() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run, then restart
+    let cmd = sh_c("echo BEFORE && sleep 999");
+    let cmd_refs = to_refs(&cmd);
+    let mut run_args = vec!["run", "histrestart", "--"];
+    run_args.extend(cmd_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    root.psy(&["restart", "histrestart"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let history = root.psy_stdout(&["history", "histrestart"]);
+    // Should have run 1 (stopped) and run 2 (running)
+    assert!(
+        history.contains("1") && history.contains("2"),
+        "history should show 2 runs after restart, got: {history}"
+    );
+
+    // --previous should show old run's logs
+    let prev_logs = root.psy_stdout(&["logs", "histrestart", "--previous"]);
+    assert!(
+        prev_logs.contains("BEFORE"),
+        "--previous should show pre-restart logs, got: {prev_logs}"
+    );
+}

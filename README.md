@@ -57,14 +57,16 @@ Download from [GitHub Releases](https://github.com/lauripiispanen/psy/releases) 
 
 ```
 psy up [--name <name>] [-- <command>]              Start a psy root session
-psy run <name> [--restart <policy>] [-- <cmd>]    Launch a managed child process
-psy ps                                             List managed processes
-psy logs <name> [-f] [--tail <n>]                  View captured logs
-psy stop <name>                                    Stop a process (SIGTERM → SIGKILL)
-psy restart <name>                                 Restart with same arguments
-psy down                                           Tear down everything
-psy mcp                                            Start MCP JSON-RPC server
-psy version                                        Print version
+psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child process
+psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
+psy ps                                              List managed processes
+psy logs <name> [-f] [--tail <n>]                   View captured logs
+psy history <name>                                  Show run history
+psy stop <name>                                     Stop a process (SIGTERM → SIGKILL)
+psy restart <name>                                  Restart with same arguments
+psy down                                            Tear down everything
+psy mcp                                             Start MCP JSON-RPC server
+psy version                                         Print version
 ```
 
 ### Process status
@@ -90,16 +92,53 @@ Stopped processes remain visible as tombstones. Re-running `psy run` with the sa
 ### Logs
 
 ```bash
-psy logs server              # full log (plain text)
-psy logs server --tail 20    # last 20 lines
-psy logs server -f           # follow (stream until Ctrl-C)
-psy logs server --stdout     # stdout only
-psy logs server --stderr     # stderr only
+psy logs server                    # full log (plain text)
+psy logs server --tail 20          # last 20 lines
+psy logs server -f                 # follow (stream until Ctrl-C)
+psy logs server --stdout           # stdout only
+psy logs server --stderr           # stderr only
+psy logs server --since 5m         # last 5 minutes
+psy logs server --since 1h         # last hour
+psy logs server --until 2026-03-12T20:00:00Z
+psy logs server --grep "error"     # case-insensitive filter
+psy logs server -f --grep "WARN"   # follow with filter
 ```
 
 Output format: `[2025-03-12T10:15:32.123Z stdout] Server listening on :8080`
 
-Logs are kept in a per-process ring buffer (10k lines / 2MB) and survive process restarts.
+Logs are kept in a per-process ring buffer (10k lines / 2MB). Each run gets its own log buffer — logs from previous runs are preserved and queryable.
+
+### Run history
+
+Every time a process starts (via `psy run`, `psy restart`, or automatic restart), a new run is recorded. Use `psy history` to see all runs, then query logs by run ID:
+
+```
+$ psy history web
+RUN    STATUS     EXIT     STARTED                      DURATION
+--------------------------------------------------------------------
+1      stopped    SIG15    2026-03-13T20:10:39+00:00    1m 47s
+2      stopped    SIG15    2026-03-13T20:12:26+00:00    14s
+3      running    -        2026-03-13T20:12:40+00:00    1m 2s
+```
+
+```bash
+psy logs web                # current run (default)
+psy logs web --run 1        # first run's logs
+psy logs web --run 2        # second run's logs
+psy logs web --previous     # shorthand for the run before current
+
+# Composes with all other flags:
+psy logs web --run 1 --grep "error"
+psy logs web --previous --tail 5
+```
+
+### Attach mode
+
+```bash
+psy run --attach myrepl -- python3 -i
+```
+
+Attach connects your terminal's stdin to the child process and streams its output back. Ctrl-C detaches without killing the child — it keeps running in the background and you can reattach to its logs with `psy logs -f`.
 
 ## MCP Integration
 
@@ -110,7 +149,7 @@ psy up -- claude
 # Claude's MCP config launches "psy mcp" → connects back to the root via PSY_SOCK
 ```
 
-Tools exposed: `psy_run`, `psy_ps`, `psy_logs`, `psy_stop`, `psy_restart`
+Tools exposed: `psy_run`, `psy_ps`, `psy_logs`, `psy_stop`, `psy_restart`, `psy_history`
 
 ## How It Works
 

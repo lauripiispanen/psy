@@ -10,7 +10,7 @@ use tokio::process::{Child, Command};
 
 #[cfg(unix)]
 use crate::platform;
-use crate::protocol::{ProcessInfo, RestartPolicy};
+use crate::protocol::{ProcessInfo, RestartPolicy, RunInfo};
 use crate::ring_buffer::{RingBuffer, Stream};
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,44 @@ impl std::fmt::Display for ProcessState {
             ProcessState::Running => write!(f, "running"),
             ProcessState::Stopped => write!(f, "stopped"),
             ProcessState::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run record (archived past runs)
+// ---------------------------------------------------------------------------
+
+pub struct RunRecord {
+    pub run_id: u32,
+    pub state: ProcessState,
+    pub started_at: Option<DateTime<Utc>>,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub exit_status: Option<i32>,
+    pub signal: Option<String>,
+    pub stdout_buf: Arc<RingBuffer>,
+    pub stderr_buf: Arc<RingBuffer>,
+}
+
+impl RunRecord {
+    pub fn to_run_info(&self) -> RunInfo {
+        let duration_secs = match (self.started_at, self.stopped_at) {
+            (Some(start), Some(stop)) => {
+                Some(stop.signed_duration_since(start).num_seconds().max(0) as u64)
+            }
+            (Some(start), None) => {
+                Some(Utc::now().signed_duration_since(start).num_seconds().max(0) as u64)
+            }
+            _ => None,
+        };
+
+        RunInfo {
+            run_id: self.run_id,
+            status: self.state.to_string(),
+            exit_code: self.exit_status,
+            signal: self.signal.clone(),
+            started_at: self.started_at.map(|t| t.to_rfc3339()),
+            duration_secs,
         }
     }
 }
@@ -58,6 +96,12 @@ pub struct ProcessEntry {
     pub stopping: Arc<AtomicBool>,
     /// Handle to the running child — only present while Running.
     pub child: Option<Child>,
+    /// Handle to the child's stdin (only set when attach mode is used).
+    pub stdin_handle: Option<tokio::process::ChildStdin>,
+    /// Monotonically increasing run ID for this process name.
+    pub current_run_id: u32,
+    /// Archived past runs (oldest first).
+    pub run_history: Vec<RunRecord>,
 }
 
 impl ProcessEntry {
@@ -85,6 +129,50 @@ impl ProcessEntry {
             is_main,
             stopping: Arc::new(AtomicBool::new(false)),
             child: None,
+            stdin_handle: None,
+            current_run_id: 1,
+            run_history: Vec::new(),
+        }
+    }
+
+    /// Archive the current run into history and prepare for a new run.
+    /// Call this before spawning a new child on restart/re-run.
+    pub fn archive_current_run(&mut self) {
+        let record = RunRecord {
+            run_id: self.current_run_id,
+            state: self.state,
+            started_at: self.started_at,
+            stopped_at: self.stopped_at,
+            exit_status: self.exit_status,
+            signal: self.signal.clone(),
+            stdout_buf: Arc::clone(&self.stdout_buf),
+            stderr_buf: Arc::clone(&self.stderr_buf),
+        };
+        self.run_history.push(record);
+        self.current_run_id += 1;
+        self.stdout_buf = Arc::new(RingBuffer::new());
+        self.stderr_buf = Arc::new(RingBuffer::new());
+    }
+
+    /// Get RunInfo for the current (latest) run.
+    pub fn current_run_info(&self) -> RunInfo {
+        let duration_secs = match (self.started_at, self.stopped_at) {
+            (Some(start), Some(stop)) => {
+                Some(stop.signed_duration_since(start).num_seconds().max(0) as u64)
+            }
+            (Some(start), None) if self.state == ProcessState::Running => {
+                Some(Utc::now().signed_duration_since(start).num_seconds().max(0) as u64)
+            }
+            _ => None,
+        };
+
+        RunInfo {
+            run_id: self.current_run_id,
+            status: self.state.to_string(),
+            exit_code: self.exit_status,
+            signal: self.signal.clone(),
+            started_at: self.started_at.map(|t| t.to_rfc3339()),
+            duration_secs,
         }
     }
 
@@ -145,6 +233,23 @@ pub fn spawn_child(
     psy_sock: &str,
     psy_root_pid: u32,
 ) -> std::io::Result<Child> {
+    spawn_child_inner(entry, psy_sock, psy_root_pid, false)
+}
+
+pub fn spawn_child_attached(
+    entry: &mut ProcessEntry,
+    psy_sock: &str,
+    psy_root_pid: u32,
+) -> std::io::Result<Child> {
+    spawn_child_inner(entry, psy_sock, psy_root_pid, true)
+}
+
+fn spawn_child_inner(
+    entry: &mut ProcessEntry,
+    psy_sock: &str,
+    psy_root_pid: u32,
+    attach: bool,
+) -> std::io::Result<Child> {
     if entry.command.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -167,6 +272,11 @@ pub fn spawn_child(
         cmd.stdin(std::process::Stdio::inherit());
         cmd.stdout(std::process::Stdio::inherit());
         cmd.stderr(std::process::Stdio::inherit());
+    } else if attach {
+        // Attach mode: pipe stdin so we can write to it, pipe stdout/stderr for capture
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
     } else {
         // Non-main: stdin from /dev/null, stdout/stderr piped
         cmd.stdin(std::process::Stdio::null());
@@ -199,6 +309,11 @@ pub fn spawn_child(
     entry.stopped_at = None;
     entry.exit_status = None;
     entry.signal = None;
+
+    // Store stdin handle for attach mode
+    if attach {
+        entry.stdin_handle = child.stdin.take();
+    }
 
     // Start output capture tasks for non-main processes
     if !entry.is_main {
