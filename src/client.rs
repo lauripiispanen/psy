@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 use serde_json;
 
 use crate::protocol::{
-    LogsArgs, Request, Response, RestartPolicy, RunArgs, StreamFilter, StdinData,
+    LogsArgs, Request, Response, RestartPolicy, RunArgs, StdinData, StreamFilter,
 };
 
 /// Read PSY_SOCK from the environment, returning a friendly error if unset.
@@ -155,6 +155,7 @@ pub fn run_attached(
         restart,
         env,
         attach: true,
+        extra_args: None,
     });
     let mut payload =
         serde_json::to_string(&request).map_err(|e| format!("serialize error: {e}"))?;
@@ -219,10 +220,7 @@ pub fn run_attached(
                         .get("stream")
                         .and_then(|v| v.as_str())
                         .unwrap_or("stdout");
-                    let content = parsed
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let content = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     let _ = writeln!(out, "[{ts} {stream}] {content}");
                 } else {
                     let _ = out.write_all(buf.as_bytes());
@@ -260,10 +258,7 @@ fn stream_log_lines(reader: &mut impl BufRead) -> Result<(), String> {
                         .get("stream")
                         .and_then(|v| v.as_str())
                         .unwrap_or("stdout");
-                    let content = parsed
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let content = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     let _ = writeln!(out, "[{ts} {stream}] {content}");
                 } else {
                     let _ = out.write_all(line.as_bytes());

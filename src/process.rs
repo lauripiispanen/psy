@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +103,8 @@ pub struct ProcessEntry {
     pub current_run_id: u32,
     /// Archived past runs (oldest first).
     pub run_history: Vec<RunRecord>,
+    /// Working directory for the process (if set).
+    pub working_dir: Option<PathBuf>,
 }
 
 impl ProcessEntry {
@@ -132,6 +135,7 @@ impl ProcessEntry {
             stdin_handle: None,
             current_run_id: 1,
             run_history: Vec::new(),
+            working_dir: None,
         }
     }
 
@@ -259,6 +263,11 @@ fn spawn_child_inner(
 
     let mut cmd = Command::new(&entry.command[0]);
     cmd.args(&entry.command[1..]);
+
+    // Working directory
+    if let Some(ref dir) = entry.working_dir {
+        cmd.current_dir(dir);
+    }
 
     // Environment: inherit current env + PSY variables + entry-specific env
     cmd.env("PSY_SOCK", psy_sock);

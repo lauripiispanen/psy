@@ -70,6 +70,7 @@ pub const CMD_HISTORY: &str = "history";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunArgs {
     pub name: String,
+    #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
     pub restart: RestartPolicy,
@@ -77,6 +78,8 @@ pub struct RunArgs {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub attach: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

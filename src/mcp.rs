@@ -82,18 +82,23 @@ fn tool_schemas() -> Value {
         "tools": [
             {
                 "name": "psy_run",
-                "description": "Start a new managed process",
+                "description": "Launch a named process. If name matches a Psyfile unit, starts that unit (with optional extra args). Otherwise, command is required.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Unique name for the process"
+                            "description": "Process name (or Psyfile unit name)"
                         },
                         "command": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Command and arguments to run"
+                            "description": "Command and arguments. Required if name is not a Psyfile unit."
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Extra arguments for Psyfile unit commands"
                         },
                         "restart": {
                             "type": "string",
@@ -106,7 +111,7 @@ fn tool_schemas() -> Value {
                             "description": "Additional environment variables"
                         }
                     },
-                    "required": ["name", "command"]
+                    "required": ["name"]
                 }
             },
             {
@@ -222,10 +227,18 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
             let command: Vec<String> = args
                 .get("command")
                 .and_then(|v| v.as_array())
-                .ok_or("missing required parameter: command")?
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let extra_args: Option<Vec<String>> =
+                args.get("args").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
             let restart = match args.get("restart").and_then(|v| v.as_str()) {
                 Some("on_failure") => RestartPolicy::OnFailure,
                 Some("always") => RestartPolicy::Always,
@@ -247,6 +260,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 restart,
                 env,
                 attach: false,
+                extra_args,
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
@@ -306,10 +320,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 .get("grep")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let run = args
-                .get("run")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32);
+            let run = args.get("run").and_then(|v| v.as_u64()).map(|n| n as u32);
             let previous = args
                 .get("previous")
                 .and_then(|v| v.as_bool())
@@ -420,7 +431,7 @@ fn format_ps_table(ps: &PsResponse) -> String {
         };
         let uptime = p
             .uptime_secs
-            .map(|s| format_uptime(s))
+            .map(format_uptime)
             .unwrap_or_else(|| "-".into());
         let restart = format!("{:?}", p.restart_policy).to_lowercase();
         out.push_str(&format!(
@@ -453,7 +464,7 @@ fn format_history_table(history: &HistoryResponse) -> String {
         let started = r.started_at.as_deref().unwrap_or("-");
         let duration = r
             .duration_secs
-            .map(|s| format_uptime(s))
+            .map(format_uptime)
             .unwrap_or_else(|| "-".into());
         out.push_str(&format!(
             "{:<6} {:<10} {:<8} {:<28} {}\n",

@@ -22,6 +22,7 @@ psy/
 │   ├── process.rs           # child process management, stdio capture, restart logic
 │   ├── ring_buffer.rs       # log ring buffer (line-oriented, bounded)
 │   ├── protocol.rs          # NDJSON request/response types, serde
+│   ├── psyfile.rs           # Psyfile TOML parsing, validation, interpolation, deps
 │   ├── mcp.rs               # MCP server implementation
 │   └── platform/
 │       ├── mod.rs           # platform trait + conditional re-exports
@@ -70,8 +71,12 @@ psy/
 - [x] `psy up` — create root, launch shell (`$SHELL` or default)
 - [x] `psy up -- <command>` — create root, launch command as main
 - [x] `psy up --name` — custom root name (default: `psy-<pid>`)
+- [x] `psy up --file <path>` — explicit Psyfile path
+- [x] `psy up <units>` — start specified Psyfile units on boot
+- [x] `psy up --all` — start all Psyfile units on boot
 - [x] ~`psy up --mcp`~ — removed; agent launches `psy mcp` itself via MCP config
 - [x] `psy run <name> -- <command>` — send run command to root via PSY_SOCK
+- [x] `psy run <name>` — run Psyfile unit (no `--` needed)
 - [x] `psy run --restart <policy>` — restart policy
 - [x] `psy run --env KEY=VAL` — extra env vars
 - [x] `psy run --attach` — connect terminal stdin/stdout to child
@@ -139,6 +144,23 @@ psy/
 - [x] Prefix lines: `[<ISO8601> stdout/stderr] <content>`
 - [x] Interleaved by default, `--stdout`/`--stderr` to filter
 
+### Psyfile (`src/psyfile.rs`)
+- [x] TOML parsing with field validation (reject unknown fields)
+- [x] File discovery: walk upward from cwd for `Psyfile` or `Psyfile.toml`
+- [x] Unit definition: command, restart, env, depends_on, singleton, working_dir
+- [x] Environment variable interpolation: `${VAR}` and `${VAR:-default}`
+- [x] Circular dependency detection (Kahn's algorithm)
+- [x] Dependency resolution: topological sort for start order
+- [x] Shell escaping and `$@` substitution for extra args
+- [x] Singleton units: single instance, tombstone replacement
+- [x] Template units: `singleton = false`, numbered instances (name.1, name.2, ...)
+- [x] Template group operations: stop/restart/logs apply to all instances
+- [x] Boot-time unit startup via `psy up <units>` or `psy up --all`
+- [x] Working directory support per unit
+- [x] CLI restart policy override (`--restart` overrides Psyfile default)
+- [x] Ad-hoc processes work alongside Psyfile units
+- [x] MCP `psy_run` updated for optional command + extra args
+
 ### Edge Cases
 - [x] Concurrent `psy run` same name → error "already exists"
 - [x] `psy run` after main exits → error "shutting down"
@@ -146,6 +168,8 @@ psy/
 - [x] Large log output → ring buffer enforces limit, no unbounded growth
 - [ ] Grandchildren: Linux subreaper adopts; Windows Job Object covers; macOS pipe trick only direct children (known limitation — documented)
 - [ ] Tombstone replacement: if exited process name reused, replace old entry
+- [x] No Psyfile + `psy run` without command → error "no command provided"
+- [x] Psyfile unit name `main` → rejected at validation time
 
 ### Unit Tests
 - [x] Ring buffer: boundary conditions, eviction, line counting
@@ -154,6 +178,12 @@ psy/
 - [x] Process name validation
 - [x] Restart backoff calculation
 - [x] Restart policy logic (should_restart)
+- [x] Psyfile parsing: valid, minimal, missing command, unknown field, invalid TOML
+- [x] Psyfile validation: circular deps, unknown dep, reserved name, invalid name
+- [x] Psyfile interpolation: vars, defaults, undefined, no recursion
+- [x] Psyfile dependency resolution: no deps, chain, diamond, already included
+- [x] Shell escaping: simple, spaces, quotes, empty, join
+- [x] Command building: append, `$@` substitution, `$@` no args
 
 ### Integration Tests (`tests/integration.rs`)
 All integration tests pass on macOS. Must also pass on Linux and Windows via GitHub Actions.
@@ -172,6 +202,18 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Main process exit code propagation
 - [x] Environment variable passing
 - [x] Log tail limiting
+- [x] Psyfile unit run: command resolved from file
+- [x] Psyfile unit with env interpolation
+- [x] Psyfile depends_on: auto-starts dependencies
+- [x] Psyfile template unit: creates numbered instances
+- [x] Psyfile template group stop
+- [x] Psyfile `psy up --all`: starts all units
+- [x] Psyfile selective boot: `psy up db api`
+- [x] Psyfile ad-hoc alongside Psyfile units
+- [x] Psyfile env interpolation with default values
+- [x] Psyfile restart policy override
+- [x] Psyfile working_dir support
+- [x] No command without Psyfile → error
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

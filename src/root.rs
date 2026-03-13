@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use crate::process::{
     ProcessEntry, ProcessState,
 };
 use crate::protocol::*;
+use crate::psyfile::{self, Psyfile};
 use crate::ring_buffer::Stream as RBStream;
 
 // ---------------------------------------------------------------------------
@@ -33,6 +35,37 @@ pub struct SharedRoot {
     pub death_pipe: platform::DeathPipe,
     pub shutting_down: Arc<AtomicBool>,
     pub main_exit_tx: watch::Sender<Option<i32>>,
+    /// Explicit Psyfile path (from `--file`), or `None` for discovery.
+    pub psyfile_path: Option<PathBuf>,
+    /// Working directory at startup, used for Psyfile discovery.
+    pub cwd: PathBuf,
+    pub template_counters: Mutex<HashMap<String, u32>>,
+}
+
+impl SharedRoot {
+    /// Load and validate the Psyfile, re-reading from disk each time.
+    /// Returns `Ok(None)` if no Psyfile is found.
+    /// Returns `Err` if the file exists but has parse/validation errors.
+    pub fn load_psyfile(&self) -> Result<Option<Psyfile>, String> {
+        let path = if let Some(ref p) = self.psyfile_path {
+            if p.is_file() {
+                Some(p.clone())
+            } else {
+                return Err(format!("Psyfile not found: {}", p.display()));
+            }
+        } else {
+            psyfile::discover(&self.cwd)
+        };
+
+        match path {
+            Some(p) => {
+                let pf = psyfile::parse(&p)?;
+                psyfile::validate(&pf)?;
+                Ok(Some(pf))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +78,7 @@ pub struct PsyRoot {
 }
 
 impl PsyRoot {
-    pub fn new(_name: String) -> RootResult<Self> {
+    pub fn new(_name: String, psyfile_path: Option<PathBuf>) -> RootResult<Self> {
         // Platform-specific root setup (setsid / subreaper / Job Object)
         platform::setup_root();
 
@@ -77,6 +110,9 @@ impl PsyRoot {
             death_pipe,
             shutting_down: Arc::new(AtomicBool::new(false)),
             main_exit_tx,
+            psyfile_path,
+            cwd: std::env::current_dir().unwrap_or_default(),
+            template_counters: Mutex::new(HashMap::new()),
         });
 
         Ok(Self {
@@ -90,7 +126,11 @@ impl PsyRoot {
     /// `main_command` — the main process command (or `None` to use `$SHELL`).
     ///
     /// Returns the main process exit code.
-    pub async fn run(mut self, main_command: Option<Vec<String>>) -> RootResult<i32> {
+    pub async fn run(
+        mut self,
+        main_command: Option<Vec<String>>,
+        boot_units: Vec<String>,
+    ) -> RootResult<i32> {
         // Determine the main command
         let main_cmd = main_command.unwrap_or_else(|| {
             #[cfg(unix)]
@@ -99,6 +139,47 @@ impl PsyRoot {
             let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
             vec![shell]
         });
+
+        // Spawn the socket listener first (so boot units can use the socket)
+        {
+            let root = Arc::clone(&self.shared);
+            tokio::spawn(async move {
+                if let Err(e) = run_socket_listener(root).await {
+                    eprintln!("psy: socket listener error: {e}");
+                }
+            });
+        }
+
+        // Start boot units from Psyfile (before main process)
+        if !boot_units.is_empty() {
+            let pf = self
+                .shared
+                .load_psyfile()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            if let Some(ref pf) = pf {
+                let start_order = psyfile::resolve_start_order(pf, &boot_units)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                for unit_name in &start_order {
+                    let req = Request::run(RunArgs {
+                        name: unit_name.clone(),
+                        command: vec![],
+                        restart: RestartPolicy::No,
+                        env: HashMap::new(),
+                        attach: false,
+                        extra_args: None,
+                    });
+                    let result = handle_request(&self.shared, req).await;
+                    if let HandleResult::Response(resp) = result {
+                        if !resp.ok {
+                            eprintln!(
+                                "psy: failed to start unit '{unit_name}': {}",
+                                resp.error.unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // Launch the main process
         {
@@ -124,16 +205,6 @@ impl PsyRoot {
             });
         }
 
-        // Spawn the socket listener
-        {
-            let root = Arc::clone(&self.shared);
-            tokio::spawn(async move {
-                if let Err(e) = run_socket_listener(root).await {
-                    eprintln!("psy: socket listener error: {e}");
-                }
-            });
-        }
-
         // Wait for the main process to exit or a signal
         let exit_code = wait_for_exit_or_signal(&mut self.main_exit_rx).await;
 
@@ -149,9 +220,7 @@ impl PsyRoot {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-async fn wait_for_exit_or_signal(
-    rx: &mut tokio::sync::watch::Receiver<Option<i32>>,
-) -> i32 {
+async fn wait_for_exit_or_signal(rx: &mut tokio::sync::watch::Receiver<Option<i32>>) -> i32 {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to register SIGTERM handler");
     loop {
@@ -172,9 +241,7 @@ async fn wait_for_exit_or_signal(
 }
 
 #[cfg(windows)]
-async fn wait_for_exit_or_signal(
-    rx: &mut tokio::sync::watch::Receiver<Option<i32>>,
-) -> i32 {
+async fn wait_for_exit_or_signal(rx: &mut tokio::sync::watch::Receiver<Option<i32>>) -> i32 {
     loop {
         tokio::select! {
             _ = rx.changed() => {
@@ -207,11 +274,21 @@ async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
         CMD_RESTART => HandleResult::Response(handle_restart(root, &req).await),
         CMD_DOWN => HandleResult::Response(handle_down(root, &req).await),
         CMD_HISTORY => HandleResult::Response(handle_history(root, &req).await),
-        _ => HandleResult::Response(Response::err(&req.id, format!("unknown command: {}", req.cmd))),
+        _ => HandleResult::Response(Response::err(
+            &req.id,
+            format!("unknown command: {}", req.cmd),
+        )),
     }
 }
 
-async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> HandleResult {
+fn handle_run<'a>(
+    root: &'a Arc<SharedRoot>,
+    req: &'a Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = HandleResult> + Send + 'a>> {
+    Box::pin(handle_run_inner(root, req))
+}
+
+async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult {
     if root.shutting_down.load(Ordering::Relaxed) {
         return HandleResult::Response(Response::err(&req.id, "server is shutting down"));
     }
@@ -222,7 +299,9 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> HandleResult {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
     {
         Some(a) => a,
-        None => return HandleResult::Response(Response::err(&req.id, "invalid or missing run args")),
+        None => {
+            return HandleResult::Response(Response::err(&req.id, "invalid or missing run args"))
+        }
     };
 
     if !validate_name(&args.name) {
@@ -232,37 +311,215 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> HandleResult {
         ));
     }
 
-    let attach = args.attach;
+    // Load Psyfile from disk (hot-reload)
+    let psyfile = match root.load_psyfile() {
+        Ok(pf) => pf,
+        Err(e) => {
+            // If the command has an explicit command, we can still run ad-hoc
+            if !args.command.is_empty() {
+                None
+            } else {
+                return HandleResult::Response(Response::err(
+                    &req.id,
+                    format!("Psyfile error: {e}"),
+                ));
+            }
+        }
+    };
+
+    // Check if this name matches a Psyfile unit
+    let has_unit = psyfile
+        .as_ref()
+        .map(|pf| pf.units.contains_key(&args.name))
+        .unwrap_or(false);
+
+    if has_unit {
+        let pf = psyfile.as_ref().unwrap();
+        let unit = &pf.units[&args.name];
+
+        // Start dependencies first
+        if !unit.depends_on.is_empty() {
+            let dep_order = match psyfile::resolve_start_order(pf, &unit.depends_on) {
+                Ok(o) => o,
+                Err(e) => {
+                    return HandleResult::Response(Response::err(
+                        &req.id,
+                        format!("dependency error: {e}"),
+                    ))
+                }
+            };
+            for dep_name in &dep_order {
+                let already_running = {
+                    let table = root.process_table.lock().await;
+                    if let Some(dep_unit) = pf.units.get(dep_name.as_str()) {
+                        if dep_unit.singleton {
+                            table
+                                .get(dep_name.as_str())
+                                .map(|e| e.state == ProcessState::Running)
+                                .unwrap_or(false)
+                        } else {
+                            table.iter().any(|(n, e)| {
+                                n.starts_with(&format!("{dep_name}."))
+                                    && e.state == ProcessState::Running
+                            })
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if !already_running {
+                    let dep_req = Request::run(RunArgs {
+                        name: dep_name.clone(),
+                        command: vec![],
+                        restart: RestartPolicy::No,
+                        env: HashMap::new(),
+                        attach: false,
+                        extra_args: None,
+                    });
+                    let result = handle_run(root, &dep_req).await;
+                    if let HandleResult::Response(ref resp) = result {
+                        if !resp.ok {
+                            return HandleResult::Response(Response::err(
+                                &req.id,
+                                format!(
+                                    "failed to start dependency '{dep_name}': {}",
+                                    resp.error.as_deref().unwrap_or("unknown")
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build command string
+        let extra = args.extra_args.as_deref().unwrap_or(&[]);
+        let extra_owned: Vec<String> = extra.to_vec();
+        let cmd_str = psyfile::build_command_with_args(&unit.command, &extra_owned);
+
+        // Merge env: unit.env + args.env (args override)
+        let mut resolved_env = unit.env.clone();
+        for (k, v) in &args.env {
+            resolved_env.insert(k.clone(), v.clone());
+        }
+
+        // Interpolate env vars in command and env values
+        let mut full_env: HashMap<String, String> = std::env::vars().collect();
+        full_env.insert("PSY_SOCK".into(), root.psy_sock.clone());
+        full_env.insert("PSY_ROOT_PID".into(), root.psy_root_pid.to_string());
+        for (k, v) in &resolved_env {
+            full_env.insert(k.clone(), v.clone());
+        }
+
+        let cmd_str = psyfile::interpolate(&cmd_str, &full_env);
+
+        let resolved_env: HashMap<String, String> = resolved_env
+            .into_iter()
+            .map(|(k, v)| (k, psyfile::interpolate(&v, &full_env)))
+            .collect();
+
+        // Determine process name (singleton vs template)
+        let (actual_name, instance_env) = if unit.singleton {
+            (args.name.clone(), HashMap::new())
+        } else {
+            let mut counters = root.template_counters.lock().await;
+            let n = counters.entry(args.name.clone()).or_insert(0);
+            *n += 1;
+            let instance = *n;
+            let name = format!("{}.{}", args.name, instance);
+            let mut ie = HashMap::new();
+            ie.insert("PSY_INSTANCE".into(), instance.to_string());
+            (name, ie)
+        };
+
+        // Resolve restart policy (CLI overrides Psyfile)
+        let restart = if args.restart != RestartPolicy::No {
+            args.restart
+        } else {
+            unit.restart
+        };
+
+        let shell_cmd = psyfile::build_shell_command(&cmd_str);
+
+        let mut final_env = resolved_env;
+        for (k, v) in instance_env {
+            final_env.insert(k, v);
+        }
+
+        let working_dir = unit.working_dir.as_ref().map(|d| {
+            let s = d.to_string_lossy().to_string();
+            std::path::PathBuf::from(psyfile::interpolate(&s, &full_env))
+        });
+
+        return spawn_process(
+            root,
+            &req.id,
+            actual_name,
+            shell_cmd,
+            final_env,
+            restart,
+            args.attach,
+            working_dir,
+        )
+        .await;
+    }
+
+    // --- Ad-hoc mode (existing behavior) ---
+    if args.command.is_empty() {
+        return HandleResult::Response(Response::err(
+            &req.id,
+            format!("no command provided for ad-hoc process '{}'", args.name),
+        ));
+    }
+
+    spawn_process(
+        root,
+        &req.id,
+        args.name.clone(),
+        args.command.clone(),
+        args.env.clone(),
+        args.restart,
+        args.attach,
+        None,
+    )
+    .await
+}
+
+/// Common process spawning logic used by both Psyfile and ad-hoc modes.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_process(
+    root: &Arc<SharedRoot>,
+    req_id: &str,
+    name: String,
+    command: Vec<String>,
+    env: HashMap<String, String>,
+    restart: RestartPolicy,
+    attach: bool,
+    working_dir: Option<std::path::PathBuf>,
+) -> HandleResult {
     let mut table = root.process_table.lock().await;
 
     // Allow replacing stopped/failed tombstones; only reject if still running
-    // Preserve run history from the old entry
-    let old_history = if let Some(existing) = table.get_mut(&args.name) {
+    let old_history = if let Some(existing) = table.get_mut(&name) {
         if existing.state == ProcessState::Running {
             return HandleResult::Response(Response::err(
-                &req.id,
-                format!("process '{}' is already running", args.name),
+                req_id,
+                format!("process '{}' is already running", name),
             ));
         }
-        // Archive the old entry's current run, then take its history
         existing.archive_current_run();
         let history = std::mem::take(&mut existing.run_history);
         let next_id = existing.current_run_id;
-        table.remove(&args.name);
+        table.remove(&name);
         Some((history, next_id))
     } else {
         None
     };
 
-    let mut entry = ProcessEntry::new(
-        args.name.clone(),
-        args.command.clone(),
-        args.env.clone(),
-        args.restart,
-        false,
-    );
+    let mut entry = ProcessEntry::new(name.clone(), command, env, restart, false);
+    entry.working_dir = working_dir;
 
-    // Restore history from previous incarnation
     if let Some((history, next_id)) = old_history {
         entry.run_history = history;
         entry.current_run_id = next_id;
@@ -271,21 +528,23 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> HandleResult {
     let child = if attach {
         match spawn_child_attached(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
-            Err(e) => return HandleResult::Response(Response::err(&req.id, format!("spawn failed: {e}"))),
+            Err(e) => {
+                return HandleResult::Response(Response::err(req_id, format!("spawn failed: {e}")))
+            }
         }
     } else {
         match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
-            Err(e) => return HandleResult::Response(Response::err(&req.id, format!("spawn failed: {e}"))),
+            Err(e) => {
+                return HandleResult::Response(Response::err(req_id, format!("spawn failed: {e}")))
+            }
         }
     };
 
     entry.child = Some(child);
-    let name = args.name.clone();
     table.insert(name.clone(), entry);
     drop(table);
 
-    // Spawn a monitor task for this child
     let root_clone = Arc::clone(root);
     let monitor_name = name.clone();
     tokio::spawn(async move {
@@ -293,8 +552,8 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> HandleResult {
     });
 
     let response = Response::ok(
-        &req.id,
-        Some(serde_json::json!({ "name": args.name, "status": "running" })),
+        req_id,
+        Some(serde_json::json!({ "name": name, "status": "running" })),
     );
 
     if attach {
@@ -324,10 +583,7 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let since = args
         .since
         .as_deref()
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-        })
+        .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&chrono::Utc)))
         .transpose();
     let since = match since {
         Ok(s) => s,
@@ -337,17 +593,66 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let until = args
         .until
         .as_deref()
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-        })
+        .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&chrono::Utc)))
         .transpose();
     let until = match until {
         Ok(u) => u,
         Err(e) => return Response::err(&req.id, format!("invalid until timestamp: {e}")),
     };
 
+    // Check if this is a template unit name — collect logs from all instances
+    let is_template = root
+        .load_psyfile()
+        .ok()
+        .flatten()
+        .and_then(|pf| pf.units.get(&args.name).map(|u| !u.singleton))
+        .unwrap_or(false);
+
     let table = root.process_table.lock().await;
+
+    if is_template {
+        let prefix = format!("{}.", args.name);
+        let grep_ref = args.grep.as_deref();
+        let mut all_lines = Vec::new();
+
+        for (instance_name, entry) in table.iter() {
+            if !instance_name.starts_with(&prefix) {
+                continue;
+            }
+            let stdout_lines = entry
+                .stdout_buf
+                .lines(None, args.stream, since, until, grep_ref);
+            let stderr_lines = entry
+                .stderr_buf
+                .lines(None, args.stream, since, until, grep_ref);
+            for mut line in stdout_lines.into_iter().chain(stderr_lines.into_iter()) {
+                // Prefix content with instance name
+                line.content = format!("[{}] {}", instance_name, line.content);
+                all_lines.push(line);
+            }
+        }
+
+        all_lines.sort_by_key(|l| l.timestamp);
+
+        if let Some(n) = args.tail {
+            let start = all_lines.len().saturating_sub(n);
+            all_lines = all_lines.split_off(start);
+        }
+
+        let lines_json: Vec<serde_json::Value> = all_lines
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "timestamp": l.timestamp.to_rfc3339(),
+                    "stream": l.stream,
+                    "content": l.content,
+                })
+            })
+            .collect();
+
+        return Response::ok(&req.id, Some(serde_json::json!({ "lines": lines_json })));
+    }
+
     let entry = match table.get(&args.name) {
         Some(e) => e,
         None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
@@ -355,7 +660,6 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
 
     // Resolve which run's buffers to use
     let (stdout_buf, stderr_buf) = if args.previous {
-        // --previous: the run before the current one
         if entry.run_history.is_empty() {
             return Response::err(&req.id, "no previous run");
         }
@@ -366,7 +670,10 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
             (Arc::clone(&entry.stdout_buf), Arc::clone(&entry.stderr_buf))
         } else {
             match entry.run_history.iter().find(|r| r.run_id == run_id) {
-                Some(record) => (Arc::clone(&record.stdout_buf), Arc::clone(&record.stderr_buf)),
+                Some(record) => (
+                    Arc::clone(&record.stdout_buf),
+                    Arc::clone(&record.stderr_buf),
+                ),
                 None => return Response::err(&req.id, format!("run {} not found", run_id)),
             }
         }
@@ -374,7 +681,6 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
         (Arc::clone(&entry.stdout_buf), Arc::clone(&entry.stderr_buf))
     };
 
-    // Collect lines from both stdout and stderr buffers, merge by timestamp
     let grep_ref = args.grep.as_deref();
     let stdout_lines = stdout_buf.lines(None, args.stream, since, until, grep_ref);
     let stderr_lines = stderr_buf.lines(None, args.stream, since, until, grep_ref);
@@ -385,7 +691,6 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
         .collect();
     all_lines.sort_by_key(|l| l.timestamp);
 
-    // Apply tail
     if let Some(n) = args.tail {
         let start = all_lines.len().saturating_sub(n);
         all_lines = all_lines.split_off(start);
@@ -419,6 +724,47 @@ async fn handle_stop(root: &Arc<SharedRoot>, req: &Request) -> Response {
         return Response::err(&req.id, "cannot stop the main process (use 'down' instead)");
     }
 
+    // Check if this is a template unit name (non-singleton) — stop all instances
+    let is_template = root
+        .load_psyfile()
+        .ok()
+        .flatten()
+        .and_then(|pf| pf.units.get(&args.name).map(|u| !u.singleton))
+        .unwrap_or(false);
+
+    if is_template {
+        let prefix = format!("{}.", args.name);
+        let pids: Vec<(String, Option<u32>)> = {
+            let mut table = root.process_table.lock().await;
+            table
+                .iter_mut()
+                .filter(|(n, e)| n.starts_with(&prefix) && e.state == ProcessState::Running)
+                .map(|(n, e)| {
+                    e.stopping.store(true, Ordering::Relaxed);
+                    (n.clone(), e.pid)
+                })
+                .collect()
+        };
+
+        for (_, pid) in &pids {
+            if let Some(pid) = pid {
+                let pid = *pid;
+                tokio::task::spawn_blocking(move || {
+                    platform::stop_process(pid, Duration::from_secs(10));
+                })
+                .await
+                .ok();
+            }
+        }
+
+        return Response::ok(
+            &req.id,
+            Some(
+                serde_json::json!({ "name": args.name, "status": "stopped", "instances": pids.len() }),
+            ),
+        );
+    }
+
     let pid = {
         let mut table = root.process_table.lock().await;
         match table.get_mut(&args.name) {
@@ -434,7 +780,6 @@ async fn handle_stop(root: &Arc<SharedRoot>, req: &Request) -> Response {
     };
 
     if let Some(pid) = pid {
-        // stop_process is synchronous and blocking, so run it on a blocking thread
         tokio::task::spawn_blocking(move || {
             platform::stop_process(pid, Duration::from_secs(10));
         })
@@ -448,7 +793,14 @@ async fn handle_stop(root: &Arc<SharedRoot>, req: &Request) -> Response {
     )
 }
 
-async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
+fn handle_restart<'a>(
+    root: &'a Arc<SharedRoot>,
+    req: &'a Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
+    Box::pin(handle_restart_inner(root, req))
+}
+
+async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let args: RestartArgs = match req
         .args
         .as_ref()
@@ -458,8 +810,53 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         None => return Response::err(&req.id, "invalid or missing restart args"),
     };
 
-    // Get info needed to stop and respawn
-    let (pid, command, env, restart_policy) = {
+    // Load Psyfile for template check and command re-resolution
+    let psyfile = root.load_psyfile().ok().flatten();
+
+    // Check if this is a template unit name — restart all instances
+    let is_template = psyfile
+        .as_ref()
+        .and_then(|pf| pf.units.get(&args.name))
+        .map(|u| !u.singleton)
+        .unwrap_or(false);
+
+    if is_template {
+        let prefix = format!("{}.", args.name);
+        let instances: Vec<String> = {
+            let table = root.process_table.lock().await;
+            table
+                .keys()
+                .filter(|n| n.starts_with(&prefix))
+                .cloned()
+                .collect()
+        };
+
+        for instance_name in &instances {
+            let sub_req = Request::restart(RestartArgs {
+                name: instance_name.clone(),
+            });
+            let _ = handle_restart(root, &sub_req).await;
+        }
+
+        return Response::ok(
+            &req.id,
+            Some(
+                serde_json::json!({ "name": args.name, "status": "restarted", "instances": instances.len() }),
+            ),
+        );
+    }
+
+    // Determine the unit name for Psyfile lookup.
+    // For template instances like "worker.3", strip the suffix to find "worker" in the Psyfile.
+    let unit_name = args
+        .name
+        .rsplit_once('.')
+        .map(|(base, _)| base)
+        .unwrap_or(&args.name);
+    let unit_def = psyfile.as_ref().and_then(|pf| pf.units.get(unit_name));
+
+    // Get info needed to stop
+    let (pid, old_command, old_env, old_restart, old_working_dir) = {
         let mut table = root.process_table.lock().await;
         match table.get_mut(&args.name) {
             Some(entry) => {
@@ -469,6 +866,7 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
                     entry.command.clone(),
                     entry.env.clone(),
                     entry.restart_policy,
+                    entry.working_dir.clone(),
                 )
             }
             None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
@@ -483,14 +881,37 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         })
         .await
         .ok();
-        // Wait briefly for the monitor to update state
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // Re-resolve command from Psyfile if this is a unit (hot-reload)
+    let (command, env, restart_policy, working_dir) = if let Some(unit) = unit_def {
+        let cmd_str = psyfile::build_command_with_args(&unit.command, &[]);
+        let mut full_env: HashMap<String, String> = std::env::vars().collect();
+        full_env.insert("PSY_SOCK".into(), root.psy_sock.clone());
+        full_env.insert("PSY_ROOT_PID".into(), root.psy_root_pid.to_string());
+        for (k, v) in &unit.env {
+            full_env.insert(k.clone(), v.clone());
+        }
+        let cmd_str = psyfile::interpolate(&cmd_str, &full_env);
+        let resolved_env: HashMap<String, String> = unit
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), psyfile::interpolate(v, &full_env)))
+            .collect();
+        let shell_cmd = psyfile::build_shell_command(&cmd_str);
+        let wd = unit.working_dir.as_ref().map(|d| {
+            let s = d.to_string_lossy().to_string();
+            std::path::PathBuf::from(psyfile::interpolate(&s, &full_env))
+        });
+        (shell_cmd, resolved_env, unit.restart, wd)
+    } else {
+        (old_command, old_env, old_restart, old_working_dir)
+    };
 
     // Archive current run and re-create with fresh buffers
     {
         let mut table = root.process_table.lock().await;
-        // Archive the old run's state and take the history
         let (history, next_id) = if let Some(old) = table.get_mut(&args.name) {
             old.archive_current_run();
             (std::mem::take(&mut old.run_history), old.current_run_id)
@@ -502,6 +923,7 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         let mut entry = ProcessEntry::new(args.name.clone(), command, env, restart_policy, false);
         entry.run_history = history;
         entry.current_run_id = next_id;
+        entry.working_dir = working_dir;
 
         let child = match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
@@ -513,7 +935,6 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         table.insert(name.clone(), entry);
         drop(table);
 
-        // Spawn monitor for the restarted process
         let root_clone = Arc::clone(root);
         tokio::spawn(async move {
             monitor_child(root_clone, name).await;
@@ -547,6 +968,9 @@ async fn handle_history(root: &Arc<SharedRoot>, req: &Request) -> Response {
     };
 
     let table = root.process_table.lock().await;
+
+    // Check for template unit — if the exact name isn't in the table but is a
+    // template in the Psyfile, we can't show history for the group.
     let entry = match table.get(&args.name) {
         Some(e) => e,
         None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
@@ -957,8 +1381,12 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
 
         // Send existing tail lines first (with since/grep filtering)
         let grep_ref = grep.as_deref();
-        let stdout_lines = entry.stdout_buf.lines(None, args.stream, since, None, grep_ref);
-        let stderr_lines = entry.stderr_buf.lines(None, args.stream, since, None, grep_ref);
+        let stdout_lines = entry
+            .stdout_buf
+            .lines(None, args.stream, since, None, grep_ref);
+        let stderr_lines = entry
+            .stderr_buf
+            .lines(None, args.stream, since, None, grep_ref);
 
         let mut all_lines: Vec<_> = stdout_lines
             .into_iter()

@@ -3,10 +3,12 @@ pub mod mcp;
 pub mod platform;
 pub mod process;
 pub mod protocol;
+pub mod psyfile;
 pub mod ring_buffer;
 pub mod root;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -38,6 +40,15 @@ enum Commands {
         /// Name for the main process
         #[arg(long)]
         name: Option<String>,
+        /// Psyfile unit names to start on boot
+        #[arg(value_name = "UNITS")]
+        units: Vec<String>,
+        /// Start all Psyfile units
+        #[arg(long)]
+        all: bool,
+        /// Path to Psyfile (overrides discovery)
+        #[arg(long)]
+        file: Option<PathBuf>,
         /// Command to run as the main process (default: $SHELL)
         #[arg(last = true)]
         command: Vec<String>,
@@ -55,8 +66,8 @@ enum Commands {
         /// Attach terminal stdin/stdout to the child process
         #[arg(long)]
         attach: bool,
-        /// Command to run
-        #[arg(last = true, required = true)]
+        /// Command to run (required for ad-hoc processes, optional for Psyfile units)
+        #[arg(last = true)]
         command: Vec<String>,
     },
     /// List managed processes
@@ -128,9 +139,81 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Up { name, command } => {
+        Commands::Up {
+            name,
+            units,
+            all,
+            file,
+            command,
+        } => {
+            // Resolve the Psyfile path
+            let psyfile_path: Option<std::path::PathBuf> = if let Some(ref path) = file {
+                // Explicit --file: validate it exists and parses
+                match psyfile::parse(path) {
+                    Ok(pf) => {
+                        if let Err(e) = psyfile::validate(&pf) {
+                            eprintln!("psy up: Psyfile error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("psy up: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Some(path.clone())
+            } else if !units.is_empty() || all {
+                // Need a Psyfile but none explicitly given — discover
+                match psyfile::discover(&std::env::current_dir().unwrap_or_default()) {
+                    Some(path) => {
+                        match psyfile::parse(&path) {
+                            Ok(pf) => {
+                                if let Err(e) = psyfile::validate(&pf) {
+                                    eprintln!("psy up: Psyfile error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("psy up: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                        Some(path)
+                    }
+                    None => {
+                        eprintln!("psy up: no Psyfile found");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // No explicit --file, no units requested — discovery is optional.
+                // The root will re-discover on each request (hot-reload).
+                None
+            };
+
+            // Determine which units to start
+            let boot_units = if all {
+                // Parse the Psyfile to get all unit names
+                let pf_path = psyfile_path.as_ref().unwrap(); // validated above
+                let pf = psyfile::parse(pf_path).unwrap();
+                pf.units.keys().cloned().collect::<Vec<_>>()
+            } else if !units.is_empty() {
+                // Validate unit names exist in the Psyfile
+                let pf_path = psyfile_path.as_ref().unwrap(); // validated above
+                let pf = psyfile::parse(pf_path).unwrap();
+                for u in &units {
+                    if !pf.units.contains_key(u) {
+                        eprintln!("psy up: unknown unit '{u}' in Psyfile");
+                        std::process::exit(1);
+                    }
+                }
+                units
+            } else {
+                Vec::new()
+            };
+
             let root_name = name.unwrap_or_else(|| format!("psy-{}", std::process::id()));
-            let psy_root = match root::PsyRoot::new(root_name) {
+            let psy_root = match root::PsyRoot::new(root_name, psyfile_path) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("psy up: {e}");
@@ -144,7 +227,7 @@ fn main() {
             };
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             let exit_code = rt.block_on(async {
-                match psy_root.run(main_cmd).await {
+                match psy_root.run(main_cmd, boot_units).await {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("psy: {e}");
@@ -176,22 +259,25 @@ fn main() {
             let restart_policy = parse_restart_policy(&restart);
             let env = parse_env_args(&envs);
             if attach {
-                if let Err(e) = client::run_attached(
-                    &name,
-                    command,
-                    restart_policy,
-                    env,
-                ) {
+                if let Err(e) = client::run_attached(&name, command, restart_policy, env) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             } else {
+                // If command is empty, this might be a Psyfile unit — send with
+                // empty command and let the root resolve it.
+                let (cmd, extra) = if command.is_empty() {
+                    (vec![], None)
+                } else {
+                    (command, None)
+                };
                 let req = Request::run(RunArgs {
                     name,
-                    command,
+                    command: cmd,
                     restart: restart_policy,
                     env,
                     attach: false,
+                    extra_args: extra,
                 });
                 send_and_print(req);
             }
@@ -263,12 +349,8 @@ fn main() {
             let until_str = until_abs.map(|t| t.to_rfc3339());
 
             if follow {
-                if let Err(e) = client::follow_logs(
-                    &name,
-                    stream,
-                    since_str.clone(),
-                    grep.clone(),
-                ) {
+                if let Err(e) = client::follow_logs(&name, stream, since_str.clone(), grep.clone())
+                {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -296,20 +378,15 @@ fn main() {
                                         .get("stream")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("stdout");
-                                    let content = line
-                                        .get("content")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
+                                    let content =
+                                        line.get("content").and_then(|v| v.as_str()).unwrap_or("");
                                     println!("[{ts} {s}] {content}");
                                 }
                             }
                         }
                     }
                     Ok(resp) => {
-                        eprintln!(
-                            "error: {}",
-                            resp.error.unwrap_or_else(|| "unknown".into())
-                        );
+                        eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
                         std::process::exit(1);
                     }
                     Err(e) => {
@@ -325,8 +402,7 @@ fn main() {
             match client::send_command(req) {
                 Ok(resp) if resp.ok => {
                     if let Some(data) = resp.data {
-                        if let Ok(history) =
-                            serde_json::from_value::<HistoryResponse>(data.clone())
+                        if let Ok(history) = serde_json::from_value::<HistoryResponse>(data.clone())
                         {
                             print_history_table(&history);
                         } else {
@@ -455,8 +531,8 @@ fn print_ps_table(ps: &PsResponse) {
         return;
     }
     println!(
-        "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}",
-        "NAME", "PID", "STATUS", "EXIT", "UPTIME", "RESTARTS", "RESTART"
+        "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} RESTART",
+        "NAME", "PID", "STATUS", "EXIT", "UPTIME", "RESTARTS"
     );
     println!("{}", "-".repeat(78));
     for p in &ps.processes {
@@ -470,7 +546,7 @@ fn print_ps_table(ps: &PsResponse) {
         };
         let uptime = p
             .uptime_secs
-            .map(|s| format_uptime(s))
+            .map(format_uptime)
             .unwrap_or_else(|| "-".into());
         let restart = format!("{:?}", p.restart_policy).to_lowercase();
         println!(
@@ -486,8 +562,8 @@ fn print_history_table(history: &HistoryResponse) {
         return;
     }
     println!(
-        "{:<6} {:<10} {:<8} {:<28} {}",
-        "RUN", "STATUS", "EXIT", "STARTED", "DURATION"
+        "{:<6} {:<10} {:<8} {:<28} DURATION",
+        "RUN", "STATUS", "EXIT", "STARTED"
     );
     println!("{}", "-".repeat(68));
     for r in &history.runs {
@@ -501,7 +577,7 @@ fn print_history_table(history: &HistoryResponse) {
         let started = r.started_at.as_deref().unwrap_or("-");
         let duration = r
             .duration_secs
-            .map(|s| format_uptime(s))
+            .map(format_uptime)
             .unwrap_or_else(|| "-".into());
         println!(
             "{:<6} {:<10} {:<8} {:<28} {}",

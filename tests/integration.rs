@@ -5,10 +5,14 @@
 //!
 //! Each test starts a `psy up` root process and cleans it up on drop.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -23,6 +27,34 @@ fn psy_bin() -> PathBuf {
 struct PsyRoot {
     child: Child,
     sock: String,
+}
+
+/// A temp directory that creates a Psyfile and cleans up on drop.
+struct TempPsyfileDir {
+    path: PathBuf,
+}
+
+impl TempPsyfileDir {
+    fn new(psyfile_content: &str) -> Self {
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("psy-test-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&dir);
+        let psyfile_path = dir.join("Psyfile");
+        let mut f = std::fs::File::create(&psyfile_path).expect("create Psyfile");
+        f.write_all(psyfile_content.as_bytes())
+            .expect("write Psyfile");
+        TempPsyfileDir { path: dir }
+    }
+
+    fn psyfile_path(&self) -> PathBuf {
+        self.path.join("Psyfile")
+    }
+}
+
+impl Drop for TempPsyfileDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 impl PsyRoot {
@@ -42,6 +74,48 @@ impl PsyRoot {
         // Build the expected socket path (mirrors platform::socket_path).
         let sock = Self::socket_path_for(pid);
 
+        PsyRoot { child, sock }
+    }
+
+    /// Start `psy up` with a Psyfile and optional boot units.
+    fn start_with_psyfile(
+        psyfile_path: &std::path::Path,
+        boot_units: &[&str],
+        main_command: &[&str],
+    ) -> Self {
+        let mut cmd = Command::new(psy_bin());
+        cmd.arg("up");
+        cmd.arg("--file").arg(psyfile_path);
+        for unit in boot_units {
+            cmd.arg(unit);
+        }
+        cmd.arg("--").args(main_command);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn().expect("failed to start psy up with Psyfile");
+        let pid = child.id();
+
+        thread::sleep(Duration::from_secs(2));
+        let sock = Self::socket_path_for(pid);
+        PsyRoot { child, sock }
+    }
+
+    /// Start `psy up --all` with a Psyfile.
+    fn start_with_psyfile_all(psyfile_path: &std::path::Path, main_command: &[&str]) -> Self {
+        let mut cmd = Command::new(psy_bin());
+        cmd.arg("up");
+        cmd.arg("--file").arg(psyfile_path);
+        cmd.arg("--all");
+        cmd.arg("--").args(main_command);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn().expect("failed to start psy up --all");
+        let pid = child.id();
+
+        thread::sleep(Duration::from_secs(2));
+        let sock = Self::socket_path_for(pid);
         PsyRoot { child, sock }
     }
 
@@ -930,12 +1004,20 @@ fn test_logs_run_with_grep() {
 
     #[cfg(unix)]
     let cmd1 = vec![
-        "run", "greprun", "--", "sh", "-c",
+        "run",
+        "greprun",
+        "--",
+        "sh",
+        "-c",
         "echo 'ERROR: old crash' && echo 'INFO: ok'",
     ];
     #[cfg(windows)]
     let cmd1 = vec![
-        "run", "greprun", "--", "cmd", "/c",
+        "run",
+        "greprun",
+        "--",
+        "cmd",
+        "/c",
         "echo ERROR: old crash && echo INFO: ok",
     ];
     root.psy(&cmd1);
@@ -989,5 +1071,334 @@ fn test_history_after_restart() {
     assert!(
         prev_logs.contains("BEFORE"),
         "--previous should show pre-restart logs, got: {prev_logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0 — Psyfile tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_psyfile_unit_run() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[echoer]
+command = "echo psyfile-works"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    // Run the Psyfile unit (no -- command needed)
+    root.psy(&["run", "echoer"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "echoer"]);
+    assert!(
+        logs.contains("psyfile-works"),
+        "Psyfile unit should produce output, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_unit_with_env() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[envunit]
+command = "echo ${MY_VAR}"
+env = { MY_VAR = "injected-value" }
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "envunit"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "envunit"]);
+    assert!(
+        logs.contains("injected-value"),
+        "Psyfile env should be interpolated, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_depends_on() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[db]
+command = "echo db-started && sleep 60"
+restart = "no"
+
+[api]
+command = "echo api-started && sleep 60"
+depends_on = ["db"]
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    // Running api should auto-start db
+    root.psy(&["run", "api"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("db") && ps.contains("api"),
+        "both db and api should be running, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_template_unit() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[client]
+command = "echo client-instance && sleep 60"
+singleton = false
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "client"]);
+    root.psy(&["run", "client"]);
+    root.psy(&["run", "client"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("client.1") && ps.contains("client.2") && ps.contains("client.3"),
+        "template should create numbered instances, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_template_group_stop() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[worker]
+command = "sleep 999"
+singleton = false
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "worker"]);
+    root.psy(&["run", "worker"]);
+    thread::sleep(Duration::from_secs(1));
+
+    // Stop the group
+    root.psy(&["stop", "worker"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let ps = root.psy_stdout(&["ps"]);
+    // Both instances should be stopped
+    let running_workers = ps
+        .lines()
+        .filter(|l| l.contains("worker.") && l.contains("running"))
+        .count();
+    assert_eq!(
+        running_workers, 0,
+        "all worker instances should be stopped, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_up_all() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[svc1]
+command = "echo svc1-ok && sleep 60"
+
+[svc2]
+command = "echo svc2-ok && sleep 60"
+
+[svc3]
+command = "echo svc3-ok && sleep 60"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile_all(&tmp.psyfile_path(), &to_refs(&sl));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("svc1") && ps.contains("svc2") && ps.contains("svc3"),
+        "--all should start all units, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_selective_boot() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[db]
+command = "echo db-ok && sleep 60"
+
+[api]
+command = "echo api-ok && sleep 60"
+depends_on = ["db"]
+
+[worker]
+command = "echo worker-ok && sleep 60"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &["api"], &to_refs(&sl));
+
+    let ps = root.psy_stdout(&["ps"]);
+    // db and api should be running (api depends on db), but not worker
+    assert!(
+        ps.contains("db") && ps.contains("api"),
+        "db and api should be running, got: {ps}"
+    );
+    assert!(
+        !ps.contains("worker"),
+        "worker should not be started, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_adhoc_alongside() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[server]
+command = "echo server-ok && sleep 60"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    // Run a Psyfile unit
+    root.psy(&["run", "server"]);
+    // Run an ad-hoc process
+    let echo = sh_c("echo adhoc-ok && sleep 60");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "adhoc", "--"];
+    run_args.extend(echo_refs);
+    root.psy(&run_args);
+
+    thread::sleep(Duration::from_secs(1));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("server") && ps.contains("adhoc"),
+        "both Psyfile unit and ad-hoc should run, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_no_command_adhoc_error() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Without a Psyfile, running without a command should error
+    let out = root.psy(&["run", "nocommand"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.to_lowercase().contains("error")
+            || combined.to_lowercase().contains("no command")
+            || !out.status.success(),
+        "run without command should error, got: {combined}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_env_interpolation_default() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[porttest]
+command = "echo ${PORT:-8080}"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "porttest"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "porttest"]);
+    assert!(
+        logs.contains("8080"),
+        "default value should be used, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_restart_override() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[crasher]
+command = "exit 1"
+restart = "no"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    // Override restart policy via CLI
+    root.psy(&["run", "crasher", "--restart", "on-failure"]);
+    thread::sleep(Duration::from_secs(3));
+
+    let ps = root.psy_stdout(&["ps"]);
+    // Should show on_failure restart policy and restarts > 0
+    let crasher_line = ps.lines().find(|l| l.contains("crasher")).unwrap_or("");
+    assert!(
+        crasher_line.contains("on_failure") || crasher_line.contains("onfailure"),
+        "restart policy should be overridden, got: {crasher_line}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_working_dir() {
+    let sl = sleep_cmd(60);
+
+    let work_dir = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let work_dir_str = work_dir.to_string_lossy().replace('\\', "/");
+
+    #[cfg(unix)]
+    let psyfile_content = format!(
+        "[pwdtest]\ncommand = \"pwd\"\nworking_dir = \"{}\"\n",
+        work_dir_str
+    );
+    #[cfg(windows)]
+    let psyfile_content = format!(
+        "[pwdtest]\ncommand = \"cd\"\nworking_dir = \"{}\"\n",
+        work_dir_str
+    );
+
+    let tmp = TempPsyfileDir::new(&psyfile_content);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "pwdtest"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "pwdtest"]);
+    // Normalize both paths for comparison
+    let expected = work_dir.to_string_lossy().to_lowercase();
+    let logs_lower = logs.to_lowercase();
+    assert!(
+        logs_lower.contains(&expected)
+            || logs_lower.contains(&expected.replace('\\', "/"))
+            || logs_lower.contains("/private/tmp")
+            || logs_lower.contains("temp"),
+        "working dir should be {expected}, got: {logs}"
     );
 }
