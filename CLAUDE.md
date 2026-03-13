@@ -26,7 +26,7 @@ psy/
 │   └── platform/
 │       ├── mod.rs           # platform trait + conditional re-exports
 │       ├── unix.rs          # pipe trick, subreaper (Linux), signal handling
-│       └── windows.rs       # Job Objects, named pipes, console ctrl (stubs)
+│       └── windows.rs       # Job Objects, named pipes, console ctrl
 ├── tests/
 │   └── integration.rs       # cross-platform integration tests
 └── .github/
@@ -111,14 +111,14 @@ psy/
 - [ ] kqueue `EVFILT_PROC` + `NOTE_EXIT` watchdog (optional secondary, not implemented)
 
 ### Platform: Windows (`src/platform/windows.rs`)
-- [ ] Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (stub)
-- [ ] `AssignProcessToJobObject` for each child (stub)
-- [ ] Named pipe at `\\.\pipe\psy-<pid>` (stub)
-- [ ] `CTRL_BREAK_EVENT` for graceful stop (stub)
-- [ ] `TerminateProcess` fallback (stub)
-- [ ] `CREATE_NEW_PROCESS_GROUP` for child spawning (stub)
-- [ ] `CreatePipe` for stdio capture via `STARTUPINFO` (stub)
-- [ ] Anonymous pipe trick (inheritable handles) (stub)
+- [x] Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+- [x] `AssignProcessToJobObject` for each child
+- [x] Named pipe at `\\.\pipe\psy-<pid>` (tokio named pipe server in root.rs)
+- [x] `CTRL_BREAK_EVENT` for graceful stop
+- [x] `TerminateProcess` fallback
+- [x] `CREATE_NEW_PROCESS_GROUP` for child spawning
+- [x] `CreatePipe` for death pipe (inheritable handles)
+- [x] Death pipe created; watchdog thread is no-op (Job Object is primary mechanism)
 
 ### MCP Server (`src/mcp.rs`)
 - [x] JSON-RPC over stdin/stdout transport
@@ -178,6 +178,6 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - Serialization: serde + serde_json, NDJSON over sockets
 - CLI parsing: clap derive API
 - Error handling: Box<dyn Error> / Result types (no anyhow)
-- Platform code: `src/platform/unix.rs` (shared Linux+macOS with cfg), `src/platform/windows.rs` (stubs)
+- Platform code: `src/platform/unix.rs` (shared Linux+macOS with cfg), `src/platform/windows.rs`
 - Socket path: `/tmp/psy-<uid>/<pid>.sock` on macOS, `$XDG_RUNTIME_DIR/psy/<pid>.sock` on Linux (fallback `/tmp/...`)
-- Windows IPC: named pipe `\\.\pipe\psy-<pid>` (not yet functional)
+- Windows IPC: named pipe `\\.\pipe\psy-<pid>` (tokio named pipe server)
