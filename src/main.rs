@@ -208,7 +208,40 @@ fn main() {
                 }
             } else {
                 let req = Request::logs(LogsArgs { name, tail, stream });
-                send_and_print(req);
+                match client::send_command(req) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(data) = resp.data {
+                            if let Some(lines) = data.get("lines").and_then(|v| v.as_array()) {
+                                for line in lines {
+                                    let ts = line
+                                        .get("timestamp")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let s = line
+                                        .get("stream")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("stdout");
+                                    let content = line
+                                        .get("content")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    println!("[{ts} {s}] {content}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown".into())
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
 
@@ -278,20 +311,37 @@ fn print_ps_table(ps: &PsResponse) {
         return;
     }
     println!(
-        "{:<20} {:<8} {:<12} {:<12} UPTIME",
-        "NAME", "PID", "STATUS", "RESTART"
+        "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}",
+        "NAME", "PID", "STATUS", "EXIT", "UPTIME", "RESTARTS", "RESTART"
     );
-    println!("{}", "-".repeat(64));
+    println!("{}", "-".repeat(78));
     for p in &ps.processes {
         let pid_str = p.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let exit_str = if let Some(sig) = &p.signal {
+            sig.clone()
+        } else {
+            p.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into())
+        };
         let uptime = p
             .uptime_secs
-            .map(|s| format!("{s}s"))
+            .map(|s| format_uptime(s))
             .unwrap_or_else(|| "-".into());
         let restart = format!("{:?}", p.restart_policy).to_lowercase();
         println!(
-            "{:<20} {:<8} {:<12} {:<12} {}",
-            p.name, pid_str, p.status, restart, uptime
+            "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}",
+            p.name, pid_str, p.status, exit_str, uptime, p.restarts, restart
         );
+    }
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m {}s", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
 }

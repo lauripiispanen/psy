@@ -56,22 +56,50 @@ Download from [GitHub Releases](https://github.com/lauripiispanen/psy/releases) 
 ## CLI
 
 ```
-psy up [--name <name>] [-- <command>]             Start a psy root session
-psy run <name> [--restart <policy>] [-- <cmd>]   Launch a managed child process
-psy ps                                            List managed processes
-psy logs <name> [-f] [--tail <n>]                 View captured logs
-psy stop <name>                                   Stop a process (SIGTERM → SIGKILL)
-psy restart <name>                                Restart with same arguments
-psy down                                          Tear down everything
-psy mcp                                           Start MCP JSON-RPC server
-psy version                                       Print version
+psy up [--name <name>] [-- <command>]              Start a psy root session
+psy run <name> [--restart <policy>] [-- <cmd>]    Launch a managed child process
+psy ps                                             List managed processes
+psy logs <name> [-f] [--tail <n>]                  View captured logs
+psy stop <name>                                    Stop a process (SIGTERM → SIGKILL)
+psy restart <name>                                 Restart with same arguments
+psy down                                           Tear down everything
+psy mcp                                            Start MCP JSON-RPC server
+psy version                                        Print version
 ```
+
+### Process status
+
+```
+$ psy ps
+NAME                 PID      STATUS     EXIT     UPTIME         RESTARTS   RESTART
+------------------------------------------------------------------------------
+main                 12345    running    -        2h 13m 4s      0          no
+server               12350    running    -        1h 58m 2s      0          on-failure
+worker               -        stopped    0        -              0          no
+crasher              -        failed     1        -              5          on-failure
+```
+
+Stopped processes remain visible as tombstones. Re-running `psy run` with the same name replaces a stopped or failed process.
 
 ### Restart policies
 
 - `no` (default) — don't restart on exit
 - `on-failure` — restart on non-zero exit, up to 5 times with exponential backoff
 - `always` — restart unconditionally, same backoff and limit
+
+### Logs
+
+```bash
+psy logs server              # full log (plain text)
+psy logs server --tail 20    # last 20 lines
+psy logs server -f           # follow (stream until Ctrl-C)
+psy logs server --stdout     # stdout only
+psy logs server --stderr     # stderr only
+```
+
+Output format: `[2025-03-12T10:15:32.123Z stdout] Server listening on :8080`
+
+Logs are kept in a per-process ring buffer (10k lines / 2MB) and survive process restarts.
 
 ## MCP Integration
 
@@ -92,6 +120,8 @@ psy creates a Unix domain socket (or named pipe on Windows) and manages a proces
 - **Linux** — `PR_SET_CHILD_SUBREAPER` + `PR_SET_PDEATHSIG` ensures children die with the parent
 - **macOS** — Pipe trick: children detect parent death via EOF on an inherited file descriptor
 - **Windows** — Job Object with `KILL_ON_JOB_CLOSE` terminates all descendants
+
+**Signal handling:** SIGTERM and SIGINT on the root trigger graceful teardown of all children before exit.
 
 ## License
 

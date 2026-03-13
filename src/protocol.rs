@@ -117,6 +117,9 @@ pub struct ProcessInfo {
     pub restart_policy: RestartPolicy,
     pub started_at: Option<String>,
     pub uptime_secs: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub restarts: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

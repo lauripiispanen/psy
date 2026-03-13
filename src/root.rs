@@ -133,18 +133,58 @@ impl PsyRoot {
             });
         }
 
-        // Wait for the main process to exit
-        let exit_code = loop {
-            self.main_exit_rx.changed().await.ok();
-            if let Some(code) = *self.main_exit_rx.borrow() {
-                break code;
-            }
-        };
+        // Wait for the main process to exit or a signal
+        let exit_code = wait_for_exit_or_signal(&mut self.main_exit_rx).await;
 
         // Teardown all remaining children
         teardown(Arc::clone(&self.shared)).await;
 
         Ok(exit_code)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signal handling
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+async fn wait_for_exit_or_signal(
+    rx: &mut tokio::sync::watch::Receiver<Option<i32>>,
+) -> i32 {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+    loop {
+        tokio::select! {
+            _ = rx.changed() => {
+                if let Some(code) = *rx.borrow() {
+                    return code;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                return 130; // 128 + SIGINT(2)
+            }
+            _ = sigterm.recv() => {
+                return 143; // 128 + SIGTERM(15)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_exit_or_signal(
+    rx: &mut tokio::sync::watch::Receiver<Option<i32>>,
+) -> i32 {
+    loop {
+        tokio::select! {
+            _ = rx.changed() => {
+                if let Some(code) = *rx.borrow() {
+                    return code;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                return 130;
+            }
+        }
     }
 }
 
@@ -187,8 +227,12 @@ async fn handle_run(root: &Arc<SharedRoot>, req: &Request) -> Response {
 
     let mut table = root.process_table.lock().await;
 
-    if table.contains_key(&args.name) {
-        return Response::err(&req.id, format!("process '{}' already exists", args.name));
+    // Allow replacing stopped/failed tombstones; only reject if still running
+    if let Some(existing) = table.get(&args.name) {
+        if existing.state == ProcessState::Running {
+            return Response::err(&req.id, format!("process '{}' is already running", args.name));
+        }
+        table.remove(&args.name);
     }
 
     let mut entry = ProcessEntry::new(
@@ -289,9 +333,12 @@ async fn handle_stop(root: &Arc<SharedRoot>, req: &Request) -> Response {
     }
 
     let pid = {
-        let table = root.process_table.lock().await;
-        match table.get(&args.name) {
-            Some(entry) if entry.state == ProcessState::Running => entry.pid,
+        let mut table = root.process_table.lock().await;
+        match table.get_mut(&args.name) {
+            Some(entry) if entry.state == ProcessState::Running => {
+                entry.stopping.store(true, Ordering::Relaxed);
+                entry.pid
+            }
             Some(_) => {
                 return Response::err(&req.id, format!("process '{}' is not running", args.name))
             }
@@ -324,16 +371,21 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         None => return Response::err(&req.id, "invalid or missing restart args"),
     };
 
-    // Get info needed to stop and respawn
-    let (pid, command, env, restart_policy) = {
-        let table = root.process_table.lock().await;
-        match table.get(&args.name) {
-            Some(entry) => (
-                entry.pid,
-                entry.command.clone(),
-                entry.env.clone(),
-                entry.restart_policy,
-            ),
+    // Get info needed to stop and respawn, and preserve log buffers
+    let (pid, command, env, restart_policy, stdout_buf, stderr_buf) = {
+        let mut table = root.process_table.lock().await;
+        match table.get_mut(&args.name) {
+            Some(entry) => {
+                entry.stopping.store(true, Ordering::Relaxed);
+                (
+                    entry.pid,
+                    entry.command.clone(),
+                    entry.env.clone(),
+                    entry.restart_policy,
+                    Arc::clone(&entry.stdout_buf),
+                    Arc::clone(&entry.stderr_buf),
+                )
+            }
             None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
         }
     };
@@ -350,12 +402,14 @@ async fn handle_restart(root: &Arc<SharedRoot>, req: &Request) -> Response {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Remove old entry and re-create
+    // Remove old entry and re-create, preserving log buffers
     {
         let mut table = root.process_table.lock().await;
         table.remove(&args.name);
 
         let mut entry = ProcessEntry::new(args.name.clone(), command, env, restart_policy, false);
+        entry.stdout_buf = stdout_buf;
+        entry.stderr_buf = stderr_buf;
 
         let child = match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
@@ -461,26 +515,42 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
             };
 
             entry.stopped_at = Some(chrono::Utc::now());
+            let was_intentional = entry.stopping.swap(false, Ordering::Relaxed);
 
-            match exit_code {
-                Some(0) => {
-                    entry.state = ProcessState::Stopped;
-                    entry.exit_status = Some(0);
+            if was_intentional {
+                // Intentional stop (psy stop / restart) — always mark as stopped
+                entry.state = ProcessState::Stopped;
+                entry.exit_status = exit_code;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Ok(ref s) = status {
+                        if let Some(sig) = s.signal() {
+                            entry.signal = Some(format!("SIG{sig}"));
+                        }
+                    }
                 }
-                Some(code) => {
-                    entry.state = ProcessState::Failed;
-                    entry.exit_status = Some(code);
-                }
-                None => {
-                    // Killed by signal
-                    entry.state = ProcessState::Failed;
-                    entry.exit_status = None;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::process::ExitStatusExt;
-                        if let Ok(ref s) = status {
-                            if let Some(sig) = s.signal() {
-                                entry.signal = Some(format!("SIG{sig}"));
+            } else {
+                match exit_code {
+                    Some(0) => {
+                        entry.state = ProcessState::Stopped;
+                        entry.exit_status = Some(0);
+                    }
+                    Some(code) => {
+                        entry.state = ProcessState::Failed;
+                        entry.exit_status = Some(code);
+                    }
+                    None => {
+                        // Killed by signal
+                        entry.state = ProcessState::Failed;
+                        entry.exit_status = None;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::ExitStatusExt;
+                            if let Ok(ref s) = status {
+                                if let Some(sig) = s.signal() {
+                                    entry.signal = Some(format!("SIG{sig}"));
+                                }
                             }
                         }
                     }

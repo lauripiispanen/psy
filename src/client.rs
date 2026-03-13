@@ -1,5 +1,7 @@
 use std::io::{self, BufRead, Write};
 
+use serde_json;
+
 use crate::protocol::{LogsArgs, Request, Response, StreamFilter};
 
 /// Read PSY_SOCK from the environment, returning a friendly error if unset.
@@ -129,7 +131,24 @@ pub fn follow_logs(name: &str, stream: StreamFilter) -> Result<(), String> {
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
-                let _ = out.write_all(line.as_bytes());
+                // Parse NDJSON log line and format as plain text
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let ts = parsed
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let stream = parsed
+                        .get("stream")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stdout");
+                    let content = parsed
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let _ = writeln!(out, "[{ts} {stream}] {content}");
+                } else {
+                    let _ = out.write_all(line.as_bytes());
+                }
                 let _ = out.flush();
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,

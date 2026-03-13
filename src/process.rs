@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +54,8 @@ pub struct ProcessEntry {
     pub stdout_buf: Arc<RingBuffer>,
     pub stderr_buf: Arc<RingBuffer>,
     pub is_main: bool,
+    /// Set to true when an intentional stop is in progress (psy stop / restart).
+    pub stopping: Arc<AtomicBool>,
     /// Handle to the running child — only present while Running.
     pub child: Option<Child>,
 }
@@ -80,6 +83,7 @@ impl ProcessEntry {
             stdout_buf: Arc::new(RingBuffer::new()),
             stderr_buf: Arc::new(RingBuffer::new()),
             is_main,
+            stopping: Arc::new(AtomicBool::new(false)),
             child: None,
         }
     }
@@ -102,6 +106,9 @@ impl ProcessEntry {
             restart_policy: self.restart_policy,
             started_at: self.started_at.map(|t| t.to_rfc3339()),
             uptime_secs,
+            exit_code: self.exit_status,
+            signal: self.signal.clone(),
+            restarts: self.restarts,
         }
     }
 }

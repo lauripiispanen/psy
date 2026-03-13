@@ -315,24 +315,41 @@ fn format_ps_table(ps: &PsResponse) -> String {
     }
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<20} {:<8} {:<12} {:<12} {}\n",
-        "NAME", "PID", "STATUS", "RESTART", "UPTIME"
+        "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}\n",
+        "NAME", "PID", "STATUS", "EXIT", "UPTIME", "RESTARTS", "RESTART"
     ));
-    out.push_str(&"-".repeat(64));
+    out.push_str(&"-".repeat(78));
     out.push('\n');
     for p in &ps.processes {
         let pid_str = p.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let exit_str = if let Some(sig) = &p.signal {
+            sig.clone()
+        } else {
+            p.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into())
+        };
         let uptime = p
             .uptime_secs
-            .map(|s| format!("{s}s"))
+            .map(|s| format_uptime(s))
             .unwrap_or_else(|| "-".into());
         let restart = format!("{:?}", p.restart_policy).to_lowercase();
         out.push_str(&format!(
-            "{:<20} {:<8} {:<12} {:<12} {}\n",
-            p.name, pid_str, p.status, restart, uptime
+            "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}\n",
+            p.name, pid_str, p.status, exit_str, uptime, p.restarts, restart
         ));
     }
     out
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m {}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
 }
 
 // ---------------------------------------------------------------------------

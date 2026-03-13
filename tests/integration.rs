@@ -445,10 +445,150 @@ fn test_logs_tail() {
     thread::sleep(Duration::from_secs(2));
 
     let logs = root.psy_stdout(&["logs", "liner", "--tail", "5"]);
-    // Output is JSON with a "lines" array. Count the "content" entries.
-    let content_count = logs.matches("\"content\"").count();
+    // Output is now plain text lines like "[timestamp stream] content"
+    let line_count = logs.lines().filter(|l| !l.is_empty()).count();
     assert!(
-        content_count <= 5,
-        "tail 5 should return at most 5 content lines, got {content_count} in: {logs}"
+        line_count <= 5,
+        "tail 5 should return at most 5 lines, got {line_count} in: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_tombstone_replacement() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run a process that exits immediately.
+    let echo = sh_c("echo first");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "reusable", "--"];
+    run_args.extend(echo_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // Re-run with the same name — should succeed (tombstone replaced).
+    let echo2 = sh_c("echo second");
+    let echo2_refs = to_refs(&echo2);
+    let mut run_args2 = vec!["run", "reusable", "--"];
+    run_args2.extend(echo2_refs);
+    let out = root.psy(&run_args2);
+    assert!(
+        out.status.success(),
+        "re-running a stopped process should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn test_stop_shows_stopped_not_failed() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let long_sl = sleep_cmd(999);
+    let long_refs = to_refs(&long_sl);
+    let mut run_args = vec!["run", "svc", "--"];
+    run_args.extend(long_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_millis(500));
+
+    root.psy(&["stop", "svc"]);
+    thread::sleep(Duration::from_millis(500));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("stopped"),
+        "intentionally stopped process should show 'stopped', got: {ps}"
+    );
+    // Should NOT show as failed
+    let svc_line = ps.lines().find(|l| l.contains("svc")).unwrap_or("");
+    assert!(
+        !svc_line.contains("failed"),
+        "intentionally stopped process should not show 'failed', got: {svc_line}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_survive_restart() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run a process that outputs a marker then sleeps.
+    let cmd = sh_c("echo BEFORE_RESTART && sleep 999");
+    let cmd_refs = to_refs(&cmd);
+    let mut run_args = vec!["run", "keeper", "--"];
+    run_args.extend(cmd_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // Restart it.
+    root.psy(&["restart", "keeper"]);
+    thread::sleep(Duration::from_secs(1));
+
+    // Logs should still contain the pre-restart output.
+    let logs = root.psy_stdout(&["logs", "keeper"]);
+    assert!(
+        logs.contains("BEFORE_RESTART"),
+        "logs should survive restart, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_plain_text_format() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let echo = sh_c("echo plaintext_check");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "fmttest", "--"];
+    run_args.extend(echo_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "fmttest"]);
+    // Should be plain text like "[2025-... stdout] plaintext_check"
+    assert!(
+        logs.contains("plaintext_check"),
+        "logs should contain output, got: {logs}"
+    );
+    assert!(
+        logs.contains("[") && logs.contains("stdout]"),
+        "logs should be plain text format [timestamp stdout], got: {logs}"
+    );
+    // Should NOT be JSON
+    assert!(
+        !logs.contains("\"content\""),
+        "logs should not be JSON, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_ps_shows_exit_and_restarts() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run a process that exits with code 42.
+    let exit_cmd = sh_c("exit 42");
+    let exit_refs = to_refs(&exit_cmd);
+    let mut run_args = vec!["run", "exiter", "--"];
+    run_args.extend(exit_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    let ps = root.psy_stdout(&["ps"]);
+    // Header should have EXIT and RESTARTS columns
+    assert!(
+        ps.contains("EXIT") && ps.contains("RESTARTS"),
+        "ps header should have EXIT and RESTARTS columns, got: {ps}"
+    );
+    // The exiter line should show exit code 42
+    let exiter_line = ps.lines().find(|l| l.contains("exiter")).unwrap_or("");
+    assert!(
+        exiter_line.contains("42"),
+        "ps should show exit code 42 for exiter, got: {exiter_line}"
     );
 }
