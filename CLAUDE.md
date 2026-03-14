@@ -193,6 +193,11 @@ psy/
 - [x] `psy psyfile schema` — output JSON Schema
 - [x] `psy psyfile validate [--file]` — validate Psyfile
 - [x] `psy psyfile init` — generate starter Psyfile
+- [x] Multi-platform support: `platforms` field to restrict units to specific OSes
+- [x] Multi-platform support: `platform.<os>` overrides for command, env, restart, depends_on, working_dir, ready, healthcheck
+- [x] Platform override env merge: platform env merged on top of base (platform wins on conflict)
+- [x] Platform filtering at parse time: excluded units removed, downstream sees resolved units
+- [x] Platform validation: reject unknown platform names and override fields
 
 ### Edge Cases
 - [x] Concurrent `psy run` same name → error "already exists"
@@ -222,6 +227,10 @@ psy/
 - [x] Psyfile probe validation: no type, multiple types, exit rejected for healthcheck
 - [x] Psyfile probes: custom interval/timeout/retries, both ready+healthcheck
 - [x] Duration parsing: seconds, minutes, hours, invalid input
+- [x] Platform overrides: command, env merge, restart, depends_on, working_dir, ready probe
+- [x] Platform filtering: excludes unit, includes current, omitted includes all
+- [x] Platform validation: invalid platform name, invalid override key, invalid override field
+- [x] Platform with platforms restriction: combined platforms + platform override
 
 ### Integration Tests (`tests/integration.rs`)
 All integration tests pass on macOS. Must also pass on Linux and Windows via GitHub Actions.
@@ -264,6 +273,10 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] `psy psyfile schema` outputs valid JSON
 - [x] `psy psyfile validate` succeeds/fails appropriately
 - [x] `psy psyfile init` creates file, fails on existing
+- [x] Platform override command: overridden command runs instead of base
+- [x] Platform excluded unit: `psy run` fails, not visible
+- [x] Platform `psy up --all` skips excluded units
+- [x] Platform env merge: base preserved, platform overrides/adds
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

@@ -216,6 +216,8 @@ depends_on = ["api"]
 | `working_dir` | string | cwd | Working directory |
 | `ready` | table | none | Startup readiness probe |
 | `healthcheck` | table | none | Continuous health check |
+| `platforms` | array | all | Restrict to specific OSes (`linux`, `macos`, `windows`) |
+| `platform.<os>` | table | none | Per-platform overrides for command, env, restart, etc. |
 
 ### Readiness probes
 
@@ -250,6 +252,34 @@ When a dependency restarts, dependents with `restart = true` automatically resta
 depends_on = [{ name = "db", restart = true }]
 # If db restarts, api restarts automatically (in dependency order)
 ```
+
+### Multi-platform support
+
+Restrict units to specific operating systems with `platforms`, and override fields per-platform with `platform.<os>`:
+
+```toml
+[db]
+command = "docker run --rm -p 5432:5432 postgres:16"
+
+[redis]
+command = "redis-server"
+platforms = ["linux", "macos"]  # not available on Windows
+
+[cache]
+command = "echo starting cache"
+platform.linux.command = "redis-cli monitor"
+platform.windows.command = "echo no redis on windows"
+platform.macos.command = "redis-cli monitor"
+
+[api]
+command = "cargo run --bin api"
+env = { PORT = "3000" }
+platform.windows.env = { PORT = "3000", RUST_LOG = "debug" }
+```
+
+Platform overrides can set: `command`, `env`, `restart`, `depends_on`, `working_dir`, `ready`, `healthcheck`. Environment variables are merged (platform wins on conflict). Units excluded by `platforms` are invisible — they won't appear in `psy ps` and can't be started.
+
+Valid platform names: `linux`, `macos`, `windows`.
 
 ### Hot-reload
 

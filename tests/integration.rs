@@ -1908,3 +1908,160 @@ fn test_psyfile_init() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Platform support tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_psyfile_platform_override_command() {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "windows"
+    };
+    let content = format!(
+        r#"
+[echoer]
+command = "echo base-output"
+
+[echoer.platform.{os}]
+command = "echo overridden-output"
+"#
+    );
+    let tmp = TempPsyfileDir::new(&content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    root.psy(&["run", "echoer"]);
+    thread::sleep(Duration::from_secs(1));
+    let logs = root.psy_stdout(&["logs", "echoer"]);
+    assert!(
+        logs.contains("overridden-output"),
+        "expected overridden command output, got: {logs}"
+    );
+    assert!(
+        !logs.contains("base-output"),
+        "should not contain base output, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_platform_excluded_unit() {
+    let other = if cfg!(target_os = "macos") {
+        "linux"
+    } else {
+        "macos"
+    };
+    let content = format!(
+        r#"
+[excluded]
+command = "echo should-not-run"
+platforms = ["{other}"]
+
+[included]
+command = "echo runs-fine"
+"#
+    );
+    let tmp = TempPsyfileDir::new(&content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    // Trying to run excluded unit should fail
+    let out = root.psy(&["run", "excluded"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() || stderr.contains("not found") || stderr.contains("no command"),
+        "expected failure for excluded unit, stderr: {stderr}"
+    );
+
+    // Included unit should work
+    root.psy(&["run", "included"]);
+    thread::sleep(Duration::from_secs(1));
+    let logs = root.psy_stdout(&["logs", "included"]);
+    assert!(
+        logs.contains("runs-fine"),
+        "expected included unit output, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_platform_up_all_skips_excluded() {
+    let other = if cfg!(target_os = "macos") {
+        "linux"
+    } else {
+        "macos"
+    };
+    let content = format!(
+        r#"
+[included]
+command = "echo included-output"
+
+[excluded]
+command = "echo excluded-output"
+platforms = ["{other}"]
+"#
+    );
+    let tmp = TempPsyfileDir::new(&content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile_all(&tmp.psyfile_path(), &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("included"),
+        "psy ps should show included unit, got: {ps}"
+    );
+    assert!(
+        !ps.contains("excluded"),
+        "psy ps should not show excluded unit, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_platform_env_merge() {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "windows"
+    };
+    #[cfg(unix)]
+    let echo_cmd = "echo BASE=$BASE OVERRIDE=$OVERRIDE ADDED=$ADDED";
+    #[cfg(windows)]
+    let echo_cmd = "echo BASE=%BASE% OVERRIDE=%OVERRIDE% ADDED=%ADDED%";
+    let content = format!(
+        r#"
+[echoer]
+command = "{echo_cmd}"
+env = {{ BASE = "base-val", OVERRIDE = "base-override" }}
+
+[echoer.platform.{os}]
+env = {{ OVERRIDE = "platform-override", ADDED = "platform-added" }}
+"#
+    );
+    let tmp = TempPsyfileDir::new(&content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    root.psy(&["run", "echoer"]);
+    thread::sleep(Duration::from_secs(1));
+    let logs = root.psy_stdout(&["logs", "echoer"]);
+    assert!(
+        logs.contains("BASE=base-val"),
+        "base env should be preserved, got: {logs}"
+    );
+    assert!(
+        logs.contains("OVERRIDE=platform-override"),
+        "override env should win, got: {logs}"
+    );
+    assert!(
+        logs.contains("ADDED=platform-added"),
+        "added env should appear, got: {logs}"
+    );
+}

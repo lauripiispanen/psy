@@ -10,6 +10,24 @@ use std::time::Duration;
 use crate::protocol::RestartPolicy;
 
 // ---------------------------------------------------------------------------
+// Platform detection
+// ---------------------------------------------------------------------------
+
+pub fn current_platform() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "unknown"
+    }
+}
+
+const VALID_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
+
+// ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
 
@@ -111,10 +129,77 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             "working_dir",
             "ready",
             "healthcheck",
+            "platforms",
+            "platform",
         ];
         for key in unit_table.keys() {
             if !known_fields.contains(&key.as_str()) {
                 return Err(format!("unknown field '{key}' in unit '{name}'"));
+            }
+        }
+
+        // Parse `platforms` restriction list
+        if let Some(v) = unit_table.get("platforms") {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| format!("unit '{name}': 'platforms' must be an array of strings"))?;
+            let mut platform_list = Vec::new();
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| format!("unit '{name}': 'platforms' entries must be strings"))?;
+                if !VALID_PLATFORMS.contains(&s) {
+                    return Err(format!(
+                        "unit '{name}': invalid platform '{s}', must be one of: {}",
+                        VALID_PLATFORMS.join(", ")
+                    ));
+                }
+                platform_list.push(s.to_string());
+            }
+            // Skip unit if current platform not in list
+            if !platform_list.iter().any(|p| p == current_platform()) {
+                continue;
+            }
+        }
+
+        // Parse `platform` overrides table (validated but applied after base parsing)
+        let platform_override = if let Some(v) = unit_table.get("platform") {
+            let plat_table = v
+                .as_table()
+                .ok_or_else(|| format!("unit '{name}': 'platform' must be a table"))?;
+            // Validate platform keys
+            for key in plat_table.keys() {
+                if !VALID_PLATFORMS.contains(&key.as_str()) {
+                    return Err(format!(
+                        "unit '{name}': unknown platform '{key}', must be one of: {}",
+                        VALID_PLATFORMS.join(", ")
+                    ));
+                }
+            }
+            plat_table
+                .get(current_platform())
+                .and_then(|v| v.as_table())
+        } else {
+            None
+        };
+
+        // Validate platform override fields
+        let overridable_fields = [
+            "command",
+            "restart",
+            "env",
+            "depends_on",
+            "working_dir",
+            "ready",
+            "healthcheck",
+        ];
+        if let Some(override_table) = platform_override {
+            for key in override_table.keys() {
+                if !overridable_fields.contains(&key.as_str()) {
+                    return Err(format!(
+                        "unit '{name}': unknown field '{key}' in platform override"
+                    ));
+                }
             }
         }
 
@@ -216,6 +301,105 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
         let healthcheck = match unit_table.get("healthcheck") {
             Some(v) => Some(parse_probe_config(v, name, "healthcheck")?),
             None => None,
+        };
+
+        // Apply platform overrides
+        let (command, restart, env, depends_on, working_dir, ready, healthcheck) = if let Some(
+            ovr,
+        ) =
+            platform_override
+        {
+            let command = match ovr.get("command").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => command,
+            };
+            let restart = match ovr.get("restart").and_then(|v| v.as_str()) {
+                Some("on-failure") | Some("on_failure") => RestartPolicy::OnFailure,
+                Some("always") => RestartPolicy::Always,
+                Some("no") => RestartPolicy::No,
+                Some(other) => {
+                    return Err(format!(
+                        "unit '{name}': invalid restart policy '{other}' in platform override"
+                    ))
+                }
+                None => restart,
+            };
+            let env = match ovr.get("env") {
+                Some(v) => {
+                    let env_table = v.as_table().ok_or_else(|| {
+                        format!("unit '{name}': 'env' must be a table in platform override")
+                    })?;
+                    let mut merged = env;
+                    for (k, val) in env_table {
+                        let s = val.as_str().ok_or_else(|| {
+                                format!("unit '{name}': env value for '{k}' must be a string in platform override")
+                            })?;
+                        merged.insert(k.clone(), s.to_string());
+                    }
+                    merged
+                }
+                None => env,
+            };
+            let depends_on = match ovr.get("depends_on") {
+                Some(v) => {
+                    let arr = v.as_array().ok_or_else(|| {
+                        format!("unit '{name}': 'depends_on' must be an array in platform override")
+                    })?;
+                    arr.iter()
+                            .map(|item| {
+                                if let Some(s) = item.as_str() {
+                                    Ok(Dependency { name: s.to_string(), restart: false })
+                                } else if let Some(tbl) = item.as_table() {
+                                    let dep_name = tbl
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .ok_or_else(|| {
+                                            format!("unit '{name}': depends_on table entry requires 'name' in platform override")
+                                        })?;
+                                    let restart = tbl
+                                        .get("restart")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    Ok(Dependency { name: dep_name.to_string(), restart })
+                                } else {
+                                    Err(format!("unit '{name}': 'depends_on' entries must be strings or tables in platform override"))
+                                }
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                }
+                None => depends_on,
+            };
+            let working_dir = match ovr.get("working_dir").and_then(|v| v.as_str()) {
+                Some(s) => Some(PathBuf::from(s)),
+                None => working_dir,
+            };
+            let ready = match ovr.get("ready") {
+                Some(v) => Some(parse_probe_config(v, name, "ready")?),
+                None => ready,
+            };
+            let healthcheck = match ovr.get("healthcheck") {
+                Some(v) => Some(parse_probe_config(v, name, "healthcheck")?),
+                None => healthcheck,
+            };
+            (
+                command,
+                restart,
+                env,
+                depends_on,
+                working_dir,
+                ready,
+                healthcheck,
+            )
+        } else {
+            (
+                command,
+                restart,
+                env,
+                depends_on,
+                working_dir,
+                ready,
+                healthcheck,
+            )
         };
 
         units.insert(
@@ -669,6 +853,46 @@ pub fn json_schema() -> serde_json::Value {
         "title": "Psyfile",
         "description": "psy process lifecycle manager — unit definitions",
         "type": "object",
+        "definitions": {
+            "platform_override": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command override" },
+                    "restart": {
+                        "type": "string",
+                        "enum": ["no", "on-failure", "always"],
+                        "description": "Restart policy override"
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Environment variables (merged with base)"
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "required": ["name"],
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "restart": { "type": "boolean", "default": false }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "description": "Dependency override (replaces base)"
+                    },
+                    "working_dir": { "type": "string", "description": "Working directory override" },
+                    "ready": { "type": "object", "description": "Readiness probe override" },
+                    "healthcheck": { "type": "object", "description": "Health check override" }
+                },
+                "additionalProperties": false
+            }
+        },
         "additionalProperties": {
             "type": "object",
             "required": ["command"],
@@ -751,6 +975,24 @@ pub fn json_schema() -> serde_json::Value {
                         "interval": { "type": "string", "default": "10s", "description": "Time between checks" },
                         "timeout": { "type": "string", "default": "30s", "description": "Per-check timeout" },
                         "retries": { "type": "integer", "default": 3, "description": "Consecutive failures before unhealthy" }
+                    },
+                    "additionalProperties": false
+                },
+                "platforms": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["linux", "macos", "windows"]
+                    },
+                    "description": "Restrict unit to these platforms; omit for all platforms"
+                },
+                "platform": {
+                    "type": "object",
+                    "description": "Per-platform overrides for command, env, restart, depends_on, working_dir, ready, healthcheck",
+                    "properties": {
+                        "linux": { "$ref": "#/definitions/platform_override" },
+                        "macos": { "$ref": "#/definitions/platform_override" },
+                        "windows": { "$ref": "#/definitions/platform_override" }
                     },
                     "additionalProperties": false
                 }
@@ -1412,5 +1654,274 @@ healthcheck = { http = "http://localhost:8080/health", interval = "15s" }
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("5x").is_err());
         assert!(parse_duration("").is_err());
+    }
+
+    // -- platform support ----------------------------------------------------
+
+    #[test]
+    fn platform_override_command() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "default-cmd"
+
+[server.platform.{os}]
+command = "overridden-cmd"
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        assert_eq!(pf.units["server"].command, "overridden-cmd");
+    }
+
+    #[test]
+    fn platform_override_env_merge() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "start-server"
+env = {{ A = "1", B = "2" }}
+
+[server.platform.{os}]
+env = {{ B = "3", C = "4" }}
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        let env = &pf.units["server"].env;
+        assert_eq!(env["A"], "1");
+        assert_eq!(env["B"], "3"); // overridden
+        assert_eq!(env["C"], "4"); // added
+    }
+
+    #[test]
+    fn platform_override_restart() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "start-server"
+restart = "no"
+
+[server.platform.{os}]
+restart = "always"
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        assert_eq!(pf.units["server"].restart, RestartPolicy::Always);
+    }
+
+    #[test]
+    fn platform_override_depends_on() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[db]
+command = "start-db"
+
+[extra]
+command = "start-extra"
+
+[app]
+command = "start-app"
+depends_on = ["db"]
+
+[app.platform.{os}]
+depends_on = ["db", "extra"]
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        let deps = pf.units["app"].dep_names();
+        assert_eq!(deps, vec!["db", "extra"]);
+    }
+
+    #[test]
+    fn platform_override_working_dir() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "start-server"
+working_dir = "/default"
+
+[server.platform.{os}]
+working_dir = "/overridden"
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        assert_eq!(
+            pf.units["server"].working_dir.as_deref(),
+            Some(Path::new("/overridden"))
+        );
+    }
+
+    #[test]
+    fn platform_override_ready() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "start-server"
+ready = {{ tcp = "localhost:8080" }}
+
+[server.platform.{os}]
+ready = {{ tcp = "localhost:9090" }}
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        let ready = pf.units["server"].ready.as_ref().unwrap();
+        assert!(matches!(ready.probe, ProbeKind::Tcp(ref s) if s == "localhost:9090"));
+    }
+
+    #[test]
+    fn platform_override_no_match_keeps_base() {
+        // Use a platform that isn't the current one
+        let other = if current_platform() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let content = format!(
+            r#"
+[server]
+command = "default-cmd"
+
+[server.platform.{other}]
+command = "other-cmd"
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        assert_eq!(pf.units["server"].command, "default-cmd");
+    }
+
+    #[test]
+    fn platforms_filter_excludes_unit() {
+        let other = if current_platform() == "macos" {
+            "linux"
+        } else {
+            "macos"
+        };
+        let content = format!(
+            r#"
+[excluded]
+command = "echo excluded"
+platforms = ["{other}"]
+
+[included]
+command = "echo included"
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        assert!(!pf.units.contains_key("excluded"));
+        assert!(pf.units.contains_key("included"));
+    }
+
+    #[test]
+    fn platforms_filter_includes_current() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "echo hello"
+platforms = ["{os}"]
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        assert!(pf.units.contains_key("server"));
+    }
+
+    #[test]
+    fn platforms_omitted_includes_all() {
+        let content = r#"
+[server]
+command = "echo hello"
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(pf.units.contains_key("server"));
+    }
+
+    #[test]
+    fn platforms_invalid_platform_name() {
+        let content = r#"
+[server]
+command = "echo hello"
+platforms = ["dos"]
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(
+            err.contains("invalid platform 'dos'"),
+            "expected invalid platform error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn platform_override_invalid_platform_key() {
+        let content = r#"
+[server]
+command = "echo hello"
+
+[server.platform.beos]
+command = "beos-cmd"
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(
+            err.contains("unknown platform 'beos'"),
+            "expected unknown platform error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn platform_override_invalid_field() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "echo hello"
+
+[server.platform.{os}]
+singleton = false
+"#
+        );
+        let err = parse_str(&content).unwrap_err();
+        assert!(
+            err.contains("unknown field 'singleton' in platform override"),
+            "expected unknown field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn platform_override_invalid_restart_value() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "echo hello"
+
+[server.platform.{os}]
+restart = "sometimes"
+"#
+        );
+        let err = parse_str(&content).unwrap_err();
+        assert!(
+            err.contains("invalid restart policy"),
+            "expected invalid restart error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn platforms_with_platform_override() {
+        let os = current_platform();
+        let content = format!(
+            r#"
+[server]
+command = "default-cmd"
+platforms = ["{os}"]
+
+[server.platform.{os}]
+command = "overridden-cmd"
+"#
+        );
+        let pf = parse_str(&content).unwrap();
+        assert_eq!(pf.units["server"].command, "overridden-cmd");
     }
 }
