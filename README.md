@@ -23,15 +23,30 @@ psy ps
 # When claude exits, everything tears down automatically
 ```
 
-Or use it as a local dev environment:
+Or use a **Psyfile** to define your stack declaratively:
+
+```toml
+# Psyfile
+[db]
+command = "docker run --rm -p 5432:5432 postgres:16"
+restart = "always"
+ready = { tcp = 5432 }
+
+[api]
+command = "cargo run --bin api-server"
+restart = "on-failure"
+depends_on = [{ name = "db", restart = true }]
+healthcheck = { http = "http://localhost:3000/health", interval = "10s", retries = 3 }
+
+[frontend]
+command = "npm run dev"
+depends_on = ["api"]
+```
 
 ```bash
-psy up
-psy run api -- cargo run --bin api-server
-psy run frontend -- npm run dev
-psy run worker -- python worker.py
-psy ps
-# Exit the shell → everything cleaned up
+psy up --all -- claude
+# db starts first, api waits for port 5432, frontend waits for api
+# When claude exits, everything tears down automatically
 ```
 
 ## Install
@@ -56,15 +71,19 @@ Download from [GitHub Releases](https://github.com/lauripiispanen/psy/releases) 
 ## CLI
 
 ```
-psy up [--name <name>] [-- <command>]              Start a psy root session
+psy up [--name <name>] [units...] [-- <command>]   Start a psy root session
+psy up --all [-- <command>]                        Start all Psyfile units
 psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child process
 psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
 psy ps                                              List managed processes
-psy logs <name> [-f] [--tail <n>]                   View captured logs
+psy logs <name> [-f] [--tail <n>] [--probe]         View captured logs
 psy history <name>                                  Show run history
 psy stop <name>                                     Stop a process (SIGTERM → SIGKILL)
 psy restart <name>                                  Restart with same arguments
 psy down                                            Tear down everything
+psy psyfile schema                                  Output JSON Schema for Psyfile
+psy psyfile validate [--file <path>]                Validate a Psyfile
+psy psyfile init                                    Generate a starter Psyfile
 psy mcp                                             Start MCP JSON-RPC server
 psy version                                         Print version
 ```
@@ -73,15 +92,16 @@ psy version                                         Print version
 
 ```
 $ psy ps
-NAME                 PID      STATUS     EXIT     UPTIME         RESTARTS   RESTART
-------------------------------------------------------------------------------
-main                 12345    running    -        2h 13m 4s      0          no
-server               12350    running    -        1h 58m 2s      0          on-failure
-worker               -        stopped    0        -              0          no
-crasher              -        failed     1        -              5          on-failure
+NAME                 PID      STATUS     READY    EXIT     UPTIME         RESTARTS   RESTART
+--------------------------------------------------------------------------------------
+main                 12345    running    -        -        2h 13m 4s      0          no
+server               12350    running    ready    -        1h 58m 2s      0          on-failure
+db                   12348    running    ready    -        2h 13m 1s      0          always
+worker               -        stopped    -        0        -              0          no
+crasher              -        failed     -        1        -              5          on-failure
 ```
 
-Stopped processes remain visible as tombstones. Re-running `psy run` with the same name replaces a stopped or failed process.
+Stopped processes remain visible as tombstones. Re-running `psy run` with the same name replaces a stopped or failed process. The READY column shows readiness probe status (`ready`, `waiting`, `failed`, or `-` if no probe).
 
 ### Restart policies
 
@@ -132,6 +152,16 @@ psy logs web --run 1 --grep "error"
 psy logs web --previous --tail 5
 ```
 
+### Probe logs
+
+Readiness probes and health checks write diagnostic output to separate log streams. These are hidden by default to keep `psy logs` clean:
+
+```bash
+psy logs server --probe             # all probe output
+psy logs server --probe --stderr    # probe diagnostics only
+psy logs server --probe --stdout    # probe command stdout only
+```
+
 ### Attach mode
 
 ```bash
@@ -149,7 +179,89 @@ psy up -- claude
 # Claude's MCP config launches "psy mcp" → connects back to the root via PSY_SOCK
 ```
 
-Tools exposed: `psy_run`, `psy_ps`, `psy_logs`, `psy_stop`, `psy_restart`, `psy_history`
+Tools exposed: `psy_run`, `psy_ps`, `psy_logs`, `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
+
+## Psyfile
+
+A Psyfile is an optional TOML file that defines named process units. Place a file named `Psyfile` or `Psyfile.toml` in your project directory. psy discovers it by walking upward from the current directory.
+
+```toml
+[postgres]
+command = "docker run --rm -p ${DB_PORT:-5432}:5432 postgres:16"
+restart = "always"
+ready = { tcp = 5432, interval = "1s", timeout = "30s" }
+
+[api]
+command = "cargo run --bin api-server"
+restart = "on-failure"
+env = { DATABASE_URL = "postgres://localhost:${DB_PORT:-5432}/dev" }
+depends_on = [{ name = "postgres", restart = true }]
+healthcheck = { http = "http://localhost:3000/health", interval = "10s", retries = 3 }
+
+[worker]
+command = "./worker --id $PSY_INSTANCE"
+singleton = false
+depends_on = ["api"]
+```
+
+### Unit fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `command` | string | *required* | Shell command to run |
+| `restart` | `"no"` / `"on-failure"` / `"always"` | `"no"` | Restart policy |
+| `env` | table | `{}` | Environment variables (supports `${VAR:-default}`) |
+| `depends_on` | array | `[]` | Dependencies — strings or `{ name, restart }` tables |
+| `singleton` | bool | `true` | `false` = template unit (multiple instances) |
+| `working_dir` | string | cwd | Working directory |
+| `ready` | table | none | Startup readiness probe |
+| `healthcheck` | table | none | Continuous health check |
+
+### Readiness probes
+
+A `ready` probe runs once after process start. Dependents wait for it to pass before starting.
+
+```toml
+ready = { tcp = "localhost:5432" }                    # TCP port check
+ready = { tcp = 8080 }                                # shorthand (localhost:PORT)
+ready = { http = "http://localhost:3000/health" }     # HTTP GET, expects 2xx
+ready = { exec = "pg_isready -h localhost" }          # command, expects exit 0
+ready = { exit = 0 }                                  # process itself exits with code
+```
+
+Optional timing: `interval` (default `"1s"`), `timeout` (default `"30s"`), `retries`.
+
+### Health checks
+
+A `healthcheck` runs continuously after the process is ready. On failure (consecutive retries exhausted), the process is killed and restarted per its restart policy.
+
+```toml
+healthcheck = { tcp = "localhost:5432", interval = "10s", retries = 3 }
+healthcheck = { http = "http://localhost:3000/health", interval = "15s", retries = 5 }
+healthcheck = { exec = "curl -sf http://localhost:3000/ping", interval = "10s" }
+```
+
+### Restart cascades
+
+When a dependency restarts, dependents with `restart = true` automatically restart too:
+
+```toml
+[api]
+depends_on = [{ name = "db", restart = true }]
+# If db restarts, api restarts automatically (in dependency order)
+```
+
+### Hot-reload
+
+The Psyfile is re-read from disk on every command. You can create, modify, or delete it while psy is running — changes take effect immediately.
+
+### Psyfile utilities
+
+```bash
+psy psyfile schema      # output JSON Schema (for editor validation)
+psy psyfile validate    # validate current Psyfile
+psy psyfile init        # generate a starter Psyfile
+```
 
 ## How It Works
 

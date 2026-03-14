@@ -17,6 +17,8 @@ use crate::protocol::StreamFilter;
 pub enum Stream {
     Stdout,
     Stderr,
+    ProbeStdout,
+    ProbeStderr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,11 +28,19 @@ pub struct LogLine {
     pub content: String,
 }
 
+impl Stream {
+    pub fn is_probe(self) -> bool {
+        matches!(self, Stream::ProbeStdout | Stream::ProbeStderr)
+    }
+}
+
 impl fmt::Display for LogLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let stream_label = match self.stream {
             Stream::Stdout => "stdout",
             Stream::Stderr => "stderr",
+            Stream::ProbeStdout => "probe:stdout",
+            Stream::ProbeStderr => "probe:stderr",
         };
         write!(
             f,
@@ -103,9 +113,12 @@ impl Inner {
         let iter = self.buf.iter().filter(|l| {
             // Stream filter
             let stream_ok = match filter {
-                StreamFilter::All => true,
+                StreamFilter::All => !l.stream.is_probe(),
                 StreamFilter::Stdout => l.stream == Stream::Stdout,
                 StreamFilter::Stderr => l.stream == Stream::Stderr,
+                StreamFilter::Probe => l.stream.is_probe(),
+                StreamFilter::ProbeStdout => l.stream == Stream::ProbeStdout,
+                StreamFilter::ProbeStderr => l.stream == Stream::ProbeStderr,
             };
             if !stream_ok {
                 return false;

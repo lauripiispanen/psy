@@ -108,6 +108,8 @@ pub struct LogsArgs {
     pub run: Option<u32>,
     #[serde(default)]
     pub previous: bool,
+    #[serde(default)]
+    pub probe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +144,9 @@ pub enum StreamFilter {
     All,
     Stdout,
     Stderr,
+    Probe,
+    ProbeStdout,
+    ProbeStderr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +154,19 @@ pub enum StreamFilter {
 pub enum StreamKind {
     Stdout,
     Stderr,
+    ProbeStdout,
+    ProbeStderr,
+}
+
+impl From<crate::ring_buffer::Stream> for StreamKind {
+    fn from(s: crate::ring_buffer::Stream) -> Self {
+        match s {
+            crate::ring_buffer::Stream::Stdout => StreamKind::Stdout,
+            crate::ring_buffer::Stream::Stderr => StreamKind::Stderr,
+            crate::ring_buffer::Stream::ProbeStdout => StreamKind::ProbeStdout,
+            crate::ring_buffer::Stream::ProbeStderr => StreamKind::ProbeStderr,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +194,8 @@ pub struct ProcessInfo {
     pub exit_code: Option<i32>,
     pub signal: Option<String>,
     pub restarts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

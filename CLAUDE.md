@@ -24,6 +24,7 @@ psy/
 │   ├── protocol.rs          # NDJSON request/response types, serde
 │   ├── psyfile.rs           # Psyfile TOML parsing, validation, interpolation, deps
 │   ├── mcp.rs               # MCP server implementation
+│   ├── probe.rs             # readiness + healthcheck probe execution engine
 │   └── platform/
 │       ├── mod.rs           # platform trait + conditional re-exports
 │       ├── unix.rs          # pipe trick, subreaper (Linux), signal handling
@@ -39,7 +40,7 @@ psy/
 
 ### Core Infrastructure
 - [x] `Cargo.toml` — dependencies, profile settings
-- [x] `src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, mcp, version)
+- [x] `src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, mcp, psyfile, version)
 - [x] `src/protocol.rs` — NDJSON request/response types (Request, Response, serde)
 
 ### Process Management
@@ -89,7 +90,11 @@ psy/
 - [x] `psy logs --grep` — case-insensitive substring filtering
 - [x] `psy logs --run <id>` — view logs from a specific run
 - [x] `psy logs --previous` — view logs from the run before current
+- [x] `psy logs --probe` — show probe logs instead of process logs
 - [x] `psy history <name>` — show run history table
+- [x] `psy psyfile schema` — output JSON Schema for Psyfile format
+- [x] `psy psyfile validate [--file]` — validate Psyfile
+- [x] `psy psyfile init` — generate starter Psyfile
 - [x] `psy stop <name>` — send stop command
 - [x] `psy restart <name>` — send restart command
 - [x] `psy down` — send down command
@@ -138,16 +143,34 @@ psy/
 - [x] `psy_stop` tool — stop named process
 - [x] `psy_restart` tool — restart named process
 - [x] `psy_history` tool — show run history for a process
+- [x] `psy_psyfile_schema` tool — return Psyfile JSON Schema
+- [x] `psy_logs` tool — `probe` parameter for probe log streams
 - [x] Connect to root via `PSY_SOCK` internally
 
 ### Log Output Format
 - [x] Prefix lines: `[<ISO8601> stdout/stderr] <content>`
 - [x] Interleaved by default, `--stdout`/`--stderr` to filter
+- [x] Probe log streams: `probe:stdout`, `probe:stderr` (hidden by default, shown with `--probe`)
+
+### Readiness Probes & Health Checks (`src/probe.rs`)
+- [x] Probe execution engine: tcp, http, exec, exit probe types
+- [x] Readiness probes (`ready`): one-time startup check, dependents wait for success
+- [x] Health checks (`healthcheck`): continuous monitoring, failure triggers restart per policy
+- [x] Probe cancellation via watch channel on process stop/restart
+- [x] Dependency readiness waiting: dependents block until upstream ready probe passes
+- [x] Restart cascades: `depends_on = [{ name = "x", restart = true }]` propagates restarts
+- [x] Exit probes handled in monitor_child (not polling-based)
+- [x] TCP probe: `tokio::net::TcpStream::connect` with 1s per-attempt timeout
+- [x] HTTP probe: raw TCP + HTTP/1.0 GET, check for 2xx status
+- [x] Exec probe: shell command, check exit 0, capture stdout/stderr (up to 256 bytes)
+- [x] Probe logging to ring buffer using `probe:stdout`/`probe:stderr` streams
+- [x] `psy ps` READY column: `-`/`waiting`/`ready`/`failed`
+- [x] `psy logs --probe` flag to view probe logs
 
 ### Psyfile (`src/psyfile.rs`)
 - [x] TOML parsing with field validation (reject unknown fields)
 - [x] File discovery: walk upward from cwd for `Psyfile` or `Psyfile.toml`
-- [x] Unit definition: command, restart, env, depends_on, singleton, working_dir
+- [x] Unit definition: command, restart, env, depends_on, singleton, working_dir, ready, healthcheck
 - [x] Environment variable interpolation: `${VAR}` and `${VAR:-default}`
 - [x] Circular dependency detection (Kahn's algorithm)
 - [x] Dependency resolution: topological sort for start order
@@ -160,6 +183,16 @@ psy/
 - [x] CLI restart policy override (`--restart` overrides Psyfile default)
 - [x] Ad-hoc processes work alongside Psyfile units
 - [x] MCP `psy_run` updated for optional command + extra args
+- [x] Hot-reload: Psyfile re-read from disk on every run/stop/restart/logs command
+- [x] Psyfile can be created/modified after `psy up` — changes take effect immediately
+- [x] Extended `depends_on` syntax: string or `{ name, restart }` table entries
+- [x] Probe config parsing: `ready` and `healthcheck` tables with type/interval/timeout/retries
+- [x] Duration parsing helper: `Ns`, `Nm`, `Nh` format
+- [x] `exit` probe type restricted to `ready` only (not `healthcheck`)
+- [x] JSON Schema generation for Psyfile format (`json_schema()`)
+- [x] `psy psyfile schema` — output JSON Schema
+- [x] `psy psyfile validate [--file]` — validate Psyfile
+- [x] `psy psyfile init` — generate starter Psyfile
 
 ### Edge Cases
 - [x] Concurrent `psy run` same name → error "already exists"
@@ -184,6 +217,11 @@ psy/
 - [x] Psyfile dependency resolution: no deps, chain, diamond, already included
 - [x] Shell escaping: simple, spaces, quotes, empty, join
 - [x] Command building: append, `$@` substitution, `$@` no args
+- [x] Psyfile `depends_on` extended syntax: mixed string/table, table-only, default restart
+- [x] Psyfile probe parsing: tcp, tcp port number, http, exec, exit variants
+- [x] Psyfile probe validation: no type, multiple types, exit rejected for healthcheck
+- [x] Psyfile probes: custom interval/timeout/retries, both ready+healthcheck
+- [x] Duration parsing: seconds, minutes, hours, invalid input
 
 ### Integration Tests (`tests/integration.rs`)
 All integration tests pass on macOS. Must also pass on Linux and Windows via GitHub Actions.
@@ -214,6 +252,18 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Psyfile restart policy override
 - [x] Psyfile working_dir support
 - [x] No command without Psyfile → error
+- [x] Ready exit probe: build step with `ready = { exit = 0 }`, dependent waits
+- [x] Ready exec probe: exec-based readiness with dependency
+- [x] Ready TCP probe: TCP readiness with probe logs
+- [x] Probe logs hidden by default, shown with `--probe`
+- [x] Probe log stream filters: `--probe --stdout`, `--probe --stderr`
+- [x] `psy ps` READY column display
+- [x] Extended `depends_on` with `restart = true` flag
+- [x] Healthcheck failure triggers restart
+- [x] Restart cascade with readiness waiting
+- [x] `psy psyfile schema` outputs valid JSON
+- [x] `psy psyfile validate` succeeds/fails appropriately
+- [x] `psy psyfile init` creates file, fails on existing
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

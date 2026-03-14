@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::protocol::RestartPolicy;
 
@@ -22,9 +23,40 @@ pub struct UnitDef {
     pub command: String,
     pub restart: RestartPolicy,
     pub env: HashMap<String, String>,
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<Dependency>,
     pub singleton: bool,
     pub working_dir: Option<PathBuf>,
+    pub ready: Option<ProbeConfig>,
+    pub healthcheck: Option<ProbeConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    pub name: String,
+    pub restart: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProbeKind {
+    Exit(i32),
+    Tcp(String),
+    Http(String),
+    Exec(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbeConfig {
+    pub probe: ProbeKind,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub retries: Option<u32>,
+}
+
+impl UnitDef {
+    /// Extract dependency names as a plain list of strings.
+    pub fn dep_names(&self) -> Vec<String> {
+        self.depends_on.iter().map(|d| d.name.clone()).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +109,8 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             "depends_on",
             "singleton",
             "working_dir",
+            "ready",
+            "healthcheck",
         ];
         for key in unit_table.keys() {
             if !known_fields.contains(&key.as_str()) {
@@ -125,11 +159,39 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
                     .ok_or_else(|| format!("unit '{name}': 'depends_on' must be an array"))?;
                 arr.iter()
                     .map(|item| {
-                        item.as_str()
-                            .ok_or_else(|| {
-                                format!("unit '{name}': 'depends_on' entries must be strings")
+                        if let Some(s) = item.as_str() {
+                            Ok(Dependency {
+                                name: s.to_string(),
+                                restart: false,
                             })
-                            .map(|s| s.to_string())
+                        } else if let Some(tbl) = item.as_table() {
+                            let dep_name = tbl
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    format!("unit '{name}': depends_on table entry requires 'name' string")
+                                })?;
+                            let restart = tbl
+                                .get("restart")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            // Reject unknown keys
+                            for key in tbl.keys() {
+                                if key != "name" && key != "restart" {
+                                    return Err(format!(
+                                        "unit '{name}': unknown field '{key}' in depends_on entry"
+                                    ));
+                                }
+                            }
+                            Ok(Dependency {
+                                name: dep_name.to_string(),
+                                restart,
+                            })
+                        } else {
+                            Err(format!(
+                                "unit '{name}': 'depends_on' entries must be strings or tables"
+                            ))
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()?
             }
@@ -146,6 +208,16 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
 
+        let ready = match unit_table.get("ready") {
+            Some(v) => Some(parse_probe_config(v, name, "ready")?),
+            None => None,
+        };
+
+        let healthcheck = match unit_table.get("healthcheck") {
+            Some(v) => Some(parse_probe_config(v, name, "healthcheck")?),
+            None => None,
+        };
+
         units.insert(
             name.clone(),
             UnitDef {
@@ -155,11 +227,158 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
                 depends_on,
                 singleton,
                 working_dir,
+                ready,
+                healthcheck,
             },
         );
     }
 
     Ok(Psyfile { units })
+}
+
+// ---------------------------------------------------------------------------
+// Probe config parsing
+// ---------------------------------------------------------------------------
+
+fn parse_probe_config(
+    value: &toml::Value,
+    unit_name: &str,
+    field: &str,
+) -> Result<ProbeConfig, String> {
+    let tbl = value
+        .as_table()
+        .ok_or_else(|| format!("unit '{unit_name}': '{field}' must be a table"))?;
+
+    // Reject unknown keys
+    let known_probe_fields = [
+        "exit", "tcp", "http", "exec", "interval", "timeout", "retries",
+    ];
+    for key in tbl.keys() {
+        if !known_probe_fields.contains(&key.as_str()) {
+            return Err(format!(
+                "unit '{unit_name}': unknown field '{key}' in '{field}'"
+            ));
+        }
+    }
+
+    // Parse probe kind — exactly one of exit/tcp/http/exec
+    let mut probe = None;
+    let mut type_count = 0;
+
+    if let Some(v) = tbl.get("exit") {
+        if field == "healthcheck" {
+            return Err(format!(
+                "unit '{unit_name}': 'exit' probe type is not valid for healthcheck"
+            ));
+        }
+        let code = v
+            .as_integer()
+            .ok_or_else(|| format!("unit '{unit_name}': '{field}.exit' must be an integer"))?
+            as i32;
+        probe = Some(ProbeKind::Exit(code));
+        type_count += 1;
+    }
+    if let Some(v) = tbl.get("tcp") {
+        let addr = if let Some(s) = v.as_str() {
+            s.to_string()
+        } else if let Some(n) = v.as_integer() {
+            format!("localhost:{n}")
+        } else {
+            return Err(format!(
+                "unit '{unit_name}': '{field}.tcp' must be a string or integer"
+            ));
+        };
+        probe = Some(ProbeKind::Tcp(addr));
+        type_count += 1;
+    }
+    if let Some(v) = tbl.get("http") {
+        let url = v
+            .as_str()
+            .ok_or_else(|| format!("unit '{unit_name}': '{field}.http' must be a string"))?;
+        probe = Some(ProbeKind::Http(url.to_string()));
+        type_count += 1;
+    }
+    if let Some(v) = tbl.get("exec") {
+        let cmd = v
+            .as_str()
+            .ok_or_else(|| format!("unit '{unit_name}': '{field}.exec' must be a string"))?;
+        probe = Some(ProbeKind::Exec(cmd.to_string()));
+        type_count += 1;
+    }
+
+    if type_count == 0 {
+        return Err(format!(
+            "unit '{unit_name}': '{field}' must specify one of: exit, tcp, http, exec"
+        ));
+    }
+    if type_count > 1 {
+        return Err(format!(
+            "unit '{unit_name}': '{field}' must specify exactly one of: exit, tcp, http, exec"
+        ));
+    }
+
+    let is_ready = field == "ready";
+    let default_interval = if is_ready {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(10)
+    };
+    let default_timeout = Duration::from_secs(30);
+
+    let interval = match tbl.get("interval") {
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                format!("unit '{unit_name}': '{field}.interval' must be a string")
+            })?;
+            parse_duration(s).map_err(|e| format!("unit '{unit_name}': '{field}.interval': {e}"))?
+        }
+        None => default_interval,
+    };
+
+    let timeout = match tbl.get("timeout") {
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("unit '{unit_name}': '{field}.timeout' must be a string"))?;
+            parse_duration(s).map_err(|e| format!("unit '{unit_name}': '{field}.timeout': {e}"))?
+        }
+        None => default_timeout,
+    };
+
+    let retries =
+        match tbl.get("retries") {
+            Some(v) => Some(v.as_integer().ok_or_else(|| {
+                format!("unit '{unit_name}': '{field}.retries' must be an integer")
+            })? as u32),
+            None => None,
+        };
+
+    Ok(ProbeConfig {
+        probe: probe.unwrap(),
+        interval,
+        timeout,
+        retries,
+    })
+}
+
+/// Parse a duration string like "1s", "5m", "2h".
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration string".into());
+    }
+    let (num_str, suffix) = s.split_at(s.len() - 1);
+    let num: u64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid duration '{s}': expected format like '1s', '5m', '2h'"))?;
+    match suffix {
+        "s" => Ok(Duration::from_secs(num)),
+        "m" => Ok(Duration::from_secs(num * 60)),
+        "h" => Ok(Duration::from_secs(num * 3600)),
+        _ => Err(format!(
+            "invalid duration suffix '{suffix}' in '{s}': expected 's', 'm', or 'h'"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,9 +402,10 @@ pub fn validate(psyfile: &Psyfile) -> Result<(), String> {
     // Check dependency references exist
     for (name, unit) in &psyfile.units {
         for dep in &unit.depends_on {
-            if !psyfile.units.contains_key(dep) {
+            if !psyfile.units.contains_key(&dep.name) {
                 return Err(format!(
-                    "unit '{name}': depends_on references unknown unit '{dep}'"
+                    "unit '{name}': depends_on references unknown unit '{}'",
+                    dep.name
                 ));
             }
         }
@@ -209,7 +429,7 @@ fn detect_cycles(psyfile: &Psyfile) -> Result<(), String> {
     for (name, unit) in &psyfile.units {
         for dep in &unit.depends_on {
             adjacency
-                .entry(dep.as_str())
+                .entry(dep.name.as_str())
                 .or_default()
                 .push(name.as_str());
             *in_degree.entry(name.as_str()).or_insert(0) += 1;
@@ -339,7 +559,7 @@ fn dfs_order(
     visiting.insert(name.to_string());
 
     for dep in &unit.depends_on {
-        dfs_order(psyfile, dep, visited, visiting, result)?;
+        dfs_order(psyfile, &dep.name, visited, visiting, result)?;
     }
 
     visiting.remove(name);
@@ -436,6 +656,108 @@ pub fn build_command_with_args(command: &str, extra_args: &[String]) -> String {
             format!("{} {}", command, joined)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// JSON Schema
+// ---------------------------------------------------------------------------
+
+/// Return a JSON Schema describing the Psyfile format.
+pub fn json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "Psyfile",
+        "description": "psy process lifecycle manager — unit definitions",
+        "type": "object",
+        "additionalProperties": {
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run"
+                },
+                "restart": {
+                    "type": "string",
+                    "enum": ["no", "on-failure", "always"],
+                    "default": "no",
+                    "description": "Restart policy"
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Environment variables"
+                },
+                "depends_on": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            { "type": "string" },
+                            {
+                                "type": "object",
+                                "required": ["name"],
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "restart": { "type": "boolean", "default": false }
+                                },
+                                "additionalProperties": false
+                            }
+                        ]
+                    },
+                    "description": "Units to start before this one"
+                },
+                "singleton": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Single instance (true) or template (false)"
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Working directory for the process"
+                },
+                "ready": {
+                    "type": "object",
+                    "description": "Startup readiness probe — dependents wait for it",
+                    "properties": {
+                        "exit": { "type": "integer", "description": "Expected exit code" },
+                        "tcp": {
+                            "oneOf": [
+                                { "type": "string" },
+                                { "type": "integer" }
+                            ],
+                            "description": "TCP address or port to probe"
+                        },
+                        "http": { "type": "string", "description": "HTTP URL to probe (expects 2xx)" },
+                        "exec": { "type": "string", "description": "Command to run (expects exit 0)" },
+                        "interval": { "type": "string", "default": "1s", "description": "Time between attempts" },
+                        "timeout": { "type": "string", "default": "30s", "description": "Give up after this duration" },
+                        "retries": { "type": "integer", "description": "Max probe attempts" }
+                    },
+                    "additionalProperties": false
+                },
+                "healthcheck": {
+                    "type": "object",
+                    "description": "Continuous health check — failure triggers restart per policy",
+                    "properties": {
+                        "tcp": {
+                            "oneOf": [
+                                { "type": "string" },
+                                { "type": "integer" }
+                            ],
+                            "description": "TCP address or port to probe"
+                        },
+                        "http": { "type": "string", "description": "HTTP URL to probe (expects 2xx)" },
+                        "exec": { "type": "string", "description": "Command to run (expects exit 0)" },
+                        "interval": { "type": "string", "default": "10s", "description": "Time between checks" },
+                        "timeout": { "type": "string", "default": "30s", "description": "Per-check timeout" },
+                        "retries": { "type": "integer", "default": 3, "description": "Consecutive failures before unhealthy" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +875,7 @@ command = "start-api"
 depends_on = ["db"]
 "#;
         let pf = parse_str(content).unwrap();
-        assert_eq!(pf.units["api"].depends_on, vec!["db"]);
+        assert_eq!(pf.units["api"].dep_names(), vec!["db"]);
     }
 
     #[test]
@@ -871,5 +1193,224 @@ command = "echo b"
             assert!(p.is_file());
         }
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // -- depends_on extended syntax ------------------------------------------
+
+    #[test]
+    fn parse_depends_on_mixed() {
+        let content = r#"
+[db]
+command = "start-db"
+
+[cache]
+command = "start-cache"
+
+[api]
+command = "start-api"
+depends_on = ["db", { name = "cache", restart = true }]
+"#;
+        let pf = parse_str(content).unwrap();
+        let deps = &pf.units["api"].depends_on;
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "db");
+        assert!(!deps[0].restart);
+        assert_eq!(deps[1].name, "cache");
+        assert!(deps[1].restart);
+    }
+
+    #[test]
+    fn parse_depends_on_table_only() {
+        let content = r#"
+[db]
+command = "start-db"
+
+[api]
+command = "start-api"
+depends_on = [{ name = "db", restart = true }]
+"#;
+        let pf = parse_str(content).unwrap();
+        let deps = &pf.units["api"].depends_on;
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "db");
+        assert!(deps[0].restart);
+    }
+
+    #[test]
+    fn parse_depends_on_table_default_restart() {
+        let content = r#"
+[db]
+command = "start-db"
+
+[api]
+command = "start-api"
+depends_on = [{ name = "db" }]
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(!pf.units["api"].depends_on[0].restart);
+    }
+
+    // -- ready / healthcheck probes ------------------------------------------
+
+    #[test]
+    fn parse_ready_tcp() {
+        let content = r#"
+[server]
+command = "start-server"
+ready = { tcp = "localhost:8080" }
+"#;
+        let pf = parse_str(content).unwrap();
+        let ready = pf.units["server"].ready.as_ref().unwrap();
+        assert!(matches!(ready.probe, ProbeKind::Tcp(ref s) if s == "localhost:8080"));
+        assert_eq!(ready.interval, Duration::from_secs(1));
+        assert_eq!(ready.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_ready_tcp_port_number() {
+        let content = r#"
+[server]
+command = "start-server"
+ready = { tcp = 8080 }
+"#;
+        let pf = parse_str(content).unwrap();
+        let ready = pf.units["server"].ready.as_ref().unwrap();
+        assert!(matches!(ready.probe, ProbeKind::Tcp(ref s) if s == "localhost:8080"));
+    }
+
+    #[test]
+    fn parse_ready_http() {
+        let content = r#"
+[api]
+command = "start-api"
+ready = { http = "http://localhost:3000/health" }
+"#;
+        let pf = parse_str(content).unwrap();
+        let ready = pf.units["api"].ready.as_ref().unwrap();
+        assert!(
+            matches!(ready.probe, ProbeKind::Http(ref s) if s == "http://localhost:3000/health")
+        );
+    }
+
+    #[test]
+    fn parse_ready_exec() {
+        let content = r#"
+[db]
+command = "start-db"
+ready = { exec = "pg_isready -h localhost" }
+"#;
+        let pf = parse_str(content).unwrap();
+        let ready = pf.units["db"].ready.as_ref().unwrap();
+        assert!(matches!(ready.probe, ProbeKind::Exec(ref s) if s == "pg_isready -h localhost"));
+    }
+
+    #[test]
+    fn parse_ready_exit() {
+        let content = r#"
+[build]
+command = "cargo build"
+ready = { exit = 0 }
+"#;
+        let pf = parse_str(content).unwrap();
+        let ready = pf.units["build"].ready.as_ref().unwrap();
+        assert!(matches!(ready.probe, ProbeKind::Exit(0)));
+    }
+
+    #[test]
+    fn parse_ready_custom_interval_timeout() {
+        let content = r#"
+[server]
+command = "start-server"
+ready = { tcp = "localhost:5432", interval = "2s", timeout = "60s", retries = 10 }
+"#;
+        let pf = parse_str(content).unwrap();
+        let ready = pf.units["server"].ready.as_ref().unwrap();
+        assert_eq!(ready.interval, Duration::from_secs(2));
+        assert_eq!(ready.timeout, Duration::from_secs(60));
+        assert_eq!(ready.retries, Some(10));
+    }
+
+    #[test]
+    fn parse_healthcheck() {
+        let content = r#"
+[server]
+command = "start-server"
+healthcheck = { tcp = "localhost:8080", interval = "10s", retries = 3 }
+"#;
+        let pf = parse_str(content).unwrap();
+        let hc = pf.units["server"].healthcheck.as_ref().unwrap();
+        assert!(matches!(hc.probe, ProbeKind::Tcp(ref s) if s == "localhost:8080"));
+        assert_eq!(hc.interval, Duration::from_secs(10));
+        assert_eq!(hc.retries, Some(3));
+    }
+
+    #[test]
+    fn parse_healthcheck_exit_rejected() {
+        let content = r#"
+[server]
+command = "start-server"
+healthcheck = { exit = 0 }
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(err.contains("not valid for healthcheck"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_probe_no_type() {
+        let content = r#"
+[server]
+command = "start-server"
+ready = { interval = "1s" }
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(err.contains("must specify one of"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_probe_multiple_types() {
+        let content = r#"
+[server]
+command = "start-server"
+ready = { tcp = "localhost:8080", http = "http://localhost:8080" }
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(err.contains("exactly one"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_both_ready_and_healthcheck() {
+        let content = r#"
+[server]
+command = "start-server"
+ready = { tcp = "localhost:8080" }
+healthcheck = { http = "http://localhost:8080/health", interval = "15s" }
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(pf.units["server"].ready.is_some());
+        assert!(pf.units["server"].healthcheck.is_some());
+    }
+
+    // -- parse_duration ------------------------------------------------------
+
+    #[test]
+    fn duration_seconds() {
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn duration_minutes() {
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn duration_hours() {
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn duration_invalid() {
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("5x").is_err());
+        assert!(parse_duration("").is_err());
     }
 }

@@ -339,7 +339,8 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
 
         // Start dependencies first
         if !unit.depends_on.is_empty() {
-            let dep_order = match psyfile::resolve_start_order(pf, &unit.depends_on) {
+            let dep_names = unit.dep_names();
+            let dep_order = match psyfile::resolve_start_order(pf, &dep_names) {
                 Ok(o) => o,
                 Err(e) => {
                     return HandleResult::Response(Response::err(
@@ -386,6 +387,37 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
                                     "failed to start dependency '{dep_name}': {}",
                                     resp.error.as_deref().unwrap_or("unknown")
                                 ),
+                            ));
+                        }
+                    }
+                }
+
+                // Wait for dependency readiness if it has a probe
+                let wait_info = {
+                    let table = root.process_table.lock().await;
+                    if let Some(entry) = table.get(dep_name.as_str()) {
+                        if !entry.ready && entry.ready_config.is_some() {
+                            let timeout = entry
+                                .ready_config
+                                .as_ref()
+                                .map(|c| c.timeout)
+                                .unwrap_or(std::time::Duration::from_secs(30));
+                            Some((Arc::clone(&entry.ready_notify), timeout))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((notify, timeout)) = wait_info {
+                    match tokio::time::timeout(timeout, notify.notified()).await {
+                        Ok(()) => { /* dep is ready */ }
+                        Err(_) => {
+                            return HandleResult::Response(Response::err(
+                                &req.id,
+                                format!("dependency '{}' readiness probe timed out", dep_name),
                             ));
                         }
                     }
@@ -461,6 +493,8 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             restart,
             args.attach,
             working_dir,
+            unit.ready.clone(),
+            unit.healthcheck.clone(),
         )
         .await;
     }
@@ -482,6 +516,8 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         args.restart,
         args.attach,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -497,6 +533,8 @@ async fn spawn_process(
     restart: RestartPolicy,
     attach: bool,
     working_dir: Option<std::path::PathBuf>,
+    ready_config: Option<crate::psyfile::ProbeConfig>,
+    healthcheck_config: Option<crate::psyfile::ProbeConfig>,
 ) -> HandleResult {
     let mut table = root.process_table.lock().await;
 
@@ -520,6 +558,17 @@ async fn spawn_process(
     let mut entry = ProcessEntry::new(name.clone(), command, env, restart, false);
     entry.working_dir = working_dir;
 
+    // Configure readiness probes
+    let is_exit_probe = matches!(
+        ready_config.as_ref().map(|c| &c.probe),
+        Some(crate::psyfile::ProbeKind::Exit(_))
+    );
+    if ready_config.is_some() {
+        entry.ready = false;
+        entry.ready_config = ready_config.clone();
+    }
+    entry.healthcheck_config = healthcheck_config.clone();
+
     if let Some((history, next_id)) = old_history {
         entry.run_history = history;
         entry.current_run_id = next_id;
@@ -542,8 +591,53 @@ async fn spawn_process(
     };
 
     entry.child = Some(child);
+
+    // Set up probe cancellation channel
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    entry.probe_cancel = Some(cancel_tx);
+
+    let stdout_buf = Arc::clone(&entry.stdout_buf);
+    let stderr_buf = Arc::clone(&entry.stderr_buf);
+
     table.insert(name.clone(), entry);
     drop(table);
+
+    // Launch readiness probe task (not for exit probes — those are handled by monitor_child)
+    if let Some(ref config) = ready_config {
+        if !is_exit_probe {
+            let pt = Arc::clone(&root.process_table);
+            let probe_name = name.clone();
+            let probe_config = config.clone();
+            let probe_cancel = cancel_rx.clone();
+            let probe_stdout = Arc::clone(&stdout_buf);
+            let probe_stderr = Arc::clone(&stderr_buf);
+            tokio::spawn(async move {
+                crate::probe::run_ready_probe(
+                    pt,
+                    probe_name,
+                    probe_config,
+                    probe_stdout,
+                    probe_stderr,
+                    probe_cancel,
+                )
+                .await;
+            });
+        }
+    }
+
+    // Launch healthcheck task
+    if let Some(ref config) = healthcheck_config {
+        let pt = Arc::clone(&root.process_table);
+        let hc_name = name.clone();
+        let hc_config = config.clone();
+        let hc_cancel = cancel_rx.clone();
+        let hc_stdout = Arc::clone(&stdout_buf);
+        let hc_stderr = Arc::clone(&stderr_buf);
+        tokio::spawn(async move {
+            crate::probe::run_healthcheck(pt, hc_name, hc_config, hc_stdout, hc_stderr, hc_cancel)
+                .await;
+        });
+    }
 
     let root_clone = Arc::clone(root);
     let monitor_name = name.clone();
@@ -571,7 +665,7 @@ async fn handle_ps(root: &Arc<SharedRoot>, req: &Request) -> Response {
 }
 
 async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
-    let args: LogsArgs = match req
+    let mut args: LogsArgs = match req
         .args
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -579,6 +673,18 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
         Some(a) => a,
         None => return Response::err(&req.id, "invalid or missing logs args"),
     };
+
+    // If probe flag is set, adjust stream filter to show probe streams
+    if args.probe {
+        args.stream = match args.stream {
+            StreamFilter::Stdout => StreamFilter::ProbeStdout,
+            StreamFilter::Stderr => StreamFilter::ProbeStderr,
+            StreamFilter::ProbeStdout | StreamFilter::ProbeStderr | StreamFilter::Probe => {
+                args.stream // already a probe filter
+            }
+            _ => StreamFilter::Probe,
+        };
+    }
 
     let since = args
         .since
@@ -925,19 +1031,87 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
         entry.current_run_id = next_id;
         entry.working_dir = working_dir;
 
+        // Configure readiness probes from Psyfile unit
+        let ready_config = unit_def.and_then(|u| u.ready.clone());
+        let healthcheck_config = unit_def.and_then(|u| u.healthcheck.clone());
+
+        let is_exit_probe = matches!(
+            ready_config.as_ref().map(|c| &c.probe),
+            Some(crate::psyfile::ProbeKind::Exit(_))
+        );
+        if ready_config.is_some() {
+            entry.ready = false;
+            entry.ready_config = ready_config.clone();
+        }
+        entry.healthcheck_config = healthcheck_config.clone();
+
         let child = match spawn_child(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
             Err(e) => return Response::err(&req.id, format!("restart spawn failed: {e}")),
         };
 
         entry.child = Some(child);
+
+        // Set up probe cancellation and launch probe tasks
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        entry.probe_cancel = Some(cancel_tx);
+        let stdout_buf = Arc::clone(&entry.stdout_buf);
+        let stderr_buf = Arc::clone(&entry.stderr_buf);
+
         let name = args.name.clone();
         table.insert(name.clone(), entry);
         drop(table);
 
+        // Launch readiness probe task
+        if let Some(ref config) = ready_config {
+            if !is_exit_probe {
+                let pt = Arc::clone(&root.process_table);
+                let probe_name = name.clone();
+                let probe_config = config.clone();
+                let probe_cancel = cancel_rx.clone();
+                let probe_stdout = Arc::clone(&stdout_buf);
+                let probe_stderr = Arc::clone(&stderr_buf);
+                tokio::spawn(async move {
+                    crate::probe::run_ready_probe(
+                        pt,
+                        probe_name,
+                        probe_config,
+                        probe_stdout,
+                        probe_stderr,
+                        probe_cancel,
+                    )
+                    .await;
+                });
+            }
+        }
+
+        // Launch healthcheck task
+        if let Some(ref config) = healthcheck_config {
+            let pt = Arc::clone(&root.process_table);
+            let hc_name = name.clone();
+            let hc_config = config.clone();
+            let hc_cancel = cancel_rx.clone();
+            let hc_stdout = Arc::clone(&stdout_buf);
+            let hc_stderr = Arc::clone(&stderr_buf);
+            tokio::spawn(async move {
+                crate::probe::run_healthcheck(
+                    pt, hc_name, hc_config, hc_stdout, hc_stderr, hc_cancel,
+                )
+                .await;
+            });
+        }
+
         let root_clone = Arc::clone(root);
+        let monitor_name = name.clone();
         tokio::spawn(async move {
-            monitor_child(root_clone, name).await;
+            monitor_child(root_clone, monitor_name).await;
+        });
+
+        // Trigger restart cascades
+        let root_clone = Arc::clone(root);
+        let cascade_name = name.clone();
+        tokio::spawn(async move {
+            cascade_restarts(&root_clone, &cascade_name).await;
         });
     }
 
@@ -945,6 +1119,109 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
         &req.id,
         Some(serde_json::json!({ "name": args.name, "status": "running" })),
     )
+}
+
+/// Cascade restarts to dependents that have `restart = true` in their dependency
+/// on the restarted unit. Uses BFS to collect all transitive dependents, then
+/// restarts each in dependency order. Each restart is done via a direct restart
+/// call (no recursive cascade to avoid infinite loops).
+async fn cascade_restarts(root: &Arc<SharedRoot>, restarted_name: &str) {
+    use std::collections::{HashSet, VecDeque};
+
+    let psyfile = match root.load_psyfile().ok().flatten() {
+        Some(pf) => pf,
+        None => return,
+    };
+
+    // Build reverse dep map: unit_name -> units that depend on it with restart=true
+    let mut reverse_deps: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, unit) in &psyfile.units {
+        for dep in &unit.depends_on {
+            if dep.restart {
+                reverse_deps
+                    .entry(dep.name.clone())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+    }
+
+    // BFS from restarted_name to collect all transitive dependents
+    let mut to_restart = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    if let Some(direct) = reverse_deps.get(restarted_name) {
+        for d in direct {
+            queue.push_back(d.clone());
+        }
+    }
+
+    while let Some(name) = queue.pop_front() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        to_restart.push(name.clone());
+        if let Some(transitive) = reverse_deps.get(&name) {
+            for t in transitive {
+                queue.push_back(t.clone());
+            }
+        }
+    }
+
+    if to_restart.is_empty() {
+        return;
+    }
+
+    // Wait for the restarted upstream to be ready if it has a probe
+    let wait_info = {
+        let table = root.process_table.lock().await;
+        if let Some(entry) = table.get(restarted_name) {
+            if !entry.ready && entry.ready_config.is_some() {
+                let timeout = entry
+                    .ready_config
+                    .as_ref()
+                    .map(|c| c.timeout)
+                    .unwrap_or(std::time::Duration::from_secs(30));
+                Some((Arc::clone(&entry.ready_notify), timeout))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some((notify, timeout)) = wait_info {
+        if tokio::time::timeout(timeout, notify.notified())
+            .await
+            .is_err()
+        {
+            // Upstream readiness timed out — skip cascading
+            return;
+        }
+    }
+
+    // Restart each dependent
+    for dep_name in &to_restart {
+        let is_running = {
+            let table = root.process_table.lock().await;
+            table
+                .get(dep_name)
+                .map(|e| e.state == ProcessState::Running)
+                .unwrap_or(false)
+        };
+
+        if is_running {
+            // Use the Send-safe handle_restart wrapper
+            let sub_req = Request::restart(RestartArgs {
+                name: dep_name.clone(),
+            });
+            // handle_restart_inner calls cascade_restarts at the end,
+            // which naturally handles transitive cascades.
+            let _ = handle_restart(root, &sub_req).await;
+        }
+    }
 }
 
 async fn handle_down(root: &Arc<SharedRoot>, req: &Request) -> Response {
@@ -1030,22 +1307,33 @@ async fn teardown(root: Arc<SharedRoot>) {
 async fn monitor_child(root: Arc<SharedRoot>, name: String) {
     loop {
         // Take the child handle out of the table so we can await it without
-        // holding the lock.
-        let child_handle = {
+        // holding the lock. Also record the run_id so we can detect if the
+        // entry was replaced (e.g. by a restart) while we were waiting.
+        let (child_handle, run_id, kill_notify) = {
             let mut table = root.process_table.lock().await;
             let entry = match table.get_mut(&name) {
                 Some(e) if e.state == ProcessState::Running => e,
                 _ => return,
             };
+            let rid = entry.current_run_id;
+            let kn = Arc::clone(&entry.kill_notify);
             match entry.child.take() {
-                Some(c) => c,
+                Some(c) => (c, rid, kn),
                 None => return,
             }
         };
 
-        // Wait for exit (without holding the lock)
+        // Wait for exit or a kill request from the healthcheck probe.
+        // We hold the child handle here — the healthcheck signals via
+        // kill_notify and we perform the actual kill.
         let mut child_handle = child_handle;
-        let status = child_handle.wait().await;
+        let status = tokio::select! {
+            s = child_handle.wait() => s,
+            _ = kill_notify.notified() => {
+                let _ = child_handle.kill().await;
+                child_handle.wait().await
+            }
+        };
 
         let exit_code = status.as_ref().ok().and_then(|s| s.code());
 
@@ -1056,6 +1344,12 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
                 Some(e) => e,
                 None => return,
             };
+
+            // If the entry was replaced (e.g. by handle_restart), bail out —
+            // a new monitor_child is already watching the new process.
+            if entry.current_run_id != run_id {
+                return;
+            }
 
             entry.stopped_at = Some(chrono::Utc::now());
             let was_intentional = entry.stopping.swap(false, Ordering::Relaxed);
@@ -1102,6 +1396,23 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
 
             entry.pid = None;
 
+            // Cancel any running probe tasks
+            if let Some(ref cancel) = entry.probe_cancel {
+                let _ = cancel.send(true);
+            }
+
+            // Handle exit readiness probe
+            if let Some(ref config) = entry.ready_config {
+                if let crate::psyfile::ProbeKind::Exit(expected_code) = config.probe {
+                    if exit_code == Some(expected_code) {
+                        entry.ready = true;
+                        entry.ready_notify.notify_waiters();
+                    } else {
+                        entry.ready_failed = true;
+                    }
+                }
+            }
+
             let do_restart =
                 !root.shutting_down.load(Ordering::Relaxed) && should_restart(entry, exit_code);
             let backoff = calculate_backoff(entry.restarts);
@@ -1131,9 +1442,64 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
             // Archive the completed run and start fresh buffers
             entry.archive_current_run();
 
+            // Reset readiness state for new run
+            if entry.ready_config.is_some() {
+                entry.ready = false;
+                entry.ready_failed = false;
+            }
+
             match spawn_child(entry, &root.psy_sock, root.psy_root_pid) {
                 Ok(child) => {
                     entry.child = Some(child);
+
+                    // Relaunch probe tasks
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    entry.probe_cancel = Some(cancel_tx);
+                    let stdout_buf = Arc::clone(&entry.stdout_buf);
+                    let stderr_buf = Arc::clone(&entry.stderr_buf);
+
+                    let is_exit_probe = matches!(
+                        entry.ready_config.as_ref().map(|c| &c.probe),
+                        Some(crate::psyfile::ProbeKind::Exit(_))
+                    );
+
+                    if let Some(ref config) = entry.ready_config.clone() {
+                        if !is_exit_probe {
+                            let pt = Arc::clone(&root.process_table);
+                            let probe_name = name.clone();
+                            let probe_config = config.clone();
+                            let probe_cancel = cancel_rx.clone();
+                            let probe_stdout = Arc::clone(&stdout_buf);
+                            let probe_stderr = Arc::clone(&stderr_buf);
+                            tokio::spawn(async move {
+                                crate::probe::run_ready_probe(
+                                    pt,
+                                    probe_name,
+                                    probe_config,
+                                    probe_stdout,
+                                    probe_stderr,
+                                    probe_cancel,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+
+                    if let Some(ref config) = entry.healthcheck_config.clone() {
+                        let pt = Arc::clone(&root.process_table);
+                        let hc_name = name.clone();
+                        let hc_config = config.clone();
+                        let hc_cancel = cancel_rx.clone();
+                        let hc_stdout = Arc::clone(&stdout_buf);
+                        let hc_stderr = Arc::clone(&stderr_buf);
+                        tokio::spawn(async move {
+                            crate::probe::run_healthcheck(
+                                pt, hc_name, hc_config, hc_stdout, hc_stderr, hc_cancel,
+                            )
+                            .await;
+                        });
+                    }
+
                     // Continue the loop to monitor the new child
                 }
                 Err(e) => {
@@ -1400,10 +1766,7 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
         }
 
         for line in &all_lines {
-            let stream_kind = match line.stream {
-                RBStream::Stdout => StreamKind::Stdout,
-                RBStream::Stderr => StreamKind::Stderr,
-            };
+            let stream_kind = StreamKind::from(line.stream);
             let log_resp = LogLineResponse {
                 id: req.id.clone(),
                 name: args.name.clone(),
@@ -1443,9 +1806,12 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
 
         // Apply stream filter
         let passes_filter = match args.stream {
-            StreamFilter::All => true,
+            StreamFilter::All => !log_line.stream.is_probe(),
             StreamFilter::Stdout => log_line.stream == RBStream::Stdout,
             StreamFilter::Stderr => log_line.stream == RBStream::Stderr,
+            StreamFilter::Probe => log_line.stream.is_probe(),
+            StreamFilter::ProbeStdout => log_line.stream == RBStream::ProbeStdout,
+            StreamFilter::ProbeStderr => log_line.stream == RBStream::ProbeStderr,
         };
 
         if !passes_filter {
@@ -1471,10 +1837,7 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
             }
         }
 
-        let stream_kind = match log_line.stream {
-            RBStream::Stdout => StreamKind::Stdout,
-            RBStream::Stderr => StreamKind::Stderr,
-        };
+        let stream_kind = StreamKind::from(log_line.stream);
 
         let log_resp = LogLineResponse {
             id: req.id.clone(),
@@ -1548,10 +1911,7 @@ where
             result = stdout_rx.recv() => {
                 match result {
                     Ok(log_line) => {
-                        let stream_kind = match log_line.stream {
-                            RBStream::Stdout => StreamKind::Stdout,
-                            RBStream::Stderr => StreamKind::Stderr,
-                        };
+                        let stream_kind = StreamKind::from(log_line.stream);
                         let log_resp = LogLineResponse {
                             id: req_id.to_string(),
                             name: name.to_string(),
@@ -1588,10 +1948,7 @@ where
             result = stderr_rx.recv() => {
                 match result {
                     Ok(log_line) => {
-                        let stream_kind = match log_line.stream {
-                            RBStream::Stdout => StreamKind::Stdout,
-                            RBStream::Stderr => StreamKind::Stderr,
-                        };
+                        let stream_kind = StreamKind::from(log_line.stream);
                         let log_resp = LogLineResponse {
                             id: req_id.to_string(),
                             name: name.to_string(),

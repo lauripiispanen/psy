@@ -8,10 +8,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::Notify;
 
 #[cfg(unix)]
 use crate::platform;
 use crate::protocol::{ProcessInfo, RestartPolicy, RunInfo};
+use crate::psyfile::ProbeConfig;
 use crate::ring_buffer::{RingBuffer, Stream};
 
 // ---------------------------------------------------------------------------
@@ -105,6 +107,21 @@ pub struct ProcessEntry {
     pub run_history: Vec<RunRecord>,
     /// Working directory for the process (if set).
     pub working_dir: Option<PathBuf>,
+    /// Whether the process has passed its readiness probe (true if no probe configured).
+    pub ready: bool,
+    /// Whether the readiness probe timed out.
+    pub ready_failed: bool,
+    /// Readiness probe configuration (from Psyfile).
+    pub ready_config: Option<ProbeConfig>,
+    /// Health check probe configuration (from Psyfile).
+    pub healthcheck_config: Option<ProbeConfig>,
+    /// Notified when the process becomes ready.
+    pub ready_notify: Arc<Notify>,
+    /// Send `true` to cancel all probe tasks for this process.
+    pub probe_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// Notified by healthcheck when the process should be killed.
+    /// `monitor_child` selects on this while awaiting the child exit.
+    pub kill_notify: Arc<Notify>,
 }
 
 impl ProcessEntry {
@@ -136,6 +153,13 @@ impl ProcessEntry {
             current_run_id: 1,
             run_history: Vec::new(),
             working_dir: None,
+            ready: true, // no probe = ready immediately
+            ready_failed: false,
+            ready_config: None,
+            healthcheck_config: None,
+            ready_notify: Arc::new(Notify::new()),
+            probe_cancel: None,
+            kill_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -191,6 +215,18 @@ impl ProcessEntry {
             None
         };
 
+        let ready = if self.ready_config.is_some() || self.healthcheck_config.is_some() {
+            if self.ready_failed {
+                Some("failed".into())
+            } else if self.ready {
+                Some("ready".into())
+            } else {
+                Some("waiting".into())
+            }
+        } else {
+            None
+        };
+
         ProcessInfo {
             name: self.name.clone(),
             pid: self.pid,
@@ -201,6 +237,7 @@ impl ProcessEntry {
             exit_code: self.exit_status,
             signal: self.signal.clone(),
             restarts: self.restarts,
+            ready,
         }
     }
 }

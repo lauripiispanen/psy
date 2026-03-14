@@ -127,6 +127,7 @@ pub fn follow_logs(
         grep,
         run: None,
         previous: false,
+        probe: false,
     });
     let mut payload =
         serde_json::to_string(&request).map_err(|e| format!("serialize error: {e}"))?;

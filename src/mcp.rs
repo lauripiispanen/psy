@@ -161,6 +161,10 @@ fn tool_schemas() -> Value {
                         "previous": {
                             "type": "boolean",
                             "description": "Show logs from the previous run (before the current one)"
+                        },
+                        "probe": {
+                            "type": "boolean",
+                            "description": "Show probe logs instead of process output (default: false)"
                         }
                     },
                     "required": ["name"]
@@ -206,6 +210,15 @@ fn tool_schemas() -> Value {
                         }
                     },
                     "required": ["name"]
+                }
+            },
+            {
+                "name": "psy_psyfile_schema",
+                "description": "Return the JSON Schema for the Psyfile format. Use this to discover available fields for defining process units.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }
             }
         ]
@@ -325,6 +338,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 .get("previous")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let probe = args.get("probe").and_then(|v| v.as_bool()).unwrap_or(false);
             let req = Request::logs(LogsArgs {
                 name,
                 tail,
@@ -334,6 +348,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 grep,
                 run,
                 previous,
+                probe,
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
@@ -401,6 +416,12 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
             }
         }
 
+        "psy_psyfile_schema" => {
+            let schema = crate::psyfile::json_schema();
+            let text = serde_json::to_string_pretty(&schema).unwrap_or_default();
+            Ok(json!({ "type": "text", "text": text }))
+        }
+
         _ => Err(format!("unknown tool: {tool_name}")),
     }
 }
@@ -415,13 +436,14 @@ fn format_ps_table(ps: &PsResponse) -> String {
     }
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}\n",
-        "NAME", "PID", "STATUS", "EXIT", "UPTIME", "RESTARTS", "RESTART"
+        "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} {}\n",
+        "NAME", "PID", "STATUS", "READY", "EXIT", "UPTIME", "RESTARTS", "RESTART"
     ));
-    out.push_str(&"-".repeat(78));
+    out.push_str(&"-".repeat(86));
     out.push('\n');
     for p in &ps.processes {
         let pid_str = p.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let ready_str = p.ready.as_deref().unwrap_or("-");
         let exit_str = if let Some(sig) = &p.signal {
             sig.clone()
         } else {
@@ -435,8 +457,8 @@ fn format_ps_table(ps: &PsResponse) -> String {
             .unwrap_or_else(|| "-".into());
         let restart = format!("{:?}", p.restart_policy).to_lowercase();
         out.push_str(&format!(
-            "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}\n",
-            p.name, pid_str, p.status, exit_str, uptime, p.restarts, restart
+            "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} {}\n",
+            p.name, pid_str, p.status, ready_str, exit_str, uptime, p.restarts, restart
         ));
     }
     out

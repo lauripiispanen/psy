@@ -1,6 +1,7 @@
 pub mod client;
 pub mod mcp;
 pub mod platform;
+pub mod probe;
 pub mod process;
 pub mod protocol;
 pub mod psyfile;
@@ -107,6 +108,9 @@ enum Commands {
         /// Show logs from the previous run
         #[arg(long)]
         previous: bool,
+        /// Show probe logs instead of process output
+        #[arg(long)]
+        probe: bool,
     },
     /// Show run history for a process
     History {
@@ -127,8 +131,27 @@ enum Commands {
     Down,
     /// Start MCP JSON-RPC server on stdin/stdout
     Mcp,
+    /// Psyfile utilities
+    Psyfile {
+        #[command(subcommand)]
+        command: PsyfileCommands,
+    },
     /// Print version information
     Version,
+}
+
+#[derive(Subcommand)]
+enum PsyfileCommands {
+    /// Output JSON Schema for Psyfile format
+    Schema,
+    /// Validate the current Psyfile
+    Validate {
+        /// Path to Psyfile (overrides discovery)
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Generate a starter Psyfile in the current directory
+    Init,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +272,65 @@ fn main() {
             }
         }
 
+        Commands::Psyfile { command: pf_cmd } => match pf_cmd {
+            PsyfileCommands::Schema => {
+                let schema = psyfile::json_schema();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&schema).unwrap_or_default()
+                );
+            }
+            PsyfileCommands::Validate { file } => {
+                let path = if let Some(p) = file {
+                    p
+                } else {
+                    match psyfile::discover(&std::env::current_dir().unwrap_or_default()) {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("error: no Psyfile found");
+                            std::process::exit(1);
+                        }
+                    }
+                };
+                match psyfile::parse(&path) {
+                    Ok(pf) => match psyfile::validate(&pf) {
+                        Ok(()) => println!("OK: {}", path.display()),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            PsyfileCommands::Init => {
+                let path = std::path::Path::new("Psyfile");
+                if path.exists() {
+                    eprintln!("error: Psyfile already exists");
+                    std::process::exit(1);
+                }
+                let template = r#"# Psyfile - psy process definitions
+# See: psy psyfile schema
+
+[server]
+command = "echo 'hello world'"
+# restart = "on-failure"
+# env = { PORT = "8080" }
+# depends_on = ["db"]
+# ready = { tcp = 8080 }
+# healthcheck = { http = "http://localhost:8080/health", interval = "10s", retries = 3 }
+"#;
+                if let Err(e) = std::fs::write(path, template) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                println!("Created Psyfile");
+            }
+        },
+
         Commands::Run {
             name,
             restart,
@@ -322,8 +404,15 @@ fn main() {
             grep,
             run,
             previous,
+            probe,
         } => {
-            let stream = if stdout {
+            let stream = if probe && stdout {
+                StreamFilter::ProbeStdout
+            } else if probe && stderr {
+                StreamFilter::ProbeStderr
+            } else if probe {
+                StreamFilter::Probe
+            } else if stdout {
                 StreamFilter::Stdout
             } else if stderr {
                 StreamFilter::Stderr
@@ -364,6 +453,7 @@ fn main() {
                     grep,
                     run,
                     previous,
+                    probe,
                 });
                 match client::send_command(req) {
                     Ok(resp) if resp.ok => {
@@ -531,12 +621,13 @@ fn print_ps_table(ps: &PsResponse) {
         return;
     }
     println!(
-        "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} RESTART",
-        "NAME", "PID", "STATUS", "EXIT", "UPTIME", "RESTARTS"
+        "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} RESTART",
+        "NAME", "PID", "STATUS", "READY", "EXIT", "UPTIME", "RESTARTS"
     );
-    println!("{}", "-".repeat(78));
+    println!("{}", "-".repeat(86));
     for p in &ps.processes {
         let pid_str = p.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let ready_str = p.ready.as_deref().unwrap_or("-");
         let exit_str = if let Some(sig) = &p.signal {
             sig.clone()
         } else {
@@ -550,8 +641,8 @@ fn print_ps_table(ps: &PsResponse) {
             .unwrap_or_else(|| "-".into());
         let restart = format!("{:?}", p.restart_policy).to_lowercase();
         println!(
-            "{:<20} {:<8} {:<10} {:<8} {:<14} {:<10} {}",
-            p.name, pid_str, p.status, exit_str, uptime, p.restarts, restart
+            "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} {}",
+            p.name, pid_str, p.status, ready_str, exit_str, uptime, p.restarts, restart
         );
     }
 }

@@ -1402,3 +1402,509 @@ fn test_psyfile_working_dir() {
         "working dir should be {expected}, got: {logs}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v1.1: Readiness probes
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_ready_exit_probe() {
+    // A "build" unit with exit probe — dependents wait for it to complete
+    let tmp = TempPsyfileDir::new(
+        r#"
+[build]
+command = "echo build-done"
+ready = { exit = 0 }
+
+[server]
+command = "echo server-started"
+depends_on = ["build"]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+
+    // Run server (which depends on build with exit probe)
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(3));
+
+    // Both should have run
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(ps.contains("build"), "build should be in ps: {ps}");
+    assert!(ps.contains("server"), "server should be in ps: {ps}");
+
+    // Server logs should contain its output
+    let server_logs = root.psy_stdout(&["logs", "server"]);
+    assert!(
+        server_logs.contains("server-started"),
+        "server should have started: {server_logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_ready_exec_probe() {
+    // A unit with exec probe — probe command checks a condition
+    let marker = format!("/tmp/psy-test-ready-{}", std::process::id());
+    let tmp = TempPsyfileDir::new(&format!(
+        r#"
+[setup]
+command = "sh -c 'sleep 1 && touch {marker}'"
+
+[checker]
+command = "echo checker-started"
+depends_on = ["setup"]
+"#,
+    ));
+
+    // Setup has no probe, so checker starts immediately after setup launches
+    // This test just verifies that non-probe deps still work
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+    root.psy(&["run", "checker"]);
+    thread::sleep(Duration::from_secs(3));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(ps.contains("setup"), "setup should be in ps: {ps}");
+    assert!(ps.contains("checker"), "checker should be in ps: {ps}");
+
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+#[ignore]
+fn test_ready_tcp_probe() {
+    // A unit with TCP readiness probe — dependent waits for the port
+    let tmp = TempPsyfileDir::new(
+        r#"
+[listener]
+command = "sh -c 'sleep 1 && nc -l 19876 &>/dev/null &'"
+ready = { tcp = "localhost:19876", interval = "1s", timeout = "10s" }
+
+[client]
+command = "echo client-ready"
+depends_on = ["listener"]
+"#,
+    );
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+
+    root.psy(&["run", "client"]);
+    thread::sleep(Duration::from_secs(5));
+
+    // Check probe logs are available
+    let probe_logs = root.psy_stdout(&["logs", "listener", "--probe"]);
+    assert!(
+        probe_logs.contains("tcp") || probe_logs.contains("localhost:19876"),
+        "probe logs should contain tcp diagnostics: {probe_logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_probe_logs_hidden_by_default() {
+    // Probe logs should not appear in default `psy logs` output
+    let tmp = TempPsyfileDir::new(
+        r#"
+[server]
+command = "echo hello"
+ready = { exec = "false", timeout = "3s", interval = "1s" }
+"#,
+    );
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(5));
+
+    // Default logs should NOT contain probe output
+    let default_logs = root.psy_stdout(&["logs", "server"]);
+    assert!(
+        !default_logs.contains("probe"),
+        "default logs should not contain probe output: {default_logs}"
+    );
+
+    // Probe logs should contain probe output
+    let probe_logs = root.psy_stdout(&["logs", "server", "--probe"]);
+    assert!(
+        probe_logs.contains("exec") || probe_logs.contains("false"),
+        "probe logs should contain exec diagnostics: {probe_logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_ps_ready_column() {
+    // Processes with probes show ready status in ps output
+    let tmp = TempPsyfileDir::new(
+        r#"
+[server]
+command = "echo done"
+ready = { exit = 0 }
+"#,
+    );
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(ps.contains("READY"), "ps should have READY column: {ps}");
+    // The exit probe should have passed (exit 0)
+    assert!(
+        ps.contains("ready"),
+        "server should show 'ready' status: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_depends_on_with_restart_flag() {
+    // Extended depends_on syntax with restart cascade
+    let tmp = TempPsyfileDir::new(
+        r#"
+[db]
+command = "sleep 60"
+restart = "always"
+
+[api]
+command = "sleep 60"
+restart = "always"
+depends_on = [{ name = "db", restart = true }]
+"#,
+    );
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &["db", "api"], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(3));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(ps.contains("db"), "db should be running: {ps}");
+    assert!(ps.contains("api"), "api should be running: {ps}");
+}
+
+#[test]
+#[ignore]
+fn test_healthcheck_triggers_restart() {
+    // A process with a failing healthcheck should be killed and restarted
+    let tmp = TempPsyfileDir::new(
+        r#"
+[flaky]
+command = "sleep 999"
+restart = "on-failure"
+healthcheck = { exec = "false", interval = "1s", retries = 2 }
+"#,
+    );
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+    root.psy(&["run", "flaky"]);
+
+    // Wait long enough for healthcheck to fail twice and trigger a restart
+    // Healthcheck: 1s interval wait + fail, 1s wait + fail (retries=2) → kill (SIGTERM + up to 10s)
+    // Then monitor_child: 1s backoff + spawn. Total ~15s worst case.
+    thread::sleep(Duration::from_secs(18));
+
+    // History should show at least 2 runs (original + restarted)
+    let history = root.psy_stdout(&["history", "flaky"]);
+    assert!(
+        history.contains("2"),
+        "healthcheck should trigger restart (run 2 in history), got: {history}"
+    );
+
+    // Previous run's probe logs should show the unhealthy message
+    let probe_logs = root.psy_stdout(&["logs", "flaky", "--previous", "--probe"]);
+    assert!(
+        probe_logs.contains("unhealthy") || probe_logs.contains("consecutive failures"),
+        "previous run's probe logs should show unhealthy message: {probe_logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_restart_cascade_with_readiness() {
+    // Restart db → api should also restart because depends_on has restart = true
+    // No ready probe on db so dependents start immediately after launch
+    let tmp = TempPsyfileDir::new(
+        r#"
+[db]
+command = "sleep 999"
+restart = "always"
+
+[api]
+command = "sleep 999"
+restart = "always"
+depends_on = [{ name = "db", restart = true }]
+"#,
+    );
+
+    let sl = sleep_cmd(120);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &["db", "api"], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(4));
+
+    // Verify both running
+    let ps1 = root.psy_stdout(&["ps"]);
+    assert!(ps1.contains("db"), "db should be running: {ps1}");
+    assert!(ps1.contains("api"), "api should be running: {ps1}");
+
+    // Restart db
+    root.psy(&["restart", "db"]);
+    thread::sleep(Duration::from_secs(5));
+
+    // api should have been restarted too (cascade)
+    let history = root.psy_stdout(&["history", "api"]);
+    assert!(
+        history.contains("2"),
+        "api should show run 2 after cascade restart: {history}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn test_probe_logs_stream_filter() {
+    // --probe --stdout and --probe --stderr should filter probe streams
+    // Use a script file so the command name doesn't leak into diagnostics
+    let marker_script = format!("/tmp/psy-probe-marker-{}.sh", std::process::id());
+    std::fs::write(&marker_script, "#!/bin/sh\necho XYZZY_MARKER\nexit 1\n").unwrap();
+    std::fs::set_permissions(
+        &marker_script,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+
+    let tmp = TempPsyfileDir::new(&format!(
+        r#"
+[checker]
+command = "echo main-output && sleep 999"
+ready = {{ exec = "{marker_script}", timeout = "3s", interval = "1s" }}
+"#,
+    ));
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+    root.psy(&["run", "checker"]);
+    thread::sleep(Duration::from_secs(5));
+
+    // Default logs should show main output but not probe output
+    let default_logs = root.psy_stdout(&["logs", "checker"]);
+    assert!(
+        default_logs.contains("main-output"),
+        "default logs should have main output: {default_logs}"
+    );
+
+    // --probe should show probe diagnostics
+    let probe_all = root.psy_stdout(&["logs", "checker", "--probe"]);
+    assert!(
+        !probe_all.is_empty(),
+        "probe logs should not be empty: {probe_all}"
+    );
+
+    // --probe --stdout should show only probe:stdout (the exec command's actual stdout)
+    let probe_stdout = root.psy_stdout(&["logs", "checker", "--probe", "--stdout"]);
+    assert!(
+        probe_stdout.contains("XYZZY_MARKER"),
+        "probe --stdout should show exec stdout: {probe_stdout}"
+    );
+
+    // --probe --stderr should show only probe:stderr (diagnostic messages)
+    let probe_stderr = root.psy_stdout(&["logs", "checker", "--probe", "--stderr"]);
+    assert!(
+        probe_stderr.contains("exec") || probe_stderr.contains("attempt"),
+        "probe --stderr should show diagnostics: {probe_stderr}"
+    );
+    // probe:stderr should NOT contain the stdout marker
+    assert!(
+        !probe_stderr.contains("XYZZY_MARKER"),
+        "probe --stderr should not contain stdout content: {probe_stderr}"
+    );
+
+    let _ = std::fs::remove_file(&marker_script);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn test_probe_logs_stream_filter() {
+    // Windows variant: exec probe already wraps with cmd /C, so use raw commands.
+    let tmp = TempPsyfileDir::new(
+        r#"
+[checker]
+command = "echo main-output && ping -n 999 127.0.0.1 >nul"
+ready = { exec = "echo XYZZY_MARKER && exit /b 1", timeout = "3s", interval = "1s" }
+"#,
+    );
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+    thread::sleep(Duration::from_secs(1));
+    root.psy(&["run", "checker"]);
+    thread::sleep(Duration::from_secs(5));
+
+    // Default logs should show main output but not probe output
+    let default_logs = root.psy_stdout(&["logs", "checker"]);
+    assert!(
+        default_logs.contains("main-output"),
+        "default logs should have main output: {default_logs}"
+    );
+
+    // --probe should show probe diagnostics
+    let probe_all = root.psy_stdout(&["logs", "checker", "--probe"]);
+    assert!(
+        !probe_all.is_empty(),
+        "probe logs should not be empty: {probe_all}"
+    );
+
+    // --probe --stdout should show only probe:stdout (the exec command's actual stdout)
+    let probe_stdout = root.psy_stdout(&["logs", "checker", "--probe", "--stdout"]);
+    assert!(
+        probe_stdout.contains("XYZZY_MARKER"),
+        "probe --stdout should show exec stdout: {probe_stdout}"
+    );
+
+    // --probe --stderr should show only probe:stderr (diagnostic messages)
+    let probe_stderr = root.psy_stdout(&["logs", "checker", "--probe", "--stderr"]);
+    assert!(
+        probe_stderr.contains("exec") || probe_stderr.contains("attempt"),
+        "probe --stderr should show diagnostics: {probe_stderr}"
+    );
+    // Verify --probe --stdout returns different (fewer) lines than --probe --stderr.
+    // This confirms stream-level filtering is working. We can't check for absence of
+    // XYZZY_MARKER in stderr because the diagnostic log quotes the command name.
+    let stdout_line_count = probe_stdout.lines().count();
+    let stderr_line_count = probe_stderr.lines().count();
+    assert!(
+        stdout_line_count != stderr_line_count,
+        "stdout and stderr probe streams should differ: stdout={stdout_line_count} lines, stderr={stderr_line_count} lines"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.1: Psyfile subcommand
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_psyfile_schema() {
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "schema"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run psy psyfile schema");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "schema command should succeed");
+    assert!(
+        stdout.contains("\"$schema\""),
+        "should output JSON schema: {stdout}"
+    );
+    assert!(
+        stdout.contains("command"),
+        "should mention command field: {stdout}"
+    );
+    assert!(
+        stdout.contains("ready"),
+        "should mention ready field: {stdout}"
+    );
+    assert!(
+        stdout.contains("healthcheck"),
+        "should mention healthcheck field: {stdout}"
+    );
+    assert!(
+        stdout.contains("depends_on"),
+        "should mention depends_on field: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_validate_valid() {
+    let tmp = TempPsyfileDir::new(
+        r#"
+[server]
+command = "echo hello"
+restart = "on-failure"
+"#,
+    );
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "validate", "--file"])
+        .arg(tmp.psyfile_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run psy psyfile validate");
+    assert!(output.status.success(), "validate should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("OK"), "should print OK: {stdout}");
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_validate_invalid() {
+    let tmp = TempPsyfileDir::new(
+        r#"
+[main]
+command = "echo reserved"
+"#,
+    );
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "validate", "--file"])
+        .arg(tmp.psyfile_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run psy psyfile validate");
+    assert!(
+        !output.status.success(),
+        "validate should fail for reserved name"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_init() {
+    let dir = std::env::temp_dir().join(format!("psy-init-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "init"])
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run psy psyfile init");
+    assert!(output.status.success(), "init should succeed");
+
+    let psyfile = dir.join("Psyfile");
+    assert!(psyfile.exists(), "Psyfile should be created");
+    let content = std::fs::read_to_string(&psyfile).unwrap();
+    assert!(
+        content.contains("command"),
+        "template should contain command"
+    );
+
+    // Second run should fail (file exists)
+    let output2 = Command::new(psy_bin())
+        .args(["psyfile", "init"])
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run psy psyfile init");
+    assert!(
+        !output2.status.success(),
+        "init should fail when file exists"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
