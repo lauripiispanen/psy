@@ -1,6 +1,6 @@
 [package]
 name = "psy"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 description = "Cross-platform process lifecycle manager"
 
@@ -23,12 +23,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security",
     "Win32_Foundation",
 ] }
 
 [dev-dependencies]
 libc = "0.2"
+serial_test = "3"
 
 [profile.release]
 strip = true

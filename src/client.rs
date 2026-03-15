@@ -3,14 +3,140 @@ use std::io::{self, BufRead, Write};
 
 use serde_json;
 
+use crate::platform;
 use crate::protocol::{
     LogsArgs, Request, Response, RestartPolicy, RunArgs, StdinData, StreamFilter,
 };
 
-/// Read PSY_SOCK from the environment, returning a friendly error if unset.
+/// Resolve the socket/pipe path to connect to.
+///
+/// 1. If `PSY_SOCK` is set in the environment, use it directly.
+/// 2. Otherwise, scan anchor files to discover the nearest psy root.
 fn sock_path() -> Result<String, String> {
-    std::env::var("PSY_SOCK")
-        .map_err(|_| "PSY_SOCK not set \u{2014} are you inside a psy session?".to_string())
+    if let Ok(path) = std::env::var("PSY_SOCK") {
+        return Ok(path);
+    }
+    discover_root()
+}
+
+/// Discover the nearest psy root by scanning anchor files and matching PID
+/// ancestor chains.
+fn discover_root() -> Result<String, String> {
+    let my_chain = platform::get_ancestor_chain(std::process::id());
+    let my_chain_set: std::collections::HashMap<u32, usize> = my_chain
+        .iter()
+        .enumerate()
+        .map(|(i, &pid)| (pid, i))
+        .collect();
+    let my_index = my_chain.len() - 1; // index of our own PID
+
+    let roots = platform::roots_dir();
+    let entries = std::fs::read_dir(&roots).map_err(|_| {
+        "no psy root found — start one with 'psy up' or ensure 'psy mcp' is running".to_string()
+    })?;
+
+    // Collect candidates: (distance, mtime, anchor_path, root_pid)
+    let mut candidates: Vec<(usize, std::time::SystemTime, std::path::PathBuf, u32)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let chain = match parse_anchor_filename(name_str) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let root_pid = match chain.last() {
+            Some(&p) => p,
+            None => continue,
+        };
+
+        // Find the closest shared ancestor: walk the anchor's chain from leaf
+        // toward root and find the first PID that is also in our chain.
+        let mut best_distance = None;
+        for &apid in chain.iter().rev() {
+            if let Some(&idx) = my_chain_set.get(&apid) {
+                let distance = my_index - idx;
+                best_distance = Some(distance);
+                break;
+            }
+        }
+
+        if let Some(distance) = best_distance {
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            candidates.push((distance, mtime, entry.path(), root_pid));
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err(
+            "no psy root found — start one with 'psy up' or ensure 'psy mcp' is running"
+                .to_string(),
+        );
+    }
+
+    // Sort by distance (ascending), then by mtime (descending = most recent first).
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+
+    // Try candidates in order, validating liveness.
+    for (_, _, anchor_path, root_pid) in &candidates {
+        if !platform::is_pid_alive(*root_pid) {
+            // Stale anchor — clean up and skip.
+            let _ = std::fs::remove_file(anchor_path);
+            continue;
+        }
+
+        return resolve_socket_from_anchor(anchor_path);
+    }
+
+    Err("no psy root found — start one with 'psy up' or ensure 'psy mcp' is running".to_string())
+}
+
+/// Parse a PID chain from an anchor filename (platform-specific extension).
+fn parse_anchor_filename(filename: &str) -> Option<Vec<u32>> {
+    platform::parse_anchor_chain(filename)
+}
+
+/// Given an anchor file path, return the socket/pipe path to connect to.
+#[cfg(unix)]
+fn resolve_socket_from_anchor(anchor: &std::path::Path) -> Result<String, String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let meta = std::fs::metadata(anchor)
+        .map_err(|e| format!("cannot read anchor {}: {e}", anchor.display()))?;
+
+    if meta.file_type().is_socket() {
+        // Direct mode: the anchor file IS the Unix domain socket.
+        Ok(anchor.to_string_lossy().to_string())
+    } else {
+        // Indirect mode: the anchor file contains the socket path.
+        let contents = std::fs::read_to_string(anchor)
+            .map_err(|e| format!("cannot read anchor {}: {e}", anchor.display()))?;
+        let sock_path = contents.trim().to_string();
+        if sock_path.is_empty() {
+            return Err(format!("anchor file {} is empty", anchor.display()));
+        }
+        Ok(sock_path)
+    }
+}
+
+#[cfg(windows)]
+fn resolve_socket_from_anchor(anchor: &std::path::Path) -> Result<String, String> {
+    // On Windows, the anchor file always contains the named pipe path.
+    let contents = std::fs::read_to_string(anchor)
+        .map_err(|e| format!("cannot read anchor {}: {e}", anchor.display()))?;
+    let pipe_path = contents.trim().to_string();
+    if pipe_path.is_empty() {
+        return Err(format!("anchor file {} is empty", anchor.display()));
+    }
+    Ok(pipe_path)
 }
 
 // ---------------------------------------------------------------------------

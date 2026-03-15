@@ -77,7 +77,7 @@ psy/
 - [x] `psy up --file <path>` — explicit Psyfile path
 - [x] `psy up <units>` — start specified Psyfile units on boot
 - [x] `psy up --all` — start all Psyfile units on boot
-- [x] ~`psy up --mcp`~ — removed; agent launches `psy mcp` itself via MCP config
+- [x] `psy up --mcp` — run MCP JSON-RPC server on stdin/stdout instead of main process
 - [x] `psy run <name> -- <command>` — send run command to root via PSY_SOCK
 - [x] `psy run <name>` — run Psyfile unit (no `--` needed)
 - [x] `psy run --restart <policy>` — restart policy
@@ -112,10 +112,11 @@ psy/
 
 ### Client Mode (`src/client.rs`)
 - [x] Detect client mode: `PSY_SOCK` set + command is not `up`
+- [x] Auto-discovery: when `PSY_SOCK` not set, discover nearest root via PID ancestor chain matching
 - [x] Connect to Unix socket / named pipe
 - [x] Send NDJSON request, read response
 - [x] Handle `logs_follow` streaming responses
-- [x] Error handling: socket not found, connection refused
+- [x] Error handling: socket not found, connection refused, no root discovered
 
 ### Main Process Lifecycle
 - [x] Main process stdin/stdout/stderr passthrough (not captured)
@@ -214,6 +215,22 @@ psy/
 - [x] Platform filtering at parse time: excluded units removed, downstream sees resolved units
 - [x] Platform validation: reject unknown platform names and override fields
 
+### Root Auto-Discovery (`src/platform/unix.rs`, `src/platform/windows.rs`, `src/client.rs`)
+- [x] Anchor file creation on root startup (PID ancestor chain encoded in filename)
+- [x] Anchor file cleanup on root teardown
+- [x] Stale anchor cleanup (dead PID detection) on root startup
+- [x] PID ancestor chain building: Linux `/proc/<pid>/stat`, macOS `proc_pidinfo`, Windows `CreateToolhelp32Snapshot`
+- [x] `is_pid_alive()` extracted as platform function
+- [x] Unix direct mode: anchor file IS the Unix domain socket (short chain paths)
+- [x] Unix indirect mode: anchor is regular file containing socket path (long chain paths)
+- [x] Windows: anchor file contains named pipe path
+- [x] Discovery algorithm: build own chain, scan anchors, find closest shared ancestor, validate liveness
+- [x] `PSY_SOCK` takes priority over discovery (fast path)
+- [x] Discovery error message when no root found
+- [x] `roots_dir()` platform function: `<primary_socket_dir>/roots/` (Unix), `%LOCALAPPDATA%\psy\roots\` (Windows)
+- [x] Socket path length handling: falls back to indirect mode when anchor path exceeds Unix 104-byte limit
+- [x] Windows PID reuse guard: process creation time validation in ancestor chain building
+
 ### Edge Cases
 - [x] Concurrent `psy run` same name → error "already exists"
 - [x] `psy run` after main exits → error "shutting down"
@@ -246,6 +263,12 @@ psy/
 - [x] Platform filtering: excludes unit, includes current, omitted includes all
 - [x] Platform validation: invalid platform name, invalid override key, invalid override field
 - [x] Platform with platforms restriction: combined platforms + platform override
+- [x] Ancestor chain: self chain includes PID 1 and own PID
+- [x] Ancestor chain: init PID returns `[1]`
+- [x] `is_pid_alive`: self is alive, bogus PID is not
+- [x] Anchor chain filename: formatting and parsing roundtrip
+- [x] Anchor socket path: direct mode (short chain), indirect mode (long chain)
+- [x] `roots_dir`: returns path containing "roots"
 
 ### Integration Tests (`tests/integration.rs`)
 All integration tests pass on macOS. Must also pass on Linux and Windows via GitHub Actions.
@@ -320,6 +343,17 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Multiple restarts preserve history
 - [x] `psy logs --since last`: incremental log viewing with marker
 - [x] `psy logs --since last`: first use returns all logs
+- [x] Discovery: anchor file created on root startup, removed on shutdown
+- [x] Discovery: `psy ps` without `PSY_SOCK` discovers running root
+- [x] Discovery: `PSY_SOCK` takes priority over discovery
+- [x] Discovery: error message when no root is running
+- [x] Discovery: stale anchor file cleaned up on root startup
+- [x] Discovery: `psy run` + `psy logs` work via discovery
+- [x] MCP mode: `psy up --mcp` initialize handshake
+- [x] MCP mode: run process and ps via MCP tool calls
+- [x] MCP mode: stdin EOF triggers teardown
+- [x] MCP mode: boot units with `--all` flag
+- [x] MCP mode: incompatible with `-- <command>`
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

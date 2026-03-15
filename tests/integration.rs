@@ -12,7 +12,43 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use serial_test::{parallel, serial};
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Remove anchor files for dead PIDs from the roots directory so discovery
+/// tests get a clean view. Anchors for still-alive roots are preserved so
+/// that concurrent non-discovery tests (which use PSY_SOCK) are not affected.
+fn clear_stale_anchors() {
+    let roots = test_roots_dir();
+    if let Ok(entries) = std::fs::read_dir(&roots) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = match name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            // Parse the last PID segment from the filename.
+            let stem = name_str
+                .strip_suffix(".sock")
+                .or_else(|| name_str.strip_suffix(".pipe"));
+            if let Some(stem) = stem {
+                if let Some(last) = stem.rsplit('-').next() {
+                    if let Ok(pid) = last.parse::<i32>() {
+                        // Check if the process is still alive.
+                        #[cfg(unix)]
+                        let alive = unsafe { libc::kill(pid, 0) == 0 };
+                        #[cfg(windows)]
+                        let alive = true; // conservative: don't remove on Windows
+                        if !alive {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -119,8 +155,33 @@ impl PsyRoot {
         PsyRoot { child, sock }
     }
 
+    /// Compute the socket path for a root with the given PID.
+    ///
+    /// Mirrors the anchor path logic in `platform::anchor_socket_path`. The
+    /// root binds its socket at the anchor path (direct mode) when the path
+    /// is short enough. This computes the same path deterministically so we
+    /// don't need to scan the roots directory.
     #[cfg(unix)]
     fn socket_path_for(pid: u32) -> String {
+        let chain = test_get_ancestor_chain(pid);
+        let parts: Vec<String> = chain.iter().map(|p| p.to_string()).collect();
+        let filename = format!("{}.sock", parts.join("-"));
+        let anchor = test_roots_dir().join(&filename);
+
+        // If < 104 bytes, direct mode: anchor IS the socket.
+        if anchor.as_os_str().len() < 104 {
+            return anchor.to_string_lossy().to_string();
+        }
+
+        // Indirect mode: socket at shorter path. Read anchor contents.
+        if let Ok(contents) = std::fs::read_to_string(&anchor) {
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        // Fallback: old-style path.
         let uid = unsafe { libc::getuid() };
         let dir = std::env::var("XDG_RUNTIME_DIR")
             .map(|d| format!("{d}/psy"))
@@ -130,6 +191,19 @@ impl PsyRoot {
 
     #[cfg(windows)]
     fn socket_path_for(pid: u32) -> String {
+        let chain = test_get_ancestor_chain(pid);
+        let parts: Vec<String> = chain.iter().map(|p| p.to_string()).collect();
+        let filename = format!("{}.pipe", parts.join("-"));
+        let anchor = test_roots_dir().join(&filename);
+
+        if let Ok(contents) = std::fs::read_to_string(&anchor) {
+            let trimmed = contents.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        // Fallback
         format!(r"\\.\pipe\psy-{pid}")
     }
 
@@ -154,6 +228,25 @@ impl PsyRoot {
     fn psy_stderr(&self, args: &[&str]) -> String {
         let out = self.psy(args);
         String::from_utf8_lossy(&out.stderr).to_string()
+    }
+
+    /// Run a psy subcommand WITHOUT setting PSY_SOCK, relying on discovery.
+    /// We explicitly remove PSY_SOCK from the environment to force discovery.
+    fn psy_discover(&self, args: &[&str]) -> Output {
+        Command::new(psy_bin())
+            .args(args)
+            .env_remove("PSY_SOCK")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run psy command (discovery mode)")
+    }
+
+    /// Run a psy subcommand in discovery mode, returning stdout as a String.
+    #[allow(dead_code)]
+    fn psy_discover_stdout(&self, args: &[&str]) -> String {
+        let out = self.psy_discover(args);
+        String::from_utf8_lossy(&out.stdout).to_string()
     }
 }
 
@@ -211,6 +304,7 @@ fn to_refs(v: &[String]) -> Vec<&str> {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_up_and_ps() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -224,6 +318,7 @@ fn test_up_and_ps() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_run_and_logs() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -245,6 +340,7 @@ fn test_run_and_logs() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_restart_on_failure() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -267,6 +363,7 @@ fn test_restart_on_failure() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_main_exit_kills_children() {
     let sl = sleep_cmd(1);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -295,6 +392,7 @@ fn test_main_exit_kills_children() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_stop_process() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -318,6 +416,7 @@ fn test_stop_process() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_down() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -352,6 +451,7 @@ fn test_down() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_name_validation() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -374,6 +474,7 @@ fn test_name_validation() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_duplicate_name() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -404,6 +505,7 @@ fn test_duplicate_name() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_exit_code_propagation() {
     let exit_cmd = sh_c("exit 42");
     let exit_refs = to_refs(&exit_cmd);
@@ -424,6 +526,7 @@ fn test_exit_code_propagation() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_multiple_roots() {
     let sl = sleep_cmd(60);
     let root1 = PsyRoot::start(&to_refs(&sl));
@@ -453,6 +556,7 @@ fn test_multiple_roots() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_env_passing() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -492,6 +596,7 @@ fn test_env_passing() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_tail() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -529,6 +634,7 @@ fn test_logs_tail() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_tombstone_replacement() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -556,6 +662,7 @@ fn test_tombstone_replacement() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_stop_shows_stopped_not_failed() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -585,6 +692,7 @@ fn test_stop_shows_stopped_not_failed() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_survive_restart() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -611,6 +719,7 @@ fn test_logs_survive_restart() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_plain_text_format() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -641,6 +750,7 @@ fn test_logs_plain_text_format() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_ps_shows_exit_and_restarts() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -673,6 +783,7 @@ fn test_ps_shows_exit_and_restarts() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_since() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -702,6 +813,7 @@ fn test_logs_since() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_until() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -730,6 +842,7 @@ fn test_logs_until() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_grep() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -769,6 +882,7 @@ fn test_logs_grep() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_grep_no_match() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -795,6 +909,7 @@ fn test_logs_grep_no_match() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_attach_output_and_exit() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -840,6 +955,7 @@ fn test_attach_output_and_exit() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_attach_detach_keeps_running() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -883,6 +999,7 @@ fn test_attach_detach_keeps_running() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_history_shows_runs() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -917,6 +1034,7 @@ fn test_history_shows_runs() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_previous_run() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -962,6 +1080,7 @@ fn test_logs_previous_run() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_run_id() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -998,6 +1117,7 @@ fn test_logs_run_id() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_run_with_grep() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -1044,6 +1164,7 @@ fn test_logs_run_with_grep() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_history_after_restart() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -1080,6 +1201,7 @@ fn test_history_after_restart() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_unit_run() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1103,6 +1225,7 @@ command = "echo psyfile-works"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_unit_with_env() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1126,6 +1249,7 @@ env = { MY_VAR = "injected-value" }
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_depends_on() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1154,6 +1278,7 @@ depends_on = ["db"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_template_unit() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1179,6 +1304,7 @@ singleton = false
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_template_group_stop() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1212,6 +1338,7 @@ singleton = false
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_up_all() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1237,6 +1364,7 @@ command = "echo svc3-ok && sleep 60"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_selective_boot() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1268,6 +1396,7 @@ command = "echo worker-ok && sleep 60"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_adhoc_alongside() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1298,6 +1427,7 @@ command = "echo server-ok && sleep 60"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_no_command_adhoc_error() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -1317,6 +1447,7 @@ fn test_psyfile_no_command_adhoc_error() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_env_interpolation_default() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1339,6 +1470,7 @@ command = "echo ${PORT:-8080}"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_restart_override() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -1365,6 +1497,7 @@ restart = "no"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_working_dir() {
     let sl = sleep_cmd(60);
 
@@ -1409,6 +1542,7 @@ fn test_psyfile_working_dir() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_ready_exit_probe() {
     // A "build" unit with exit probe — dependents wait for it to complete
     let tmp = TempPsyfileDir::new(
@@ -1445,6 +1579,7 @@ depends_on = ["build"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_ready_exec_probe() {
     // A unit with exec probe — probe command checks a condition
     let marker = format!("/tmp/psy-test-ready-{}", std::process::id());
@@ -1476,6 +1611,7 @@ depends_on = ["setup"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_ready_tcp_probe() {
     // A unit with TCP readiness probe — dependent waits for the port
     let tmp = TempPsyfileDir::new(
@@ -1507,6 +1643,7 @@ depends_on = ["listener"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_probe_logs_hidden_by_default() {
     // Probe logs should not appear in default `psy logs` output
     let tmp = TempPsyfileDir::new(
@@ -1540,6 +1677,7 @@ ready = { exec = "false", timeout = "3s", interval = "1s" }
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_ps_ready_column() {
     // Processes with probes show ready status in ps output
     let tmp = TempPsyfileDir::new(
@@ -1567,6 +1705,7 @@ ready = { exit = 0 }
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_depends_on_with_restart_flag() {
     // Extended depends_on syntax with restart cascade
     let tmp = TempPsyfileDir::new(
@@ -1593,6 +1732,7 @@ depends_on = [{ name = "db", restart = true }]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_healthcheck_triggers_restart() {
     // A process with a failing healthcheck should be killed and restarted
     let tmp = TempPsyfileDir::new(
@@ -1631,6 +1771,7 @@ healthcheck = { exec = "false", interval = "1s", retries = 2 }
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_restart_cascade_with_readiness() {
     // Restart db → api should also restart because depends_on has restart = true
     // No ready probe on db so dependents start immediately after launch
@@ -1671,6 +1812,7 @@ depends_on = [{ name = "db", restart = true }]
 #[cfg(unix)]
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_probe_logs_stream_filter() {
     // --probe --stdout and --probe --stderr should filter probe streams
     // Use a script file so the command name doesn't leak into diagnostics
@@ -1735,6 +1877,7 @@ ready = {{ exec = "{marker_script}", timeout = "3s", interval = "1s" }}
 #[cfg(windows)]
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_probe_logs_stream_filter() {
     // Windows variant: exec probe already wraps with cmd /C, so use raw commands.
     let tmp = TempPsyfileDir::new(
@@ -1795,6 +1938,7 @@ ready = { exec = "echo XYZZY_MARKER && exit /b 1", timeout = "3s", interval = "1
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_schema() {
     let output = Command::new(psy_bin())
         .args(["psyfile", "schema"])
@@ -1828,6 +1972,7 @@ fn test_psyfile_schema() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_validate_valid() {
     let tmp = TempPsyfileDir::new(
         r#"
@@ -1850,6 +1995,7 @@ restart = "on-failure"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_validate_invalid() {
     let tmp = TempPsyfileDir::new(
         r#"
@@ -1872,6 +2018,7 @@ command = "echo reserved"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_init() {
     let dir = std::env::temp_dir().join(format!("psy-init-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1915,6 +2062,7 @@ fn test_psyfile_init() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_platform_override_command() {
     let os = if cfg!(target_os = "macos") {
         "macos"
@@ -1950,6 +2098,7 @@ command = "echo overridden-output"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_platform_excluded_unit() {
     let other = if cfg!(target_os = "macos") {
         "linux"
@@ -1990,6 +2139,7 @@ command = "echo runs-fine"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_platform_up_all_skips_excluded() {
     let other = if cfg!(target_os = "macos") {
         "linux"
@@ -2024,6 +2174,7 @@ platforms = ["{other}"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_platform_env_merge() {
     let os = if cfg!(target_os = "macos") {
         "macos"
@@ -2072,6 +2223,7 @@ env = {{ OVERRIDE = "platform-override", ADDED = "platform-added" }}
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_basic() {
     // Start an interactive cat process, send text, check logs
     let sl = sleep_cmd(60);
@@ -2095,6 +2247,7 @@ fn test_send_basic() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_multiple_lines() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2118,6 +2271,7 @@ fn test_send_multiple_lines() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_non_interactive_error() {
     // Sending to a non-interactive process should fail
     let sl = sleep_cmd(60);
@@ -2142,6 +2296,7 @@ fn test_send_non_interactive_error() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_eof_closes_stdin() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2171,6 +2326,7 @@ fn test_send_eof_closes_stdin() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_not_found() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2187,6 +2343,7 @@ fn test_send_not_found() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_psyfile_interactive() {
     // Test interactive flag in Psyfile
     let tmp = TempPsyfileDir::new(
@@ -2215,6 +2372,7 @@ interactive = true
 #[cfg(unix)]
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_file() {
     // Test --file flag
     let sl = sleep_cmd(60);
@@ -2243,6 +2401,7 @@ fn test_send_file() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_raw_no_newline() {
     // Test --raw flag (no auto newline)
     let sl = sleep_cmd(60);
@@ -2267,6 +2426,7 @@ fn test_send_raw_no_newline() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_stopped_process_error() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2314,6 +2474,7 @@ fn test_send_stopped_process_error() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_psyfile_interactive_with_deps() {
     // Interactive process with a dependency
     let tmp = TempPsyfileDir::new(
@@ -2356,6 +2517,7 @@ depends_on = ["setup"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_restart_preserves_history_across_multiple() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2383,6 +2545,7 @@ fn test_restart_preserves_history_across_multiple() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_stop_main_rejected() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2401,6 +2564,7 @@ fn test_stop_main_rejected() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_run_after_down_rejected() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2419,6 +2583,7 @@ fn test_run_after_down_rejected() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_stderr_filter() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2470,6 +2635,7 @@ fn test_logs_stderr_filter() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_circular_dep_error() {
     let tmp = TempPsyfileDir::new(
         r#"
@@ -2504,6 +2670,7 @@ depends_on = ["a"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_unknown_dep_error() {
     let tmp = TempPsyfileDir::new(
         r#"
@@ -2528,6 +2695,7 @@ depends_on = ["nonexistent"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_unknown_field_error() {
     let tmp = TempPsyfileDir::new(
         r#"
@@ -2557,6 +2725,7 @@ depnds_on = ["db"]
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_version() {
     let output = Command::new(psy_bin())
         .args(["version"])
@@ -2575,6 +2744,7 @@ fn test_version() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_template_restart() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -2603,6 +2773,7 @@ singleton = false
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_arg_append() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -2625,6 +2796,7 @@ command = "echo base"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_dollar_at_substitution() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -2647,6 +2819,7 @@ command = "echo $@ end"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_dollar_at_no_args() {
     let sl = sleep_cmd(60);
     let tmp = TempPsyfileDir::new(
@@ -2669,6 +2842,7 @@ command = "echo $@ end"
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_psyfile_schema_has_interactive() {
     let output = Command::new(psy_bin())
         .args(["psyfile", "schema"])
@@ -2690,6 +2864,7 @@ fn test_psyfile_schema_has_interactive() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_wait_basic() {
     // Send to cat with --wait, verify echoed output is returned
     let sl = sleep_cmd(60);
@@ -2714,6 +2889,7 @@ fn test_send_wait_basic() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_wait_prompt() {
     // Process outputs a prompt pattern, verify early return.
     // Uses Python for cross-platform compatibility (available on all CI runners).
@@ -2772,6 +2948,7 @@ fn test_send_wait_prompt() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_wait_timeout() {
     // Process that doesn't produce output — verify timeout returns partial
     let sl = sleep_cmd(60);
@@ -2806,6 +2983,7 @@ fn test_send_wait_timeout() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_send_wait_non_interactive_error() {
     // send --wait to non-interactive process should error
     let sl = sleep_cmd(60);
@@ -2834,6 +3012,7 @@ fn test_send_wait_non_interactive_error() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_since_last() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2890,6 +3069,7 @@ fn test_logs_since_last() {
 
 #[test]
 #[ignore]
+#[parallel(discovery)]
 fn test_logs_since_last_first_use() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2906,5 +3086,578 @@ fn test_logs_since_last_first_use() {
     assert!(
         logs.contains("hello-last"),
         "first --since last should return all logs, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Root auto-discovery tests
+// ---------------------------------------------------------------------------
+
+/// Build the PID ancestor chain for a given PID (mirrors platform logic).
+#[cfg(target_os = "linux")]
+fn test_get_ancestor_chain(pid: u32) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut current = pid;
+    loop {
+        chain.push(current);
+        if current <= 1 {
+            break;
+        }
+        match std::fs::read_to_string(format!("/proc/{current}/stat")) {
+            Ok(stat) => {
+                if let Some(after_comm) = stat.rfind(')') {
+                    let remainder = stat[after_comm + 1..].trim_start();
+                    if let Some(ppid_str) = remainder.split_whitespace().nth(1) {
+                        if let Ok(ppid) = ppid_str.parse::<u32>() {
+                            if ppid != current && ppid != 0 {
+                                current = ppid;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+#[cfg(target_os = "macos")]
+fn test_get_ancestor_chain(pid: u32) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut current = pid;
+    loop {
+        chain.push(current);
+        if current <= 1 {
+            break;
+        }
+        match test_read_ppid_macos(current) {
+            Some(ppid) if ppid != current && ppid != 0 => current = ppid,
+            _ => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+#[cfg(target_os = "macos")]
+fn test_read_ppid_macos(pid: u32) -> Option<u32> {
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+    let mut buf = [0u8; 136];
+
+    extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let ret = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as libc::c_int,
+        )
+    };
+
+    if ret <= 0 {
+        return None;
+    }
+
+    // pbi_ppid is at offset 16 (after flags:4, status:4, xstatus:4, pid:4)
+    let ppid = u32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    Some(ppid)
+}
+
+#[cfg(windows)]
+fn test_get_ancestor_chain(pid: u32) -> Vec<u32> {
+    // Simplified: just return [pid] on Windows for tests.
+    // The full chain would need CreateToolhelp32Snapshot which is complex.
+    // The anchor filename scan fallback in socket_path_for handles this.
+    vec![pid]
+}
+
+/// Helper: return the roots directory path (mirrors platform logic in tests).
+#[cfg(unix)]
+fn test_roots_dir() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .map(|d| format!("{d}/psy"))
+        .unwrap_or_else(|_| format!("/tmp/psy-{uid}"));
+    PathBuf::from(dir).join("roots")
+}
+
+#[cfg(windows)]
+fn test_roots_dir() -> PathBuf {
+    let local = std::env::var("LOCALAPPDATA")
+        .unwrap_or_else(|_| std::env::var("TEMP").unwrap_or_else(|_| r"C:\Temp".into()));
+    PathBuf::from(local).join("psy").join("roots")
+}
+
+/// Helper: check if an anchor file exists for a given root PID.
+fn anchor_exists_for_pid(pid: u32) -> bool {
+    let dir = test_roots_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = match name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            // The root PID is the last segment before the extension.
+            let stem = name_str
+                .strip_suffix(".sock")
+                .or_else(|| name_str.strip_suffix(".pipe"));
+            if let Some(stem) = stem {
+                if let Some(last) = stem.rsplit('-').next() {
+                    if last.parse::<u32>().ok() == Some(pid) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[test]
+#[ignore]
+#[serial(discovery)]
+fn test_discovery_anchor_created_and_cleaned() {
+    clear_stale_anchors();
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+    let pid = root.child.id();
+
+    // Anchor file should exist for this root's PID.
+    assert!(
+        anchor_exists_for_pid(pid),
+        "anchor file should exist for root PID {pid}"
+    );
+
+    // After dropping the root (which sends `down` and kills it), the anchor
+    // should be cleaned up.
+    drop(root);
+    thread::sleep(Duration::from_millis(500));
+
+    assert!(
+        !anchor_exists_for_pid(pid),
+        "anchor file should be removed after root shutdown for PID {pid}"
+    );
+}
+
+#[test]
+#[ignore]
+#[serial(discovery)]
+fn test_discovery_without_psy_sock() {
+    clear_stale_anchors();
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run `psy ps` WITHOUT PSY_SOCK set — should discover the root.
+    let out = root.psy_discover(&["ps"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "psy ps via discovery should succeed; stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("main"),
+        "psy ps via discovery should list 'main'; got: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+#[serial(discovery)]
+fn test_discovery_psy_sock_takes_priority() {
+    clear_stale_anchors();
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run with PSY_SOCK set — should use the env var path, not discovery.
+    let out = root.psy(&["ps"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "psy ps via PSY_SOCK should succeed; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("main"),
+        "psy ps via PSY_SOCK should list 'main'; got: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+#[serial(discovery)]
+fn test_discovery_no_root_error() {
+    clear_stale_anchors();
+
+    // With no root running and no PSY_SOCK, discovery should fail gracefully.
+    let out = Command::new(psy_bin())
+        .args(["ps"])
+        .env_remove("PSY_SOCK")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run psy");
+
+    // It should fail (non-zero exit code).
+    assert!(!out.status.success(), "psy ps with no root should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no psy root found") || stderr.contains("PSY_SOCK"),
+        "error should mention discovery failure; got: {stderr}"
+    );
+}
+
+#[test]
+#[ignore]
+#[serial(discovery)]
+fn test_discovery_stale_anchor_cleaned() {
+    clear_stale_anchors();
+
+    // Create a fake anchor file with a dead PID.
+    let roots = test_roots_dir();
+    let _ = std::fs::create_dir_all(&roots);
+    let fake_anchor = roots.join("1-999999.sock");
+    std::fs::write(&fake_anchor, "").expect("write fake anchor");
+    assert!(fake_anchor.exists(), "fake anchor should exist");
+
+    // Start a real root — it should clean up the stale anchor.
+    let sl = sleep_cmd(60);
+    let _root = PsyRoot::start(&to_refs(&sl));
+
+    assert!(
+        !fake_anchor.exists(),
+        "stale anchor for dead PID should be cleaned up"
+    );
+}
+
+#[test]
+#[ignore]
+#[serial(discovery)]
+fn test_discovery_run_via_discovery() {
+    clear_stale_anchors();
+
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Run a worker via discovery (no PSY_SOCK).
+    let echo = sh_c("echo discovery-works");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "discworker", "--"];
+    run_args.extend(echo_refs);
+    let out = root.psy_discover(&run_args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "psy run via discovery should succeed; stderr: {stderr}"
+    );
+    thread::sleep(Duration::from_secs(2));
+
+    // Fetch logs via discovery — should find the same root.
+    let out = root.psy_discover(&["logs", "discworker"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "psy logs via discovery should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("discovery-works"),
+        "logs via discovery should contain output; got: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MCP mode tests (psy up --mcp)
+// ---------------------------------------------------------------------------
+
+/// A guard for a `psy up --mcp` process with a writable stdin.
+struct PsyMcpRoot {
+    child: Child,
+    sock: String,
+}
+
+impl PsyMcpRoot {
+    /// Start `psy up --mcp` with stdin piped so we can send JSON-RPC.
+    fn start() -> Self {
+        let mut cmd = Command::new(psy_bin());
+        cmd.arg("up").arg("--mcp");
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn().expect("failed to start psy up --mcp");
+        let pid = child.id();
+
+        // Give root time to start up and create its socket/anchor.
+        thread::sleep(Duration::from_secs(2));
+
+        let sock = PsyRoot::socket_path_for(pid);
+        PsyMcpRoot { child, sock }
+    }
+
+    /// Start `psy up --mcp --all` with a Psyfile.
+    fn start_with_psyfile_all(psyfile_path: &std::path::Path) -> Self {
+        let mut cmd = Command::new(psy_bin());
+        cmd.arg("up");
+        cmd.arg("--file").arg(psyfile_path);
+        cmd.arg("--all");
+        cmd.arg("--mcp");
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn().expect("failed to start psy up --mcp --all");
+        let pid = child.id();
+
+        thread::sleep(Duration::from_secs(2));
+        let sock = PsyRoot::socket_path_for(pid);
+        PsyMcpRoot { child, sock }
+    }
+
+    /// Send a JSON-RPC request through stdin and read a response from stdout.
+    fn mcp_call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::{BufRead, BufReader, Write};
+
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+
+        let stdin = self.child.stdin.as_mut().expect("stdin not piped");
+        let line = serde_json::to_string(&req).unwrap();
+        writeln!(stdin, "{line}").expect("write to mcp stdin");
+        stdin.flush().expect("flush mcp stdin");
+
+        let stdout = self.child.stdout.as_mut().expect("stdout not piped");
+        let mut reader = BufReader::new(stdout);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).expect("read mcp response");
+        serde_json::from_str(&resp_line).expect("parse mcp response")
+    }
+
+    /// Run a psy CLI command against this root via PSY_SOCK.
+    fn psy(&self, args: &[&str]) -> Output {
+        Command::new(psy_bin())
+            .args(args)
+            .env("PSY_SOCK", &self.sock)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to run psy command")
+    }
+
+    fn psy_stdout(&self, args: &[&str]) -> String {
+        let out = self.psy(args);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+}
+
+impl Drop for PsyMcpRoot {
+    fn drop(&mut self) {
+        // Close stdin to trigger MCP teardown.
+        drop(self.child.stdin.take());
+        // Also try graceful shutdown via socket.
+        let _ = Command::new(psy_bin())
+            .args(["down"])
+            .env("PSY_SOCK", &self.sock)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_mcp_mode_initialize() {
+    let mut root = PsyMcpRoot::start();
+
+    // Send initialize request
+    let resp = root.mcp_call(
+        "initialize",
+        serde_json::json!({"protocolVersion": "2024-11-05"}),
+    );
+
+    // Verify the response has server info
+    let result = resp.get("result").expect("missing result");
+    let server_name = result
+        .get("serverInfo")
+        .and_then(|s| s.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    assert_eq!(server_name, "psy", "server name should be 'psy'");
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_mcp_mode_run_and_ps() {
+    let mut root = PsyMcpRoot::start();
+
+    // Initialize
+    root.mcp_call(
+        "initialize",
+        serde_json::json!({"protocolVersion": "2024-11-05"}),
+    );
+
+    // Run a process via MCP tool call
+    let echo = sh_c("echo mcp-hello && sleep 60");
+    let cmd_vec: Vec<&str> = echo.iter().map(|s| s.as_str()).collect();
+    let resp = root.mcp_call(
+        "tools/call",
+        serde_json::json!({
+            "name": "psy_run",
+            "arguments": {
+                "name": "mcp-worker",
+                "command": cmd_vec
+            }
+        }),
+    );
+    let result = resp.get("result").expect("missing result");
+    let is_error = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    assert!(!is_error, "psy_run should succeed: {result}");
+
+    thread::sleep(Duration::from_secs(2));
+
+    // Verify via CLI that the process is running
+    let ps_out = root.psy_stdout(&["ps"]);
+    assert!(
+        ps_out.contains("mcp-worker"),
+        "psy ps should show mcp-worker; got: {ps_out}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_mcp_mode_stdin_eof_triggers_teardown() {
+    let mut root = PsyMcpRoot::start();
+
+    // Run a long-running process
+    let echo = sh_c("echo mcp-teardown && sleep 300");
+    let cmd_vec: Vec<&str> = echo.iter().map(|s| s.as_str()).collect();
+    root.mcp_call(
+        "tools/call",
+        serde_json::json!({
+            "name": "psy_run",
+            "arguments": {
+                "name": "long-runner",
+                "command": cmd_vec
+            }
+        }),
+    );
+    thread::sleep(Duration::from_secs(1));
+
+    let pid = root.child.id();
+
+    // Close stdin — this should trigger MCP teardown
+    drop(root.child.stdin.take());
+
+    // Wait for the root to exit
+    let status = root.child.wait().expect("wait for psy exit");
+    assert!(
+        status.success(),
+        "psy up --mcp should exit 0 on stdin EOF; got: {status}"
+    );
+
+    // Verify the root is actually dead
+    thread::sleep(Duration::from_millis(500));
+    #[cfg(unix)]
+    {
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        assert!(!alive, "root process should be dead after stdin EOF");
+    }
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_mcp_mode_with_boot_units() {
+    let tmp = TempPsyfileDir::new(
+        r#"
+[svc1]
+command = "echo svc1-mcp && sleep 60"
+
+[svc2]
+command = "echo svc2-mcp && sleep 60"
+"#,
+    );
+
+    let root = PsyMcpRoot::start_with_psyfile_all(tmp.psyfile_path().as_path());
+
+    // Give boot units time to start
+    thread::sleep(Duration::from_secs(2));
+
+    // Verify both units are running via CLI
+    let ps_out = root.psy_stdout(&["ps"]);
+    assert!(
+        ps_out.contains("svc1"),
+        "psy ps should show svc1; got: {ps_out}"
+    );
+    assert!(
+        ps_out.contains("svc2"),
+        "psy ps should show svc2; got: {ps_out}"
+    );
+
+    // There should be no "main" process in MCP mode
+    // (main is not spawned; MCP server is the main loop)
+    let lines: Vec<&str> = ps_out.lines().collect();
+    let has_main = lines.iter().any(|l| {
+        l.split_whitespace()
+            .next()
+            .map(|name| name == "main")
+            .unwrap_or(false)
+    });
+    assert!(
+        !has_main,
+        "MCP mode should not have a 'main' process; got: {ps_out}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_mcp_mode_incompatible_with_command() {
+    // `psy up --mcp -- sleep 60` should fail
+    let output = Command::new(psy_bin())
+        .args(["up", "--mcp", "--", "sleep", "60"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run psy");
+
+    assert!(
+        !output.status.success(),
+        "psy up --mcp with command should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("incompatible"),
+        "error should mention incompatibility; got: {stderr}"
     );
 }

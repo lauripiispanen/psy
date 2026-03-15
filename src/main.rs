@@ -50,6 +50,9 @@ enum Commands {
         /// Path to Psyfile (overrides discovery)
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Run MCP JSON-RPC server on stdin/stdout instead of a main process
+        #[arg(long)]
+        mcp: bool,
         /// Command to run as the main process (default: $SHELL)
         #[arg(last = true)]
         command: Vec<String>,
@@ -199,8 +202,13 @@ fn main() {
             units,
             all,
             file,
+            mcp,
             command,
         } => {
+            if mcp && !command.is_empty() {
+                eprintln!("psy up: --mcp is incompatible with -- <command>");
+                std::process::exit(1);
+            }
             // Resolve the Psyfile path
             let psyfile_path: Option<std::path::PathBuf> = if let Some(ref path) = file {
                 // Explicit --file: validate it exists and parses
@@ -275,14 +283,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let main_cmd = if command.is_empty() {
+            let main_cmd = if mcp || command.is_empty() {
                 None
             } else {
                 Some(command)
             };
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             let exit_code = rt.block_on(async {
-                match psy_root.run(main_cmd, boot_units).await {
+                match psy_root.run(main_cmd, boot_units, mcp).await {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("psy: {e}");

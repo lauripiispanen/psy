@@ -42,6 +42,10 @@ pub struct SharedRoot {
     pub template_counters: Mutex<HashMap<String, u32>>,
     /// Per-process "last viewed" timestamp for `--since last` support.
     pub logs_markers: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    /// Path to the anchor file for root discovery. When the anchor IS the
+    /// socket (Unix direct mode), this equals `socket_path`. When indirect
+    /// (Unix long chain or Windows), this is a separate file.
+    pub anchor_path: Option<PathBuf>,
 }
 
 impl SharedRoot {
@@ -88,18 +92,45 @@ impl PsyRoot {
         let death_pipe = platform::create_death_pipe()?;
 
         let pid = std::process::id();
-        let socket_path = platform::socket_path(pid);
 
-        // Clean up any stale socket from a previous run
-        platform::cleanup_stale_socket(std::path::Path::new(&socket_path))?;
+        // Build the PID ancestor chain for anchor file naming.
+        let ancestor_chain = platform::get_ancestor_chain(pid);
 
-        // Ensure the parent directory exists (Unix sockets need this)
+        // Ensure roots directory exists and clean up stale anchors.
+        let roots = platform::roots_dir();
+        let _ = std::fs::create_dir_all(&roots);
         #[cfg(unix)]
-        if let Some(parent) = std::path::Path::new(&socket_path).parent() {
-            if !parent.as_os_str().is_empty() {
+        {
+            // Set directory permissions to 0700 on Unix.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o700));
+        }
+        platform::cleanup_stale_anchors();
+
+        // Compute anchor and socket paths.
+        #[cfg(unix)]
+        let (anchor_path, socket_path) = {
+            let (anchor, sock) = platform::anchor_socket_path(&ancestor_chain);
+            // Ensure directories for both paths exist.
+            if let Some(parent) = anchor.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-        }
+            if anchor != sock {
+                if let Some(parent) = sock.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            // Clean up stale socket if it exists.
+            platform::cleanup_stale_socket(&sock)?;
+            (Some(anchor), sock.to_string_lossy().to_string())
+        };
+
+        #[cfg(windows)]
+        let (anchor_path, socket_path) = {
+            let anchor = platform::anchor_file_path(&ancestor_chain);
+            let sock = platform::socket_path(pid);
+            (Some(anchor), sock)
+        };
 
         let psy_sock = socket_path.clone();
         let (main_exit_tx, main_exit_rx) = watch::channel(None);
@@ -116,6 +147,7 @@ impl PsyRoot {
             cwd: std::env::current_dir().unwrap_or_default(),
             template_counters: Mutex::new(HashMap::new()),
             logs_markers: Mutex::new(HashMap::new()),
+            anchor_path,
         });
 
         Ok(Self {
@@ -127,21 +159,28 @@ impl PsyRoot {
     /// Run the psy root server.
     ///
     /// `main_command` — the main process command (or `None` to use `$SHELL`).
+    /// `mcp_mode` — if true, run the MCP JSON-RPC server on stdin/stdout
+    /// instead of spawning a main process.
     ///
     /// Returns the main process exit code.
     pub async fn run(
         mut self,
         main_command: Option<Vec<String>>,
         boot_units: Vec<String>,
+        mcp_mode: bool,
     ) -> RootResult<i32> {
-        // Determine the main command
-        let main_cmd = main_command.unwrap_or_else(|| {
-            #[cfg(unix)]
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            #[cfg(windows)]
-            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-            vec![shell]
-        });
+        // Determine the main command (not needed in MCP mode)
+        let main_cmd = if mcp_mode {
+            None
+        } else {
+            Some(main_command.unwrap_or_else(|| {
+                #[cfg(unix)]
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                #[cfg(windows)]
+                let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+                vec![shell]
+            }))
+        };
 
         // Spawn the socket listener first (so boot units can use the socket)
         {
@@ -151,6 +190,20 @@ impl PsyRoot {
                     eprintln!("psy: socket listener error: {e}");
                 }
             });
+        }
+
+        // Write the anchor file for root discovery.
+        // On Unix in direct mode (anchor == socket), the bind above created
+        // the socket file which IS the anchor — nothing more to write.
+        // On Unix in indirect mode or on Windows, write the socket/pipe path
+        // into the anchor file so clients can discover it.
+        if let Some(ref anchor) = self.shared.anchor_path {
+            let anchor_str = anchor.to_string_lossy();
+            if anchor_str != self.shared.socket_path {
+                if let Err(e) = std::fs::write(anchor, &self.shared.socket_path) {
+                    eprintln!("psy: failed to write anchor file: {e}");
+                }
+            }
         }
 
         // Start boot units from Psyfile (before main process)
@@ -185,27 +238,44 @@ impl PsyRoot {
             }
         }
 
-        // Launch the main process
-        {
-            let mut table = self.shared.process_table.lock().await;
-            let mut entry = ProcessEntry::new(
-                "main".into(),
-                main_cmd,
-                HashMap::new(),
-                RestartPolicy::No,
-                true,
-            );
+        if let Some(main_cmd) = main_cmd {
+            // Launch the main process
+            {
+                let mut table = self.shared.process_table.lock().await;
+                let mut entry = ProcessEntry::new(
+                    "main".into(),
+                    main_cmd,
+                    HashMap::new(),
+                    RestartPolicy::No,
+                    true,
+                );
 
-            let child = spawn_child(&mut entry, &self.shared.psy_sock, self.shared.psy_root_pid)?;
-            entry.child = Some(child);
-            table.insert("main".into(), entry);
-        }
+                let child =
+                    spawn_child(&mut entry, &self.shared.psy_sock, self.shared.psy_root_pid)?;
+                entry.child = Some(child);
+                table.insert("main".into(), entry);
+            }
 
-        // Spawn the main process monitor
-        {
-            let root = Arc::clone(&self.shared);
-            tokio::spawn(async move {
-                monitor_child(root, "main".into()).await;
+            // Spawn the main process monitor
+            {
+                let root = Arc::clone(&self.shared);
+                tokio::spawn(async move {
+                    monitor_child(root, "main".into()).await;
+                });
+            }
+        } else {
+            // MCP mode: run the MCP JSON-RPC server on stdin/stdout.
+            // When stdin closes (agent disconnects), signal teardown.
+            let exit_tx = self.shared.main_exit_tx.clone();
+            let psy_sock = self.shared.psy_sock.clone();
+            let psy_root_pid = self.shared.psy_root_pid;
+            tokio::task::spawn_blocking(move || {
+                // Set PSY_SOCK so the MCP server's client calls can find us.
+                std::env::set_var("PSY_SOCK", &psy_sock);
+                std::env::set_var("PSY_ROOT_PID", psy_root_pid.to_string());
+                let _ = crate::mcp::run();
+                // stdin closed — trigger teardown.
+                let _ = exit_tx.send(Some(0));
             });
         }
 
@@ -1582,6 +1652,14 @@ async fn teardown(root: Arc<SharedRoot>) {
 
     // Clean up the socket file
     let _ = std::fs::remove_file(&root.socket_path);
+
+    // Clean up the anchor file (if different from the socket file).
+    if let Some(ref anchor) = root.anchor_path {
+        let anchor_str = anchor.to_string_lossy();
+        if anchor_str != root.socket_path {
+            let _ = std::fs::remove_file(anchor);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

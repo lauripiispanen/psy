@@ -73,6 +73,7 @@ Download from [GitHub Releases](https://github.com/lauripiispanen/psy/releases) 
 ```
 psy up [--name <name>] [units...] [-- <command>]   Start a psy root session
 psy up --all [-- <command>]                        Start all Psyfile units
+psy up --mcp [--all] [units...]                    Start root with MCP server on stdin/stdout
 psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child process
 psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
 psy run --interactive <name> [-- <cmd>]            Launch with writable stdin pipe
@@ -229,11 +230,23 @@ Durations support `ms`, `s`, `m`, and `h` suffixes (e.g. `200ms`, `5s`, `2m`).
 
 ## MCP Integration
 
-psy includes a built-in MCP server. Configure `psy mcp` as an MCP server in your agent's config — it inherits `PSY_SOCK` from the psy session and relays tool calls to the root:
+psy includes a built-in MCP server. The simplest setup is `psy up --mcp` — it starts a psy root with the MCP JSON-RPC server on stdin/stdout, so you can configure it directly as your agent's MCP server:
+
+```json
+{
+  "mcpServers": {
+    "psy": { "command": "psy", "args": ["up", "--mcp"] }
+  }
+}
+```
+
+When the agent disconnects (stdin closes), psy tears down all managed processes automatically. Boot units work too: `psy up --mcp --all` or `psy up --mcp db api`.
+
+Alternatively, `psy mcp` (without `up`) is a lightweight relay that connects to an existing root via auto-discovery or `PSY_SOCK`:
 
 ```bash
 psy up -- claude
-# Claude's MCP config launches "psy mcp" → connects back to the root via PSY_SOCK
+# Claude's MCP config launches "psy mcp" → discovers the root automatically
 ```
 
 Tools exposed: `psy_run` (with `interactive` param), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`, `since: "last"` for incremental viewing), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
@@ -354,6 +367,8 @@ psy psyfile init        # generate a starter Psyfile
 ## How It Works
 
 psy creates a Unix domain socket (or named pipe on Windows) and manages a process table in memory. Child processes inherit `PSY_SOCK` and `PSY_ROOT_PID` environment variables, allowing any process in the tree to communicate with the root.
+
+**Auto-discovery:** When `PSY_SOCK` is not set, psy automatically discovers the nearest running root by matching PID ancestor chains. This means you can open a new terminal window and run `psy ps`, `psy logs`, etc. without being inside the psy session — psy finds the right root automatically.
 
 **Cleanup guarantees:**
 - **Linux** — `PR_SET_CHILD_SUBREAPER` + `PR_SET_PDEATHSIG` ensures children die with the parent
