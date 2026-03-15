@@ -9,8 +9,8 @@ use tokio::sync::{watch, Mutex};
 
 use crate::platform;
 use crate::process::{
-    calculate_backoff, should_restart, spawn_child, spawn_child_attached, validate_name,
-    ProcessEntry, ProcessState,
+    calculate_backoff, should_restart, spawn_child, spawn_child_attached, spawn_child_interactive,
+    validate_name, ProcessEntry, ProcessState,
 };
 use crate::protocol::*;
 use crate::psyfile::{self, Psyfile};
@@ -166,6 +166,7 @@ impl PsyRoot {
                         restart: RestartPolicy::No,
                         env: HashMap::new(),
                         attach: false,
+                        interactive: false,
                         extra_args: None,
                     });
                     let result = handle_request(&self.shared, req).await;
@@ -274,6 +275,7 @@ async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
         CMD_RESTART => HandleResult::Response(handle_restart(root, &req).await),
         CMD_DOWN => HandleResult::Response(handle_down(root, &req).await),
         CMD_HISTORY => HandleResult::Response(handle_history(root, &req).await),
+        CMD_SEND => HandleResult::Response(handle_send(root, &req).await),
         _ => HandleResult::Response(Response::err(
             &req.id,
             format!("unknown command: {}", req.cmd),
@@ -376,6 +378,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
                         restart: RestartPolicy::No,
                         env: HashMap::new(),
                         attach: false,
+                        interactive: false,
                         extra_args: None,
                     });
                     let result = handle_run(root, &dep_req).await;
@@ -426,8 +429,15 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         }
 
         // Build command string
-        let extra = args.extra_args.as_deref().unwrap_or(&[]);
-        let extra_owned: Vec<String> = extra.to_vec();
+        // When a Psyfile unit is found, the -- args are treated as extra args, not a command.
+        let extra_owned: Vec<String> = if let Some(ref extra) = args.extra_args {
+            extra.clone()
+        } else if !args.command.is_empty() {
+            // CLI sends -- args as command when extra_args is None
+            args.command.clone()
+        } else {
+            vec![]
+        };
         let cmd_str = psyfile::build_command_with_args(&unit.command, &extra_owned);
 
         // Merge env: unit.env + args.env (args override)
@@ -484,6 +494,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             std::path::PathBuf::from(psyfile::interpolate(&s, &full_env))
         });
 
+        let interactive = args.interactive || unit.interactive;
         return spawn_process(
             root,
             &req.id,
@@ -492,6 +503,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             final_env,
             restart,
             args.attach,
+            interactive,
             working_dir,
             unit.ready.clone(),
             unit.healthcheck.clone(),
@@ -515,6 +527,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         args.env.clone(),
         args.restart,
         args.attach,
+        args.interactive,
         None,
         None,
         None,
@@ -532,6 +545,7 @@ async fn spawn_process(
     env: HashMap<String, String>,
     restart: RestartPolicy,
     attach: bool,
+    interactive: bool,
     working_dir: Option<std::path::PathBuf>,
     ready_config: Option<crate::psyfile::ProbeConfig>,
     healthcheck_config: Option<crate::psyfile::ProbeConfig>,
@@ -576,6 +590,13 @@ async fn spawn_process(
 
     let child = if attach {
         match spawn_child_attached(&mut entry, &root.psy_sock, root.psy_root_pid) {
+            Ok(c) => c,
+            Err(e) => {
+                return HandleResult::Response(Response::err(req_id, format!("spawn failed: {e}")))
+            }
+        }
+    } else if interactive {
+        match spawn_child_interactive(&mut entry, &root.psy_sock, root.psy_root_pid) {
             Ok(c) => c,
             Err(e) => {
                 return HandleResult::Response(Response::err(req_id, format!("spawn failed: {e}")))
@@ -1262,6 +1283,88 @@ async fn handle_history(root: &Arc<SharedRoot>, req: &Request) -> Response {
     };
 
     Response::ok(&req.id, Some(serde_json::to_value(history).unwrap()))
+}
+
+async fn handle_send(root: &Arc<SharedRoot>, req: &Request) -> Response {
+    let args: SendArgs = match req
+        .args
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(a) => a,
+        None => return Response::err(&req.id, "invalid or missing send args"),
+    };
+
+    let mut table = root.process_table.lock().await;
+    let entry = match table.get_mut(&args.name) {
+        Some(e) => e,
+        None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
+    };
+
+    if entry.state != ProcessState::Running {
+        return Response::err(&req.id, format!("process '{}' is not running", args.name));
+    }
+
+    if !entry.interactive {
+        return Response::err(
+            &req.id,
+            format!(
+                "process '{}' was not started with interactive mode (use --interactive or interactive = true in Psyfile)",
+                args.name
+            ),
+        );
+    }
+
+    if entry.stdin_closed {
+        return Response::err(
+            &req.id,
+            format!("stdin for '{}' has been closed", args.name),
+        );
+    }
+
+    // Check for conflict with attach session
+    if entry.stdin_handle.is_none() && !args.eof {
+        return Response::err(
+            &req.id,
+            format!(
+                "process '{}' has an attached session, detach first",
+                args.name
+            ),
+        );
+    }
+
+    if args.eof {
+        // Close stdin
+        entry.stdin_handle = None;
+        entry.stdin_closed = true;
+        return Response::ok(
+            &req.id,
+            Some(serde_json::json!({ "name": args.name, "stdin": "closed" })),
+        );
+    }
+
+    if let Some(ref input) = args.input {
+        if let Some(ref mut stdin) = entry.stdin_handle {
+            use tokio::io::AsyncWriteExt;
+            match tokio::time::timeout(Duration::from_secs(5), async {
+                stdin.write_all(input.as_bytes()).await?;
+                stdin.flush().await
+            })
+            .await
+            {
+                Ok(Ok(())) => Response::ok(
+                    &req.id,
+                    Some(serde_json::json!({ "name": args.name, "bytes_written": input.len() })),
+                ),
+                Ok(Err(e)) => Response::err(&req.id, format!("write to stdin failed: {e}")),
+                Err(_) => Response::err(&req.id, "write to stdin timed out (pipe buffer full?)"),
+            }
+        } else {
+            Response::err(&req.id, format!("no stdin handle for '{}'", args.name))
+        }
+    } else {
+        Response::err(&req.id, "either 'input' or 'eof' must be provided")
+    }
 }
 
 // ---------------------------------------------------------------------------

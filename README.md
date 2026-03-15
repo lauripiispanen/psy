@@ -75,6 +75,11 @@ psy up [--name <name>] [units...] [-- <command>]   Start a psy root session
 psy up --all [-- <command>]                        Start all Psyfile units
 psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child process
 psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
+psy run --interactive <name> [-- <cmd>]            Launch with writable stdin pipe
+psy send <name> "text"                              Write text to a process's stdin
+psy send --raw <name> "text"                        Write without appending newline
+psy send --eof <name>                               Close a process's stdin
+psy send --file <path> <name>                       Pipe file contents to stdin
 psy ps                                              List managed processes
 psy logs <name> [-f] [--tail <n>] [--probe]         View captured logs
 psy history <name>                                  Show run history
@@ -170,6 +175,34 @@ psy run --attach myrepl -- python3 -i
 
 Attach connects your terminal's stdin to the child process and streams its output back. Ctrl-C detaches without killing the child — it keeps running in the background and you can reattach to its logs with `psy logs -f`.
 
+### Interactive stdin
+
+By default, child processes have their stdin connected to `/dev/null`. The interactive mode opens a writable stdin pipe, letting you send input to a running process programmatically:
+
+```bash
+# Start a process with interactive stdin
+psy run --interactive myproc -- cat
+
+# Send a line (newline auto-appended)
+psy send myproc "hello world"
+
+# Send without trailing newline
+psy send --raw myproc "no newline"
+
+# Pipe a file's contents to stdin
+psy send --file data.txt myproc
+
+# Close stdin (EOF) — permanent, cannot reopen
+psy send --eof myproc
+```
+
+Design notes:
+- Uses a pipe, not a PTY — simple and cross-platform
+- `psy send` appends a newline by default; use `--raw` to send exactly what you pass
+- `--eof` closes the pipe permanently; further sends return an error
+- If the pipe buffer is full, `psy send` blocks for up to 5 seconds before returning a backpressure error
+- Sending to a process that was not started with `--interactive` (or `interactive = true` in Psyfile) returns an error
+
 ## MCP Integration
 
 psy includes a built-in MCP server. Configure `psy mcp` as an MCP server in your agent's config — it inherits `PSY_SOCK` from the psy session and relays tool calls to the root:
@@ -179,7 +212,7 @@ psy up -- claude
 # Claude's MCP config launches "psy mcp" → connects back to the root via PSY_SOCK
 ```
 
-Tools exposed: `psy_run`, `psy_ps`, `psy_logs`, `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
+Tools exposed: `psy_run` (with `interactive` param), `psy_ps`, `psy_logs`, `psy_send`, `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
 
 ## Psyfile
 
@@ -213,6 +246,7 @@ depends_on = ["api"]
 | `env` | table | `{}` | Environment variables (supports `${VAR:-default}`) |
 | `depends_on` | array | `[]` | Dependencies — strings or `{ name, restart }` tables |
 | `singleton` | bool | `true` | `false` = template unit (multiple instances) |
+| `interactive` | bool | `false` | Enable writable stdin pipe |
 | `working_dir` | string | cwd | Working directory |
 | `ready` | table | none | Startup readiness probe |
 | `healthcheck` | table | none | Continuous health check |

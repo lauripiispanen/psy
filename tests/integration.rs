@@ -2065,3 +2065,620 @@ env = {{ OVERRIDE = "platform-override", ADDED = "platform-added" }}
         "added env should appear, got: {logs}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// v1.3: Interactive stdin (psy send)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_send_basic() {
+    // Start an interactive cat process, send text, check logs
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let cat_cmd = vec!["run", "--interactive", "catproc", "--", "cat"];
+
+    root.psy(&cat_cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    // Send text
+    root.psy(&["send", "catproc", "hello-interactive"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "catproc"]);
+    assert!(
+        logs.contains("hello-interactive"),
+        "sent text should appear in logs, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_multiple_lines() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let cat_cmd = vec!["run", "--interactive", "multicat", "--", "cat"];
+
+    root.psy(&cat_cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    root.psy(&["send", "multicat", "line-one"]);
+    root.psy(&["send", "multicat", "line-two"]);
+    root.psy(&["send", "multicat", "line-three"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "multicat"]);
+    assert!(
+        logs.contains("line-one") && logs.contains("line-two") && logs.contains("line-three"),
+        "all sent lines should appear in logs, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_non_interactive_error() {
+    // Sending to a non-interactive process should fail
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let long_sl = sleep_cmd(999);
+    let long_refs = to_refs(&long_sl);
+    let mut run_args = vec!["run", "nointeract", "--"];
+    run_args.extend(long_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_millis(500));
+
+    let out = root.psy(&["send", "nointeract", "test"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !out.status.success() || combined.to_lowercase().contains("interactive"),
+        "send to non-interactive should error, got: {combined}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_eof_closes_stdin() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let cat_cmd = vec!["run", "--interactive", "eofcat", "--", "cat"];
+
+    root.psy(&cat_cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    root.psy(&["send", "eofcat", "before-eof"]);
+    thread::sleep(Duration::from_millis(500));
+
+    // Close stdin
+    root.psy(&["send", "--eof", "eofcat"]);
+    thread::sleep(Duration::from_millis(500));
+
+    // Further sends should fail
+    let out = root.psy(&["send", "eofcat", "after-eof"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !out.status.success() || combined.to_lowercase().contains("closed"),
+        "send after eof should error, got: {combined}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_not_found() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let out = root.psy(&["send", "nonexistent", "text"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !out.status.success() || combined.to_lowercase().contains("not found"),
+        "send to nonexistent process should error, got: {combined}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_psyfile_interactive() {
+    // Test interactive flag in Psyfile
+    let tmp = TempPsyfileDir::new(
+        r#"
+[echoback]
+command = "cat"
+interactive = true
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "echoback"]);
+    thread::sleep(Duration::from_secs(1));
+
+    root.psy(&["send", "echoback", "psyfile-interactive"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "echoback"]);
+    assert!(
+        logs.contains("psyfile-interactive"),
+        "Psyfile interactive unit should accept stdin, got: {logs}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn test_send_file() {
+    // Test --file flag
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let cat_cmd = vec!["run", "--interactive", "filecat", "--", "cat"];
+    root.psy(&cat_cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    // Create temp file
+    let tmp_file = std::env::temp_dir().join(format!("psy-send-test-{}", std::process::id()));
+    std::fs::write(&tmp_file, "file-content-here\n").unwrap();
+
+    let file_path = tmp_file.to_string_lossy().to_string();
+    root.psy(&["send", "--file", &file_path, "filecat"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "filecat"]);
+    assert!(
+        logs.contains("file-content-here"),
+        "file content should appear in logs, got: {logs}"
+    );
+
+    let _ = std::fs::remove_file(&tmp_file);
+}
+
+#[test]
+#[ignore]
+fn test_send_raw_no_newline() {
+    // Test --raw flag (no auto newline)
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let cat_cmd = vec!["run", "--interactive", "rawcat", "--", "cat"];
+
+    root.psy(&cat_cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    // Send two raw fragments that together form one line
+    root.psy(&["send", "--raw", "rawcat", "part1-"]);
+    root.psy(&["send", "--raw", "rawcat", "part2\n"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "rawcat"]);
+    assert!(
+        logs.contains("part1-part2"),
+        "raw send should not add newlines between parts, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_stopped_process_error() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    #[cfg(unix)]
+    let cmd = vec![
+        "run",
+        "--interactive",
+        "stopme",
+        "--",
+        "sh",
+        "-c",
+        "echo started && sleep 999",
+    ];
+    #[cfg(windows)]
+    let cmd = vec![
+        "run",
+        "--interactive",
+        "stopme",
+        "--",
+        "cmd",
+        "/c",
+        "echo started && ping -n 999 127.0.0.1 >nul",
+    ];
+
+    root.psy(&cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    root.psy(&["stop", "stopme"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let out = root.psy(&["send", "stopme", "text"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !out.status.success() || combined.to_lowercase().contains("not running"),
+        "send to stopped process should error, got: {combined}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.3: Interactive stdin via Psyfile with dependencies
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_send_psyfile_interactive_with_deps() {
+    // Interactive process with a dependency
+    let tmp = TempPsyfileDir::new(
+        r#"
+[setup]
+command = "echo setup-done"
+ready = { exit = 0 }
+
+[repl]
+command = "cat"
+interactive = true
+depends_on = ["setup"]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "repl"]);
+    thread::sleep(Duration::from_secs(3));
+
+    // Both should be started
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(ps.contains("setup"), "setup should be in ps: {ps}");
+    assert!(ps.contains("repl"), "repl should be in ps: {ps}");
+
+    // Send to the interactive process
+    root.psy(&["send", "repl", "dep-test-input"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "repl"]);
+    assert!(
+        logs.contains("dep-test-input"),
+        "interactive unit with deps should work, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Additional comprehensive cross-platform tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_restart_preserves_history_across_multiple() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let cmd = sh_c("echo run-marker && sleep 999");
+    let cmd_refs = to_refs(&cmd);
+    let mut run_args = vec!["run", "multirestart", "--"];
+    run_args.extend(cmd_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // Restart multiple times
+    root.psy(&["restart", "multirestart"]);
+    thread::sleep(Duration::from_secs(1));
+    root.psy(&["restart", "multirestart"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let history = root.psy_stdout(&["history", "multirestart"]);
+    // Should show 3 runs
+    assert!(
+        history.contains("1") && history.contains("2") && history.contains("3"),
+        "history should show 3 runs, got: {history}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_stop_main_rejected() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let out = root.psy(&["stop", "main"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !out.status.success()
+            || combined.to_lowercase().contains("cannot stop")
+            || combined.to_lowercase().contains("down"),
+        "stopping main should be rejected, got: {combined}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_run_after_down_rejected() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    root.psy(&["down"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let echo = sh_c("echo should-not-work");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "afterdown", "--"];
+    run_args.extend(echo_refs);
+    let out = root.psy(&run_args);
+    // Should fail because server is down or shutting down
+    assert!(!out.status.success(), "run after down should fail");
+}
+
+#[test]
+#[ignore]
+fn test_logs_stderr_filter() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    #[cfg(unix)]
+    let cmd = vec![
+        "run",
+        "stderrtest",
+        "--",
+        "sh",
+        "-c",
+        "echo stdout-line && echo stderr-line >&2",
+    ];
+    #[cfg(windows)]
+    let cmd = vec![
+        "run",
+        "stderrtest",
+        "--",
+        "cmd",
+        "/c",
+        "echo stdout-line && echo stderr-line 1>&2",
+    ];
+
+    root.psy(&cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    // --stdout only
+    let stdout_logs = root.psy_stdout(&["logs", "stderrtest", "--stdout"]);
+    assert!(
+        stdout_logs.contains("stdout-line"),
+        "stdout filter should include stdout, got: {stdout_logs}"
+    );
+    assert!(
+        !stdout_logs.contains("stderr-line"),
+        "stdout filter should exclude stderr, got: {stdout_logs}"
+    );
+
+    // --stderr only
+    let stderr_logs = root.psy_stdout(&["logs", "stderrtest", "--stderr"]);
+    assert!(
+        stderr_logs.contains("stderr-line"),
+        "stderr filter should include stderr, got: {stderr_logs}"
+    );
+    assert!(
+        !stderr_logs.contains("stdout-line"),
+        "stderr filter should exclude stdout, got: {stderr_logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_circular_dep_error() {
+    let tmp = TempPsyfileDir::new(
+        r#"
+[a]
+command = "echo a"
+depends_on = ["b"]
+
+[b]
+command = "echo b"
+depends_on = ["a"]
+"#,
+    );
+
+    // Validate should fail
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "validate", "--file"])
+        .arg(tmp.psyfile_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run validate");
+    assert!(
+        !output.status.success(),
+        "circular deps should fail validation"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("circular") || stderr.to_lowercase().contains("cycle"),
+        "error should mention circular/cycle: {stderr}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_unknown_dep_error() {
+    let tmp = TempPsyfileDir::new(
+        r#"
+[api]
+command = "echo api"
+depends_on = ["nonexistent"]
+"#,
+    );
+
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "validate", "--file"])
+        .arg(tmp.psyfile_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run validate");
+    assert!(
+        !output.status.success(),
+        "unknown dep should fail validation"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_unknown_field_error() {
+    let tmp = TempPsyfileDir::new(
+        r#"
+[server]
+command = "echo hello"
+depnds_on = ["db"]
+"#,
+    );
+
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "validate", "--file"])
+        .arg(tmp.psyfile_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run validate");
+    assert!(
+        !output.status.success(),
+        "unknown field should fail validation"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("depnds_on") || stderr.contains("unknown"),
+        "error should mention the typo: {stderr}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_version() {
+    let output = Command::new(psy_bin())
+        .args(["version"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run version");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "version should succeed");
+    assert!(
+        stdout.contains("1.3.0"),
+        "version should show 1.3.0, got: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_template_restart() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[worker]
+command = "echo worker-instance && sleep 999"
+singleton = false
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "worker"]);
+    root.psy(&["run", "worker"]);
+    thread::sleep(Duration::from_secs(1));
+
+    // Restart the group
+    root.psy(&["restart", "worker"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("worker.1") && ps.contains("worker.2"),
+        "template instances should still exist after group restart, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_arg_append() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[echoer]
+command = "echo base"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "echoer", "--", "extra-arg"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "echoer"]);
+    assert!(
+        logs.contains("base") && logs.contains("extra-arg"),
+        "extra args should be appended, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_dollar_at_substitution() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[cmd]
+command = "echo $@ end"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "cmd", "--", "middle"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "cmd"]);
+    assert!(
+        logs.contains("middle") && logs.contains("end"),
+        "$@ should be substituted, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_dollar_at_no_args() {
+    let sl = sleep_cmd(60);
+    let tmp = TempPsyfileDir::new(
+        r#"
+[cmd]
+command = "echo $@ end"
+"#,
+    );
+    let root = PsyRoot::start_with_psyfile(&tmp.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "cmd"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let logs = root.psy_stdout(&["logs", "cmd"]);
+    assert!(
+        logs.contains("end"),
+        "$@ with no args should work, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_psyfile_schema_has_interactive() {
+    let output = Command::new(psy_bin())
+        .args(["psyfile", "schema"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run schema");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "schema should succeed");
+    assert!(
+        stdout.contains("interactive"),
+        "schema should include interactive field, got: {stdout}"
+    );
+}

@@ -62,6 +62,7 @@ pub const CMD_STOP: &str = "stop";
 pub const CMD_RESTART: &str = "restart";
 pub const CMD_DOWN: &str = "down";
 pub const CMD_HISTORY: &str = "history";
+pub const CMD_SEND: &str = "send";
 
 // ---------------------------------------------------------------------------
 // Argument / payload types
@@ -78,8 +79,19 @@ pub struct RunArgs {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub attach: bool,
+    #[serde(default)]
+    pub interactive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendArgs {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub eof: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -264,6 +276,13 @@ impl Request {
         Self::new(
             CMD_HISTORY,
             Some(serde_json::to_value(args).expect("serialize HistoryArgs")),
+        )
+    }
+
+    pub fn send(args: SendArgs) -> Self {
+        Self::new(
+            CMD_SEND,
+            Some(serde_json::to_value(args).expect("serialize SendArgs")),
         )
     }
 }

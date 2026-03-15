@@ -156,6 +156,7 @@ pub fn run_attached(
         restart,
         env,
         attach: true,
+        interactive: false,
         extra_args: None,
     });
     let mut payload =

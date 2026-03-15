@@ -40,7 +40,7 @@ psy/
 
 ### Core Infrastructure
 - [x] `Cargo.toml` — dependencies, profile settings
-- [x] `src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, mcp, psyfile, version)
+- [x] `src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, send, mcp, psyfile, version)
 - [x] `src/protocol.rs` — NDJSON request/response types (Request, Response, serde)
 
 ### Process Management
@@ -63,6 +63,7 @@ psy/
 - [x] Handle `logs_follow` command — streaming log lines
 - [x] Handle `stop` command — SIGTERM → 10s wait → SIGKILL
 - [x] Handle `restart` command — stop + re-run with same args
+- [x] Handle `send` command — write to interactive process stdin, --eof support, backpressure timeout
 - [x] Handle `down` command — teardown all children in reverse order
 - [x] Reject `run` during teardown ("shutting down")
 - [x] Reject `stop main` (must use `down`)
@@ -81,6 +82,7 @@ psy/
 - [x] `psy run --restart <policy>` — restart policy
 - [x] `psy run --env KEY=VAL` — extra env vars
 - [x] `psy run --attach` — connect terminal stdin/stdout to child
+- [x] `psy run --interactive` — enable stdin pipe (writable via psy send)
 - [x] `psy ps` — send ps command, format table output
 - [x] `psy logs <name>` — dump captured logs
 - [x] `psy logs --tail <n>` — last N lines
@@ -95,6 +97,10 @@ psy/
 - [x] `psy psyfile schema` — output JSON Schema for Psyfile format
 - [x] `psy psyfile validate [--file]` — validate Psyfile
 - [x] `psy psyfile init` — generate starter Psyfile
+- [x] `psy send <name> "text"` — write to process stdin (newline auto-appended)
+- [x] `psy send --raw <name> "text"` — write without appending newline
+- [x] `psy send --eof <name>` — close process stdin
+- [x] `psy send --file <path> <name>` — pipe file contents to stdin
 - [x] `psy stop <name>` — send stop command
 - [x] `psy restart <name>` — send restart command
 - [x] `psy down` — send down command
@@ -145,6 +151,8 @@ psy/
 - [x] `psy_history` tool — show run history for a process
 - [x] `psy_psyfile_schema` tool — return Psyfile JSON Schema
 - [x] `psy_logs` tool — `probe` parameter for probe log streams
+- [x] `psy_send` tool — write to process stdin (interactive mode)
+- [x] `psy_run` tool — `interactive` parameter for stdin pipe
 - [x] Connect to root via `PSY_SOCK` internally
 
 ### Log Output Format
@@ -170,7 +178,7 @@ psy/
 ### Psyfile (`src/psyfile.rs`)
 - [x] TOML parsing with field validation (reject unknown fields)
 - [x] File discovery: walk upward from cwd for `Psyfile` or `Psyfile.toml`
-- [x] Unit definition: command, restart, env, depends_on, singleton, working_dir, ready, healthcheck
+- [x] Unit definition: command, restart, env, depends_on, singleton, working_dir, ready, healthcheck, interactive
 - [x] Environment variable interpolation: `${VAR}` and `${VAR:-default}`
 - [x] Circular dependency detection (Kahn's algorithm)
 - [x] Dependency resolution: topological sort for start order
@@ -277,6 +285,28 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Platform excluded unit: `psy run` fails, not visible
 - [x] Platform `psy up --all` skips excluded units
 - [x] Platform env merge: base preserved, platform overrides/adds
+- [x] `psy send` basic: send text, appears in logs
+- [x] `psy send` multiple lines
+- [x] `psy send` on non-interactive process → error
+- [x] `psy send --eof` closes stdin, further sends error
+- [x] `psy send` to nonexistent process → error
+- [x] `psy send` Psyfile `interactive = true` works
+- [x] `psy send --file` pipes file contents
+- [x] `psy send --raw` no newline appended
+- [x] `psy send` to stopped process → error
+- [x] Interactive process with dependencies
+- [x] Psyfile arg append: `psy run unit -- extra-arg`
+- [x] Psyfile `$@` substitution and no-args
+- [x] `psy psyfile schema` includes `interactive` field
+- [x] `psy version` shows current version
+- [x] Stop main rejected
+- [x] Run after down rejected
+- [x] Logs stderr filter
+- [x] Psyfile circular dep error
+- [x] Psyfile unknown dep error
+- [x] Psyfile unknown field error
+- [x] Template group restart
+- [x] Multiple restarts preserve history
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

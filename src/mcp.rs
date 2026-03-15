@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::protocol::{
     HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
-    RunArgs, StopArgs, StreamFilter,
+    RunArgs, SendArgs, StopArgs, StreamFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -109,6 +109,10 @@ fn tool_schemas() -> Value {
                             "type": "object",
                             "additionalProperties": { "type": "string" },
                             "description": "Additional environment variables"
+                        },
+                        "interactive": {
+                            "type": "boolean",
+                            "description": "Enable stdin pipe (writable via psy_send)"
                         }
                     },
                     "required": ["name"]
@@ -213,6 +217,28 @@ fn tool_schemas() -> Value {
                 }
             },
             {
+                "name": "psy_send",
+                "description": "Write to a process's stdin (must be started with interactive mode)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Process name"
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "Text to send (newline appended automatically)"
+                        },
+                        "eof": {
+                            "type": "boolean",
+                            "description": "Close stdin (for programs that read to EOF)"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
                 "name": "psy_psyfile_schema",
                 "description": "Return the JSON Schema for the Psyfile format. Use this to discover available fields for defining process units.",
                 "inputSchema": {
@@ -267,12 +293,18 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 })
                 .unwrap_or_default();
 
+            let interactive = args
+                .get("interactive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let req = Request::run(RunArgs {
                 name,
                 command,
                 restart,
                 env,
                 attach: false,
+                interactive,
                 extra_args,
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
@@ -411,6 +443,35 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
                 Ok(json!({ "type": "text", "text": "restarted" }))
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
+        }
+
+        "psy_send" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing required parameter: name")?
+                .to_string();
+            let eof = args.get("eof").and_then(|v| v.as_bool()).unwrap_or(false);
+            let input = if eof {
+                None
+            } else {
+                let text = args
+                    .get("input")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing required parameter: input (or set eof: true)")?;
+                // Auto-append newline like CLI does
+                Some(format!("{text}\n"))
+            };
+            let req = Request::send(SendArgs { name, input, eof });
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                Ok(json!({
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&resp.data).unwrap_or_default()
+                }))
             } else {
                 Err(resp.error.unwrap_or_else(|| "unknown error".into()))
             }

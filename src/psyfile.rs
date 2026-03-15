@@ -46,6 +46,7 @@ pub struct UnitDef {
     pub working_dir: Option<PathBuf>,
     pub ready: Option<ProbeConfig>,
     pub healthcheck: Option<ProbeConfig>,
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +132,7 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             "healthcheck",
             "platforms",
             "platform",
+            "interactive",
         ];
         for key in unit_table.keys() {
             if !known_fields.contains(&key.as_str()) {
@@ -288,6 +290,11 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        let interactive = unit_table
+            .get("interactive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let working_dir = unit_table
             .get("working_dir")
             .and_then(|v| v.as_str())
@@ -413,6 +420,7 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
                 working_dir,
                 ready,
                 healthcheck,
+                interactive,
             },
         );
     }
@@ -978,6 +986,11 @@ pub fn json_schema() -> serde_json::Value {
                     },
                     "additionalProperties": false
                 },
+                "interactive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable stdin pipe (writable via psy send)"
+                },
                 "platforms": {
                     "type": "array",
                     "items": {
@@ -1129,6 +1142,27 @@ singleton = false
 "#;
         let pf = parse_str(content).unwrap();
         assert!(!pf.units["client"].singleton);
+    }
+
+    #[test]
+    fn parse_interactive_true() {
+        let content = r#"
+[repl]
+command = "python3"
+interactive = true
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(pf.units["repl"].interactive);
+    }
+
+    #[test]
+    fn parse_interactive_default_false() {
+        let content = r#"
+[server]
+command = "cargo run"
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(!pf.units["server"].interactive);
     }
 
     // -- validate ------------------------------------------------------------

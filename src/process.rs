@@ -99,8 +99,12 @@ pub struct ProcessEntry {
     pub stopping: Arc<AtomicBool>,
     /// Handle to the running child — only present while Running.
     pub child: Option<Child>,
-    /// Handle to the child's stdin (only set when attach mode is used).
+    /// Handle to the child's stdin (set when attach or interactive mode is used).
     pub stdin_handle: Option<tokio::process::ChildStdin>,
+    /// Whether the process was started in interactive mode (stdin pipe writable via psy send).
+    pub interactive: bool,
+    /// Whether stdin has been closed via --eof.
+    pub stdin_closed: bool,
     /// Monotonically increasing run ID for this process name.
     pub current_run_id: u32,
     /// Archived past runs (oldest first).
@@ -150,6 +154,8 @@ impl ProcessEntry {
             stopping: Arc::new(AtomicBool::new(false)),
             child: None,
             stdin_handle: None,
+            interactive: false,
+            stdin_closed: false,
             current_run_id: 1,
             run_history: Vec::new(),
             working_dir: None,
@@ -274,7 +280,7 @@ pub fn spawn_child(
     psy_sock: &str,
     psy_root_pid: u32,
 ) -> std::io::Result<Child> {
-    spawn_child_inner(entry, psy_sock, psy_root_pid, false)
+    spawn_child_inner(entry, psy_sock, psy_root_pid, false, false)
 }
 
 pub fn spawn_child_attached(
@@ -282,7 +288,15 @@ pub fn spawn_child_attached(
     psy_sock: &str,
     psy_root_pid: u32,
 ) -> std::io::Result<Child> {
-    spawn_child_inner(entry, psy_sock, psy_root_pid, true)
+    spawn_child_inner(entry, psy_sock, psy_root_pid, true, false)
+}
+
+pub fn spawn_child_interactive(
+    entry: &mut ProcessEntry,
+    psy_sock: &str,
+    psy_root_pid: u32,
+) -> std::io::Result<Child> {
+    spawn_child_inner(entry, psy_sock, psy_root_pid, false, true)
 }
 
 fn spawn_child_inner(
@@ -290,6 +304,7 @@ fn spawn_child_inner(
     psy_sock: &str,
     psy_root_pid: u32,
     attach: bool,
+    interactive: bool,
 ) -> std::io::Result<Child> {
     if entry.command.is_empty() {
         return Err(std::io::Error::new(
@@ -318,8 +333,8 @@ fn spawn_child_inner(
         cmd.stdin(std::process::Stdio::inherit());
         cmd.stdout(std::process::Stdio::inherit());
         cmd.stderr(std::process::Stdio::inherit());
-    } else if attach {
-        // Attach mode: pipe stdin so we can write to it, pipe stdout/stderr for capture
+    } else if attach || interactive {
+        // Attach/interactive mode: pipe stdin so we can write to it, pipe stdout/stderr for capture
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -356,9 +371,13 @@ fn spawn_child_inner(
     entry.exit_status = None;
     entry.signal = None;
 
-    // Store stdin handle for attach mode
-    if attach {
+    // Store stdin handle for attach/interactive mode
+    if attach || interactive {
         entry.stdin_handle = child.stdin.take();
+        if interactive {
+            entry.interactive = true;
+            entry.stdin_closed = false;
+        }
     }
 
     // Start output capture tasks for non-main processes

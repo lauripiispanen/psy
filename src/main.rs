@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 
 use protocol::{
     HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
-    RunArgs, StopArgs, StreamFilter,
+    RunArgs, SendArgs, StopArgs, StreamFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -67,9 +67,29 @@ enum Commands {
         /// Attach terminal stdin/stdout to the child process
         #[arg(long)]
         attach: bool,
+        /// Enable stdin pipe (writable via psy send)
+        #[arg(long)]
+        interactive: bool,
         /// Command to run (required for ad-hoc processes, optional for Psyfile units)
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// Write to a process's stdin (requires --interactive)
+    Send {
+        /// Process name
+        name: String,
+        /// Text to send (newline auto-appended unless --raw)
+        #[arg(value_name = "TEXT")]
+        input: Option<String>,
+        /// Don't append a newline
+        #[arg(long)]
+        raw: bool,
+        /// Close stdin (EOF)
+        #[arg(long)]
+        eof: bool,
+        /// Read input from file
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
     },
     /// List managed processes
     Ps {
@@ -336,6 +356,7 @@ command = "echo 'hello world'"
             restart,
             envs,
             attach,
+            interactive,
             command,
         } => {
             let restart_policy = parse_restart_policy(&restart);
@@ -359,7 +380,50 @@ command = "echo 'hello world'"
                     restart: restart_policy,
                     env,
                     attach: false,
+                    interactive,
                     extra_args: extra,
+                });
+                send_and_print(req);
+            }
+        }
+
+        Commands::Send {
+            name,
+            input,
+            raw,
+            eof,
+            file,
+        } => {
+            if eof {
+                let req = Request::send(SendArgs {
+                    name,
+                    input: None,
+                    eof: true,
+                });
+                send_and_print(req);
+            } else {
+                let text = if let Some(path) = file {
+                    match std::fs::read_to_string(&path) {
+                        Ok(contents) => contents,
+                        Err(e) => {
+                            eprintln!("error: cannot read {}: {e}", path.display());
+                            std::process::exit(1);
+                        }
+                    }
+                } else if let Some(text) = input {
+                    if raw {
+                        text
+                    } else {
+                        format!("{text}\n")
+                    }
+                } else {
+                    eprintln!("error: provide text to send, --file, or --eof");
+                    std::process::exit(1);
+                };
+                let req = Request::send(SendArgs {
+                    name,
+                    input: Some(text),
+                    eof: false,
                 });
                 send_and_print(req);
             }
