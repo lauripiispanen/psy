@@ -3334,7 +3334,10 @@ fn test_discovery_stale_anchor_cleaned() {
     // Create a fake anchor file with a dead PID.
     let roots = test_roots_dir();
     let _ = std::fs::create_dir_all(&roots);
+    #[cfg(unix)]
     let fake_anchor = roots.join("1-999999.sock");
+    #[cfg(windows)]
+    let fake_anchor = roots.join("1-999999.pipe");
     std::fs::write(&fake_anchor, "").expect("write fake anchor");
     assert!(fake_anchor.exists(), "fake anchor should exist");
 
