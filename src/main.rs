@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 
 use protocol::{
     HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
-    RunArgs, SendArgs, StopArgs, StreamFilter,
+    RunArgs, SendArgs, SendWaitArgs, StopArgs, StreamFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,18 @@ enum Commands {
         /// Read input from file
         #[arg(long, value_name = "PATH")]
         file: Option<PathBuf>,
+        /// Wait for output after sending (blocking send)
+        #[arg(long)]
+        wait: bool,
+        /// Overall timeout for --wait (e.g. 5s, 10s, 200ms)
+        #[arg(long, default_value = "5s")]
+        wait_timeout: String,
+        /// Idle timeout for --wait — stop after this long with no output
+        #[arg(long, default_value = "200ms")]
+        idle_timeout: String,
+        /// Prompt pattern for --wait — return early when output matches
+        #[arg(long)]
+        wait_prompt: Option<String>,
     },
     /// List managed processes
     Ps {
@@ -393,8 +405,53 @@ command = "echo 'hello world'"
             raw,
             eof,
             file,
+            wait,
+            wait_timeout,
+            idle_timeout,
+            wait_prompt,
         } => {
-            if eof {
+            if wait && (eof || file.is_some() || raw) {
+                eprintln!("error: --wait is incompatible with --eof, --file, and --raw");
+                std::process::exit(1);
+            }
+
+            if wait {
+                let text = match input {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("error: provide text to send with --wait");
+                        std::process::exit(1);
+                    }
+                };
+                let req = Request::send_wait(SendWaitArgs {
+                    name,
+                    input: text,
+                    timeout: Some(wait_timeout),
+                    idle_timeout: Some(idle_timeout),
+                    prompt: wait_prompt,
+                });
+                match client::send_command(req) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(data) = resp.data {
+                            if let Some(lines) = data.get("lines").and_then(|v| v.as_array()) {
+                                for line in lines {
+                                    if let Some(s) = line.as_str() {
+                                        println!("{s}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else if eof {
                 let req = Request::send(SendArgs {
                     name,
                     input: None,

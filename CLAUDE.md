@@ -64,6 +64,7 @@ psy/
 - [x] Handle `stop` command — SIGTERM → 10s wait → SIGKILL
 - [x] Handle `restart` command — stop + re-run with same args
 - [x] Handle `send` command — write to interactive process stdin, --eof support, backpressure timeout
+- [x] Handle `send_wait` command — blocking send + output collection with idle/overall timeout and prompt matching
 - [x] Handle `down` command — teardown all children in reverse order
 - [x] Reject `run` during teardown ("shutting down")
 - [x] Reject `stop main` (must use `down`)
@@ -101,6 +102,8 @@ psy/
 - [x] `psy send --raw <name> "text"` — write without appending newline
 - [x] `psy send --eof <name>` — close process stdin
 - [x] `psy send --file <path> <name>` — pipe file contents to stdin
+- [x] `psy send --wait <name> "text"` — blocking send, collect output until idle/timeout/prompt
+- [x] `psy send --wait-timeout` / `--idle-timeout` / `--wait-prompt` — wait mode options
 - [x] `psy stop <name>` — send stop command
 - [x] `psy restart <name>` — send restart command
 - [x] `psy down` — send down command
@@ -152,6 +155,8 @@ psy/
 - [x] `psy_psyfile_schema` tool — return Psyfile JSON Schema
 - [x] `psy_logs` tool — `probe` parameter for probe log streams
 - [x] `psy_send` tool — write to process stdin (interactive mode)
+- [x] `psy_send` tool — `wait` parameter for blocking send with output collection
+- [x] `psy_logs` tool — `format` parameter: `lines` (default, compact) or `structured` (JSON objects)
 - [x] `psy_run` tool — `interactive` parameter for stdin pipe
 - [x] Connect to root via `PSY_SOCK` internally
 
@@ -195,7 +200,7 @@ psy/
 - [x] Psyfile can be created/modified after `psy up` — changes take effect immediately
 - [x] Extended `depends_on` syntax: string or `{ name, restart }` table entries
 - [x] Probe config parsing: `ready` and `healthcheck` tables with type/interval/timeout/retries
-- [x] Duration parsing helper: `Ns`, `Nm`, `Nh` format
+- [x] Duration parsing helper: `Nms`, `Ns`, `Nm`, `Nh` format
 - [x] `exit` probe type restricted to `ready` only (not `healthcheck`)
 - [x] JSON Schema generation for Psyfile format (`json_schema()`)
 - [x] `psy psyfile schema` — output JSON Schema
@@ -234,7 +239,7 @@ psy/
 - [x] Psyfile probe parsing: tcp, tcp port number, http, exec, exit variants
 - [x] Psyfile probe validation: no type, multiple types, exit rejected for healthcheck
 - [x] Psyfile probes: custom interval/timeout/retries, both ready+healthcheck
-- [x] Duration parsing: seconds, minutes, hours, invalid input
+- [x] Duration parsing: milliseconds, seconds, minutes, hours, invalid input
 - [x] Platform overrides: command, env merge, restart, depends_on, working_dir, ready probe
 - [x] Platform filtering: excludes unit, includes current, omitted includes all
 - [x] Platform validation: invalid platform name, invalid override key, invalid override field
@@ -294,6 +299,10 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] `psy send --file` pipes file contents
 - [x] `psy send --raw` no newline appended
 - [x] `psy send` to stopped process → error
+- [x] `psy send --wait` basic: send to cat, verify echoed output returned
+- [x] `psy send --wait` prompt: early return when prompt pattern matched
+- [x] `psy send --wait` timeout: partial output returned on timeout
+- [x] `psy send --wait` non-interactive error
 - [x] Interactive process with dependencies
 - [x] Psyfile arg append: `psy run unit -- extra-arg`
 - [x] Psyfile `$@` substitution and no-args

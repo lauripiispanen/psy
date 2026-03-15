@@ -63,6 +63,7 @@ pub const CMD_RESTART: &str = "restart";
 pub const CMD_DOWN: &str = "down";
 pub const CMD_HISTORY: &str = "history";
 pub const CMD_SEND: &str = "send";
+pub const CMD_SEND_WAIT: &str = "send_wait";
 
 // ---------------------------------------------------------------------------
 // Argument / payload types
@@ -92,6 +93,18 @@ pub struct SendArgs {
     pub input: Option<String>,
     #[serde(default)]
     pub eof: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendWaitArgs {
+    pub name: String,
+    pub input: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -283,6 +296,13 @@ impl Request {
         Self::new(
             CMD_SEND,
             Some(serde_json::to_value(args).expect("serialize SendArgs")),
+        )
+    }
+
+    pub fn send_wait(args: SendWaitArgs) -> Self {
+        Self::new(
+            CMD_SEND_WAIT,
+            Some(serde_json::to_value(args).expect("serialize SendWaitArgs")),
         )
     }
 }

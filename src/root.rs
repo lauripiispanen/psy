@@ -276,6 +276,7 @@ async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
         CMD_DOWN => HandleResult::Response(handle_down(root, &req).await),
         CMD_HISTORY => HandleResult::Response(handle_history(root, &req).await),
         CMD_SEND => HandleResult::Response(handle_send(root, &req).await),
+        CMD_SEND_WAIT => HandleResult::Response(handle_send_wait(root, &req).await),
         _ => HandleResult::Response(Response::err(
             &req.id,
             format!("unknown command: {}", req.cmd),
@@ -1365,6 +1366,162 @@ async fn handle_send(root: &Arc<SharedRoot>, req: &Request) -> Response {
     } else {
         Response::err(&req.id, "either 'input' or 'eof' must be provided")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Send-and-wait
+// ---------------------------------------------------------------------------
+
+async fn handle_send_wait(root: &Arc<SharedRoot>, req: &Request) -> Response {
+    let args: SendWaitArgs = match req
+        .args
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(a) => a,
+        None => return Response::err(&req.id, "invalid or missing send_wait args"),
+    };
+
+    // Parse timeouts
+    let timeout = match args.timeout.as_deref() {
+        Some(s) => match crate::psyfile::parse_duration(s) {
+            Ok(d) => d,
+            Err(e) => return Response::err(&req.id, format!("invalid timeout: {e}")),
+        },
+        None => Duration::from_secs(5),
+    };
+    let idle_timeout = match args.idle_timeout.as_deref() {
+        Some(s) => match crate::psyfile::parse_duration(s) {
+            Ok(d) => d,
+            Err(e) => return Response::err(&req.id, format!("invalid idle_timeout: {e}")),
+        },
+        None => Duration::from_millis(200),
+    };
+
+    // Lock table, validate, subscribe, write, then release lock
+    let (mut stdout_rx, mut stderr_rx) = {
+        let mut table = root.process_table.lock().await;
+        let entry = match table.get_mut(&args.name) {
+            Some(e) => e,
+            None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
+        };
+
+        if entry.state != ProcessState::Running {
+            return Response::err(&req.id, format!("process '{}' is not running", args.name));
+        }
+
+        if !entry.interactive {
+            return Response::err(
+                &req.id,
+                format!(
+                    "process '{}' was not started with interactive mode",
+                    args.name
+                ),
+            );
+        }
+
+        if entry.stdin_closed {
+            return Response::err(
+                &req.id,
+                format!("stdin for '{}' has been closed", args.name),
+            );
+        }
+
+        // Subscribe to output before writing so we don't miss lines
+        let stdout_rx = entry.stdout_buf.subscribe();
+        let stderr_rx = entry.stderr_buf.subscribe();
+
+        // Write input + newline to stdin
+        let input = format!("{}\n", args.input);
+        if let Some(ref mut stdin) = entry.stdin_handle {
+            use tokio::io::AsyncWriteExt;
+            match tokio::time::timeout(Duration::from_secs(5), async {
+                stdin.write_all(input.as_bytes()).await?;
+                stdin.flush().await
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Response::err(&req.id, format!("write to stdin failed: {e}")),
+                Err(_) => {
+                    return Response::err(&req.id, "write to stdin timed out (pipe buffer full?)")
+                }
+            }
+        } else {
+            return Response::err(&req.id, format!("no stdin handle for '{}'", args.name));
+        }
+
+        (stdout_rx, stderr_rx)
+    };
+    // Lock released — now collect output
+
+    let prompt_lower = args.prompt.as_ref().map(|p| p.to_lowercase());
+    let mut lines: Vec<String> = Vec::new();
+    let mut matched_prompt = false;
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let idle_sleep = tokio::time::sleep(idle_timeout);
+        let overall_sleep = tokio::time::sleep_until(deadline);
+
+        tokio::select! {
+            result = stdout_rx.recv() => {
+                match result {
+                    Ok(log_line) => {
+                        if !log_line.stream.is_probe() {
+                            let content = log_line.content.clone();
+                            if let Some(ref pat) = prompt_lower {
+                                if content.to_lowercase().contains(pat) {
+                                    matched_prompt = true;
+                                    lines.push(content);
+                                    break;
+                                }
+                            }
+                            lines.push(content);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            result = stderr_rx.recv() => {
+                match result {
+                    Ok(log_line) => {
+                        if !log_line.stream.is_probe() {
+                            let content = log_line.content.clone();
+                            if let Some(ref pat) = prompt_lower {
+                                if content.to_lowercase().contains(pat) {
+                                    matched_prompt = true;
+                                    lines.push(content);
+                                    break;
+                                }
+                            }
+                            lines.push(content);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            _ = idle_sleep => {
+                // No output for idle_timeout — done
+                break;
+            }
+            _ = overall_sleep => {
+                // Overall timeout — done
+                break;
+            }
+        }
+    }
+
+    Response::ok(
+        &req.id,
+        Some(serde_json::json!({
+            "name": args.name,
+            "lines": lines,
+            "matched_prompt": matched_prompt,
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------

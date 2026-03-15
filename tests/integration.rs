@@ -2567,8 +2567,8 @@ fn test_version() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "version should succeed");
     assert!(
-        stdout.contains("1.3.0"),
-        "version should show 1.3.0, got: {stdout}"
+        stdout.contains("1.4.0"),
+        "version should show 1.4.0, got: {stdout}"
     );
 }
 
@@ -2680,5 +2680,149 @@ fn test_psyfile_schema_has_interactive() {
     assert!(
         stdout.contains("interactive"),
         "schema should include interactive field, got: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// send --wait tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_send_wait_basic() {
+    // Send to cat with --wait, verify echoed output is returned
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let cat_cmd = vec!["run", "--interactive", "waitcat", "--", "cat"];
+    root.psy(&cat_cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    let out = root.psy(&["send", "--wait", "waitcat", "hello-wait"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "send --wait should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("hello-wait"),
+        "send --wait should return echoed output, got: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_wait_prompt() {
+    // Process outputs a prompt pattern, verify early return.
+    // Uses Python for cross-platform compatibility (available on all CI runners).
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let py_script = vec![
+        "run",
+        "--interactive",
+        "promptproc",
+        "--",
+        "python3",
+        "-u",
+        "-c",
+        "import sys\nfor line in sys.stdin:\n    print('result: ' + line.strip(), flush=True)\n    print('PROMPT>', flush=True)",
+    ];
+
+    #[cfg(windows)]
+    let py_script = vec![
+        "run",
+        "--interactive",
+        "promptproc",
+        "--",
+        "python",
+        "-u",
+        "-c",
+        "import sys\nfor line in sys.stdin:\n    print('result: ' + line.strip(), flush=True)\n    print('PROMPT>', flush=True)",
+    ];
+
+    root.psy(&py_script);
+    thread::sleep(Duration::from_secs(2));
+
+    let out = root.psy(&[
+        "send",
+        "--wait",
+        "--wait-prompt",
+        "PROMPT>",
+        "promptproc",
+        "test-input",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "send --wait with prompt should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("result: test-input"),
+        "should contain result, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("PROMPT>"),
+        "should contain prompt, got: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_wait_timeout() {
+    // Process that doesn't produce output — verify timeout returns partial
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // cat will echo but then wait indefinitely for more input
+    let cat_cmd = vec!["run", "--interactive", "waitcat2", "--", "cat"];
+    root.psy(&cat_cmd);
+    thread::sleep(Duration::from_secs(1));
+
+    // Use a short timeout so the test completes quickly
+    let out = root.psy(&[
+        "send",
+        "--wait",
+        "--wait-timeout",
+        "1s",
+        "--idle-timeout",
+        "300ms",
+        "waitcat2",
+        "timeout-test",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "send --wait should succeed even on timeout"
+    );
+    assert!(
+        stdout.contains("timeout-test"),
+        "should have partial output, got: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_send_wait_non_interactive_error() {
+    // send --wait to non-interactive process should error
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let long_sl = sleep_cmd(999);
+    let long_refs = to_refs(&long_sl);
+    let mut run_args = vec!["run", "nointeract2", "--"];
+    run_args.extend(long_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_millis(500));
+
+    let out = root.psy(&["send", "--wait", "nointeract2", "test"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !out.status.success() || combined.to_lowercase().contains("interactive"),
+        "send --wait to non-interactive should error, got: {combined}"
     );
 }

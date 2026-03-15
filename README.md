@@ -77,6 +77,7 @@ psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child proces
 psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
 psy run --interactive <name> [-- <cmd>]            Launch with writable stdin pipe
 psy send <name> "text"                              Write text to a process's stdin
+psy send --wait <name> "text"                       Send and wait for output
 psy send --raw <name> "text"                        Write without appending newline
 psy send --eof <name>                               Close a process's stdin
 psy send --file <path> <name>                       Pipe file contents to stdin
@@ -203,6 +204,28 @@ Design notes:
 - If the pipe buffer is full, `psy send` blocks for up to 5 seconds before returning a backpressure error
 - Sending to a process that was not started with `--interactive` (or `interactive = true` in Psyfile) returns an error
 
+### Blocking send (`--wait`)
+
+For REPL-like interactions (psql, python, debuggers), `--wait` sends input and collects output in a single call — no need for a sleep-then-logs dance:
+
+```bash
+# Send a command and get the output back
+psy send --wait myrepl "SELECT 1;"
+
+# With prompt detection (returns as soon as the prompt appears)
+psy send --wait --wait-prompt ">>>" myrepl "print(2+2)"
+
+# Custom timeouts
+psy send --wait --wait-timeout 10s --idle-timeout 500ms myrepl "slow_query()"
+```
+
+Options:
+- `--wait-timeout` (default `5s`) — overall timeout; returns collected output when reached
+- `--idle-timeout` (default `200ms`) — stop collecting after this long with no new output
+- `--wait-prompt` — return early when output contains this substring (case-insensitive)
+
+Durations support `ms`, `s`, `m`, and `h` suffixes (e.g. `200ms`, `5s`, `2m`).
+
 ## MCP Integration
 
 psy includes a built-in MCP server. Configure `psy mcp` as an MCP server in your agent's config — it inherits `PSY_SOCK` from the psy session and relays tool calls to the root:
@@ -212,7 +235,7 @@ psy up -- claude
 # Claude's MCP config launches "psy mcp" → connects back to the root via PSY_SOCK
 ```
 
-Tools exposed: `psy_run` (with `interactive` param), `psy_ps`, `psy_logs`, `psy_send`, `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
+Tools exposed: `psy_run` (with `interactive` param), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
 
 ## Psyfile
 

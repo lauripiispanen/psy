@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::protocol::{
     HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
-    RunArgs, SendArgs, StopArgs, StreamFilter,
+    RunArgs, SendArgs, SendWaitArgs, StopArgs, StreamFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -169,6 +169,11 @@ fn tool_schemas() -> Value {
                         "probe": {
                             "type": "boolean",
                             "description": "Show probe logs instead of process output (default: false)"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["lines", "structured"],
+                            "description": "Output format: 'lines' returns plain text (default), 'structured' returns JSON objects with timestamp/stream/content"
                         }
                     },
                     "required": ["name"]
@@ -218,7 +223,7 @@ fn tool_schemas() -> Value {
             },
             {
                 "name": "psy_send",
-                "description": "Write to a process's stdin (must be started with interactive mode)",
+                "description": "Write to a process's stdin (must be started with interactive mode). Use wait: true to block until output is collected (ideal for REPL interactions).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -233,6 +238,22 @@ fn tool_schemas() -> Value {
                         "eof": {
                             "type": "boolean",
                             "description": "Close stdin (for programs that read to EOF)"
+                        },
+                        "wait": {
+                            "type": "boolean",
+                            "description": "Wait for output after sending and return collected lines (default: false)"
+                        },
+                        "wait_timeout": {
+                            "type": "string",
+                            "description": "Overall timeout for wait mode (e.g. '5s', '200ms'). Default: '5s'"
+                        },
+                        "idle_timeout": {
+                            "type": "string",
+                            "description": "Idle timeout — stop collecting after this long with no new output (e.g. '200ms'). Default: '200ms'"
+                        },
+                        "wait_prompt": {
+                            "type": "string",
+                            "description": "Return early when output contains this substring (case-insensitive)"
                         }
                     },
                     "required": ["name"]
@@ -371,6 +392,10 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let probe = args.get("probe").and_then(|v| v.as_bool()).unwrap_or(false);
+            let format = args
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("lines");
             let req = Request::logs(LogsArgs {
                 name,
                 tail,
@@ -384,10 +409,29 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
-                let text = resp
-                    .data
-                    .map(|d| serde_json::to_string_pretty(&d).unwrap_or_default())
-                    .unwrap_or_else(|| "(no output)".into());
+                let text = match format {
+                    "structured" => resp
+                        .data
+                        .map(|d| serde_json::to_string_pretty(&d).unwrap_or_default())
+                        .unwrap_or_else(|| "(no output)".into()),
+                    _ => {
+                        // "lines" format: extract content from each log line
+                        resp.data
+                            .and_then(|d| d.get("lines").cloned())
+                            .and_then(|v| v.as_array().cloned())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|line| {
+                                        line.get("content")
+                                            .and_then(|c| c.as_str())
+                                            .map(String::from)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_else(|| "(no output)".into())
+                    }
+                };
                 Ok(json!({ "type": "text", "text": text }))
             } else {
                 Err(resp.error.unwrap_or_else(|| "unknown error".into()))
@@ -454,26 +498,74 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_str())
                 .ok_or("missing required parameter: name")?
                 .to_string();
-            let eof = args.get("eof").and_then(|v| v.as_bool()).unwrap_or(false);
-            let input = if eof {
-                None
-            } else {
-                let text = args
+            let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if wait {
+                let input = args
                     .get("input")
                     .and_then(|v| v.as_str())
-                    .ok_or("missing required parameter: input (or set eof: true)")?;
-                // Auto-append newline like CLI does
-                Some(format!("{text}\n"))
-            };
-            let req = Request::send(SendArgs { name, input, eof });
-            let resp = client::send_command(req).map_err(|e| e.to_string())?;
-            if resp.ok {
-                Ok(json!({
-                    "type": "text",
-                    "text": serde_json::to_string_pretty(&resp.data).unwrap_or_default()
-                }))
+                    .ok_or("missing required parameter: input (required for wait mode)")?
+                    .to_string();
+                let timeout = args
+                    .get("wait_timeout")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let idle_timeout = args
+                    .get("idle_timeout")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let prompt = args
+                    .get("wait_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let req = Request::send_wait(SendWaitArgs {
+                    name,
+                    input,
+                    timeout,
+                    idle_timeout,
+                    prompt,
+                });
+                let resp = client::send_command(req).map_err(|e| e.to_string())?;
+                if resp.ok {
+                    // Return lines as plain text
+                    let text = resp
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("lines"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    Ok(json!({ "type": "text", "text": text }))
+                } else {
+                    Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+                }
             } else {
-                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+                let eof = args.get("eof").and_then(|v| v.as_bool()).unwrap_or(false);
+                let input = if eof {
+                    None
+                } else {
+                    let text = args
+                        .get("input")
+                        .and_then(|v| v.as_str())
+                        .ok_or("missing required parameter: input (or set eof: true)")?;
+                    // Auto-append newline like CLI does
+                    Some(format!("{text}\n"))
+                };
+                let req = Request::send(SendArgs { name, input, eof });
+                let resp = client::send_command(req).map_err(|e| e.to_string())?;
+                if resp.ok {
+                    Ok(json!({
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&resp.data).unwrap_or_default()
+                    }))
+                } else {
+                    Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+                }
             }
         }
 

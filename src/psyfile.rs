@@ -559,6 +559,13 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     if s.is_empty() {
         return Err("empty duration string".into());
     }
+    // Check for 2-char "ms" suffix first
+    if let Some(num_str) = s.strip_suffix("ms") {
+        let num: u64 = num_str.parse().map_err(|_| {
+            format!("invalid duration '{s}': expected format like '200ms', '1s', '5m', '2h'")
+        })?;
+        return Ok(Duration::from_millis(num));
+    }
     let (num_str, suffix) = s.split_at(s.len() - 1);
     let num: u64 = num_str
         .parse()
@@ -568,7 +575,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         "m" => Ok(Duration::from_secs(num * 60)),
         "h" => Ok(Duration::from_secs(num * 3600)),
         _ => Err(format!(
-            "invalid duration suffix '{suffix}' in '{s}': expected 's', 'm', or 'h'"
+            "invalid duration suffix '{suffix}' in '{s}': expected 'ms', 's', 'm', or 'h'"
         )),
     }
 }
@@ -1681,6 +1688,16 @@ healthcheck = { http = "http://localhost:8080/health", interval = "15s" }
     #[test]
     fn duration_hours() {
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn duration_milliseconds() {
+        assert_eq!(parse_duration("200ms").unwrap(), Duration::from_millis(200));
+        assert_eq!(parse_duration("0ms").unwrap(), Duration::from_millis(0));
+        assert_eq!(
+            parse_duration("1500ms").unwrap(),
+            Duration::from_millis(1500)
+        );
     }
 
     #[test]
