@@ -40,6 +40,8 @@ pub struct SharedRoot {
     /// Working directory at startup, used for Psyfile discovery.
     pub cwd: PathBuf,
     pub template_counters: Mutex<HashMap<String, u32>>,
+    /// Per-process "last viewed" timestamp for `--since last` support.
+    pub logs_markers: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl SharedRoot {
@@ -113,6 +115,7 @@ impl PsyRoot {
             psyfile_path,
             cwd: std::env::current_dir().unwrap_or_default(),
             template_counters: Mutex::new(HashMap::new()),
+            logs_markers: Mutex::new(HashMap::new()),
         });
 
         Ok(Self {
@@ -708,14 +711,23 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
         };
     }
 
-    let since = args
-        .since
-        .as_deref()
-        .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&chrono::Utc)))
-        .transpose();
-    let since = match since {
-        Ok(s) => s,
-        Err(e) => return Response::err(&req.id, format!("invalid since timestamp: {e}")),
+    // Resolve "last" marker: substitute with the stored timestamp for this process.
+    let is_last_marker = args.since.as_deref() == Some("last");
+    let since = if is_last_marker {
+        let markers = root.logs_markers.lock().await;
+        markers.get(&args.name).copied()
+    } else {
+        let parsed = args
+            .since
+            .as_deref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&chrono::Utc))
+            })
+            .transpose();
+        match parsed {
+            Ok(s) => s,
+            Err(e) => return Response::err(&req.id, format!("invalid since timestamp: {e}")),
+        }
     };
 
     let until = args
@@ -778,6 +790,12 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
             })
             .collect();
 
+        // Update "last" marker for this process
+        {
+            let mut markers = root.logs_markers.lock().await;
+            markers.insert(args.name.clone(), chrono::Utc::now());
+        }
+
         return Response::ok(&req.id, Some(serde_json::json!({ "lines": lines_json })));
     }
 
@@ -834,6 +852,12 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
             })
         })
         .collect();
+
+    // Update "last" marker for this process
+    {
+        let mut markers = root.logs_markers.lock().await;
+        markers.insert(args.name.clone(), chrono::Utc::now());
+    }
 
     Response::ok(&req.id, Some(serde_json::json!({ "lines": lines_json })))
 }

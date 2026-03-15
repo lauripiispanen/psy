@@ -2566,9 +2566,10 @@ fn test_version() {
         .expect("failed to run version");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "version should succeed");
+    let expected_version = env!("CARGO_PKG_VERSION");
     assert!(
-        stdout.contains("1.4.0"),
-        "version should show 1.4.0, got: {stdout}"
+        stdout.contains(expected_version),
+        "version should show {expected_version}, got: {stdout}"
     );
 }
 
@@ -2824,5 +2825,86 @@ fn test_send_wait_non_interactive_error() {
     assert!(
         !out.status.success() || combined.to_lowercase().contains("interactive"),
         "send --wait to non-interactive should error, got: {combined}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Logs --since last
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_logs_since_last() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    // Start an interactive process so we can control when output appears
+    let cat = sh_c("cat");
+    let cat_refs = to_refs(&cat);
+    let mut run_args = vec!["run", "lastproc", "--interactive", "--"];
+    run_args.extend(cat_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_millis(500));
+
+    // Send first line
+    root.psy(&["send", "lastproc", "line-one"]);
+    thread::sleep(Duration::from_millis(300));
+
+    // First logs call — should see line-one, sets marker
+    let logs1 = root.psy_stdout(&["logs", "lastproc"]);
+    assert!(
+        logs1.contains("line-one"),
+        "first logs should contain line-one, got: {logs1}"
+    );
+
+    // Send second line
+    root.psy(&["send", "lastproc", "line-two"]);
+    thread::sleep(Duration::from_millis(300));
+
+    // Logs --since last — should see line-two but not line-one
+    let logs2 = root.psy_stdout(&["logs", "lastproc", "--since", "last"]);
+    assert!(
+        logs2.contains("line-two"),
+        "logs --since last should contain line-two, got: {logs2}"
+    );
+    assert!(
+        !logs2.contains("line-one"),
+        "logs --since last should NOT contain line-one, got: {logs2}"
+    );
+
+    // Send third line
+    root.psy(&["send", "lastproc", "line-three"]);
+    thread::sleep(Duration::from_millis(300));
+
+    // Logs --since last again — should see line-three but not line-two
+    let logs3 = root.psy_stdout(&["logs", "lastproc", "--since", "last"]);
+    assert!(
+        logs3.contains("line-three"),
+        "second --since last should contain line-three, got: {logs3}"
+    );
+    assert!(
+        !logs3.contains("line-two"),
+        "second --since last should NOT contain line-two, got: {logs3}"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_logs_since_last_first_use() {
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    let echo = sh_c("echo hello-last");
+    let echo_refs = to_refs(&echo);
+    let mut run_args = vec!["run", "lastfirst", "--"];
+    run_args.extend(echo_refs);
+    root.psy(&run_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // First ever --since last with no prior marker — should return all logs
+    let logs = root.psy_stdout(&["logs", "lastfirst", "--since", "last"]);
+    assert!(
+        logs.contains("hello-last"),
+        "first --since last should return all logs, got: {logs}"
     );
 }

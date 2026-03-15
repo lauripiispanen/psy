@@ -125,7 +125,7 @@ enum Commands {
         /// Show only stderr
         #[arg(long)]
         stderr: bool,
-        /// Show logs since time (e.g. 5m, 1h, 2026-03-12T20:00:00Z)
+        /// Show logs since time (e.g. 5m, 1h, 2026-03-12T20:00:00Z, or "last")
         #[arg(long)]
         since: Option<String>,
         /// Show logs until time (e.g. 1m, 2026-03-12T21:00:00Z)
@@ -541,22 +541,28 @@ command = "echo 'hello world'"
                 StreamFilter::All
             };
 
-            // Parse time specs on the client side, send absolute timestamps
-            let since_abs = since.map(|s| {
-                parse_time_spec(&s).unwrap_or_else(|e| {
-                    eprintln!("error: invalid --since: {e}");
-                    std::process::exit(1);
-                })
+            // Parse time specs on the client side, send absolute timestamps.
+            // Special case: "last" is passed through as-is for the root to resolve.
+            let since_str = since.map(|s| {
+                if s == "last" {
+                    s
+                } else {
+                    parse_time_spec(&s)
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: invalid --since: {e}");
+                            std::process::exit(1);
+                        })
+                        .to_rfc3339()
+                }
             });
-            let until_abs = until.map(|s| {
-                parse_time_spec(&s).unwrap_or_else(|e| {
-                    eprintln!("error: invalid --until: {e}");
-                    std::process::exit(1);
-                })
+            let until_str = until.map(|s| {
+                parse_time_spec(&s)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: invalid --until: {e}");
+                        std::process::exit(1);
+                    })
+                    .to_rfc3339()
             });
-
-            let since_str = since_abs.map(|t| t.to_rfc3339());
-            let until_str = until_abs.map(|t| t.to_rfc3339());
 
             if follow {
                 if let Err(e) = client::follow_logs(&name, stream, since_str.clone(), grep.clone())

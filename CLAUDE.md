@@ -90,6 +90,7 @@ psy/
 - [x] `psy logs -f` — follow mode (stream until Ctrl-C)
 - [x] `psy logs --stdout / --stderr` — filter by stream
 - [x] `psy logs --since` / `--until` — time-based log filtering (relative or RFC 3339)
+- [x] `psy logs --since last` — show logs since last viewed, per-process marker
 - [x] `psy logs --grep` — case-insensitive substring filtering
 - [x] `psy logs --run <id>` — view logs from a specific run
 - [x] `psy logs --previous` — view logs from the run before current
@@ -157,6 +158,7 @@ psy/
 - [x] `psy_send` tool — write to process stdin (interactive mode)
 - [x] `psy_send` tool — `wait` parameter for blocking send with output collection
 - [x] `psy_logs` tool — `format` parameter: `lines` (default, compact) or `structured` (JSON objects)
+- [x] `psy_logs` tool — `since: "last"` for incremental log viewing
 - [x] `psy_run` tool — `interactive` parameter for stdin pipe
 - [x] Connect to root via `PSY_SOCK` internally
 
@@ -316,6 +318,8 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Psyfile unknown field error
 - [x] Template group restart
 - [x] Multiple restarts preserve history
+- [x] `psy logs --since last`: incremental log viewing with marker
+- [x] `psy logs --since last`: first use returns all logs
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

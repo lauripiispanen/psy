@@ -125,6 +125,7 @@ psy logs server --stdout           # stdout only
 psy logs server --stderr           # stderr only
 psy logs server --since 5m         # last 5 minutes
 psy logs server --since 1h         # last hour
+psy logs server --since last       # only new logs since last request
 psy logs server --until 2026-03-12T20:00:00Z
 psy logs server --grep "error"     # case-insensitive filter
 psy logs server -f --grep "WARN"   # follow with filter
@@ -235,7 +236,7 @@ psy up -- claude
 # Claude's MCP config launches "psy mcp" → connects back to the root via PSY_SOCK
 ```
 
-Tools exposed: `psy_run` (with `interactive` param), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
+Tools exposed: `psy_run` (with `interactive` param), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`, `since: "last"` for incremental viewing), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
 
 ## Psyfile
 

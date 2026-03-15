@@ -148,7 +148,7 @@ fn tool_schemas() -> Value {
                         },
                         "since": {
                             "type": "string",
-                            "description": "Show logs since this RFC 3339 timestamp (e.g. 2026-03-12T20:00:00Z)"
+                            "description": "Show logs since this RFC 3339 timestamp (e.g. 2026-03-12T20:00:00Z), or 'last' to show only new logs since the previous logs request"
                         },
                         "until": {
                             "type": "string",
