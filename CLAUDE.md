@@ -283,6 +283,23 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Steps: checkout, install Rust toolchain, cargo build, cargo test, cargo test --ignored (integration)
 - [x] Platform-specific test adaptations (sh vs cmd, signal vs terminate)
 
+## Release Checklist
+
+Before tagging a release:
+
+1. **Check for uncommitted changes:** `git status` — everything that should be committed must be committed before pushing/tagging
+2. **Version bump:** Update `version` in `Cargo.toml` to match the release tag
+3. **Formatting:** `cargo fmt -- --check` — must pass with no diffs
+4. **Linting:** `cargo clippy -- -D warnings` — must pass with no warnings
+5. **Unit tests:** `cargo test` — all must pass
+6. **Integration tests:** `cargo build && cargo test -- --ignored` — all must pass
+7. **README.md:** Must document all user-facing features for the release. Check new CLI commands, Psyfile fields, MCP tools, and behavioral changes are covered
+8. **CLAUDE.md:** Implementation status checkboxes must be up-to-date
+9. **CI:** Push to main first, verify GitHub Actions pass on all platforms (Linux, macOS, Windows) before tagging
+10. **Tag:** `git tag vX.Y.Z && git push origin vX.Y.Z`
+
+**Important:** Never amend a commit after it has been tagged as a release. All checks above must pass *before* tagging. If something was missed, make a new commit (and a patch release if needed).
+
 ## Conventions
 
 - Async runtime: tokio
