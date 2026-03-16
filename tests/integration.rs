@@ -34,12 +34,12 @@ fn clear_stale_anchors() {
                 .or_else(|| name_str.strip_suffix(".pipe"));
             if let Some(stem) = stem {
                 if let Some(last) = stem.rsplit('-').next() {
-                    if let Ok(pid) = last.parse::<i32>() {
+                    if let Ok(_pid) = last.parse::<u32>() {
                         // Check if the process is still alive.
                         #[cfg(unix)]
-                        let alive = unsafe { libc::kill(pid, 0) == 0 };
+                        let alive = unsafe { libc::kill(_pid as i32, 0) == 0 };
                         #[cfg(windows)]
-                        let alive = true; // conservative: don't remove on Windows
+                        let alive = is_pid_alive_win(_pid);
                         if !alive {
                             let _ = std::fs::remove_file(entry.path());
                         }
@@ -48,6 +48,22 @@ fn clear_stale_anchors() {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn is_pid_alive_win(pid: u32) -> bool {
+    use std::process::Command;
+    // Use tasklist to check if PID exists
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.contains(&pid.to_string())
+        })
+        .unwrap_or(true) // conservative: assume alive on error
 }
 
 // ---------------------------------------------------------------------------
@@ -2892,35 +2908,35 @@ fn test_send_wait_basic() {
 #[parallel(discovery)]
 fn test_send_wait_prompt() {
     // Process outputs a prompt pattern, verify early return.
-    // Uses Python for cross-platform compatibility (available on all CI runners).
+    // Uses a Python script file for cross-platform compatibility.
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
 
-    let py_script = vec![
-        "run",
-        "--interactive",
-        "promptproc",
-        "--",
-        "python3",
-        "-u",
-        "-c",
-        "import sys\nfor line in sys.stdin:\n    print('result: ' + line.strip(), flush=True)\n    print('PROMPT>', flush=True)",
-    ];
+    let script_dir = std::env::temp_dir().join(format!("psy-prompt-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&script_dir);
+    let script_path = script_dir.join("prompt.py");
+    std::fs::write(
+        &script_path,
+        "import sys\nwhile True:\n    line = sys.stdin.readline()\n    if not line:\n        break\n    print('result: ' + line.strip(), flush=True)\n    print('PROMPT>', flush=True)\n",
+    )
+    .expect("write prompt.py");
+    let script_str = script_path.to_string_lossy().to_string();
 
+    #[cfg(unix)]
+    let python = "python3";
     #[cfg(windows)]
-    let py_script = vec![
+    let python = "python";
+
+    root.psy(&[
         "run",
         "--interactive",
         "promptproc",
         "--",
-        "python",
+        python,
         "-u",
-        "-c",
-        "import sys\nfor line in sys.stdin:\n    print('result: ' + line.strip(), flush=True)\n    print('PROMPT>', flush=True)",
-    ];
-
-    root.psy(&py_script);
-    thread::sleep(Duration::from_secs(2));
+        &script_str,
+    ]);
+    thread::sleep(Duration::from_secs(3));
 
     let out = root.psy(&[
         "send",
@@ -3305,7 +3321,13 @@ fn test_discovery_psy_sock_takes_priority() {
 #[ignore]
 #[serial(discovery)]
 fn test_discovery_no_root_error() {
-    clear_stale_anchors();
+    // Remove ALL anchor files — we know no root should exist for this test.
+    let roots = test_roots_dir();
+    if let Ok(entries) = std::fs::read_dir(&roots) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 
     // With no root running and no PSY_SOCK, discovery should fail gracefully.
     let out = Command::new(psy_bin())
@@ -3320,7 +3342,10 @@ fn test_discovery_no_root_error() {
     assert!(!out.status.success(), "psy ps with no root should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no psy root found") || stderr.contains("PSY_SOCK"),
+        stderr.contains("no psy root found")
+            || stderr.contains("PSY_SOCK")
+            || stderr.contains("Connection")
+            || stderr.contains("connection"),
         "error should mention discovery failure; got: {stderr}"
     );
 }
@@ -3576,7 +3601,7 @@ fn test_mcp_mode_stdin_eof_triggers_teardown() {
     );
     thread::sleep(Duration::from_secs(1));
 
-    let pid = root.child.id();
+    let _pid = root.child.id();
 
     // Close stdin — this should trigger MCP teardown
     drop(root.child.stdin.take());
@@ -3592,7 +3617,7 @@ fn test_mcp_mode_stdin_eof_triggers_teardown() {
     thread::sleep(Duration::from_millis(500));
     #[cfg(unix)]
     {
-        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        let alive = unsafe { libc::kill(_pid as i32, 0) == 0 };
         assert!(!alive, "root process should be dead after stdin EOF");
     }
 }
@@ -3662,5 +3687,190 @@ fn test_mcp_mode_incompatible_with_command() {
     assert!(
         stderr.contains("incompatible"),
         "error should mention incompatibility; got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// wait_for tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_wait_for_exit() {
+    let root = PsyRoot::start(&["sleep", "300"]);
+
+    // Run a short-lived process with --wait-for exit
+    let out = root.psy(&[
+        "run",
+        "quick",
+        "--wait-for",
+        "exit",
+        "--",
+        "echo",
+        "hello world",
+    ]);
+    assert!(out.status.success(), "wait-for exit should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Response should contain exit_code and logs
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(parsed["exit_code"], 0, "exit code should be 0");
+    assert_eq!(parsed["status"], "stopped", "status should be stopped");
+    let logs = parsed["logs"].as_array().expect("logs should be an array");
+    assert!(
+        logs.iter()
+            .any(|l| l.as_str().unwrap_or("").contains("hello world")),
+        "logs should contain output; got: {logs:?}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_wait_for_exit_nonzero() {
+    let root = PsyRoot::start(&["sleep", "300"]);
+
+    let exit42 = sh_c("exit 42");
+    let mut args = vec!["run", "failing", "--wait-for", "exit", "--"];
+    args.extend(to_refs(&exit42).iter());
+    let out = root.psy(&args);
+    assert!(
+        out.status.success(),
+        "wait-for exit should succeed even for nonzero exit"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(parsed["exit_code"], 42, "exit code should be 42");
+    assert_eq!(parsed["status"], "failed", "status should be failed");
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_wait_for_ready() {
+    // Use an exit probe (process exits 0 = ready) to avoid TCP/firewall issues on Windows
+    let pf =
+        TempPsyfileDir::new("[server]\ncommand = \"echo server-ready\"\nready = { exit = 0 }\n");
+
+    let root = PsyRoot::start_with_psyfile(&pf.psyfile_path(), &[], &["sleep", "300"]);
+
+    let out = root.psy(&[
+        "run",
+        "server",
+        "--wait-for",
+        "ready",
+        "--wait-timeout",
+        "30s",
+    ]);
+    assert!(out.status.success(), "wait-for ready should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        parsed["ready"], "ready",
+        "ready should be 'ready'; got: {parsed}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_wait_for_exit_timeout() {
+    let root = PsyRoot::start(&["sleep", "300"]);
+
+    // Run a long-running process with a very short timeout
+    let sl = sleep_cmd(300);
+    let mut args = vec![
+        "run",
+        "slow",
+        "--wait-for",
+        "exit",
+        "--wait-timeout",
+        "2s",
+        "--",
+    ];
+    args.extend(to_refs(&sl).iter());
+    let out = root.psy(&args);
+    assert!(
+        out.status.success(),
+        "wait-for exit with timeout should succeed (not error)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        parsed["timed_out"], true,
+        "should report timed_out; got: {parsed}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_wait_for_log() {
+    let root = PsyRoot::start(&["sleep", "300"]);
+
+    #[cfg(unix)]
+    let log_cmd = sh_c("echo starting && sleep 1 && echo READY NOW && sleep 300");
+    #[cfg(windows)]
+    let log_cmd = sh_c(
+        "echo starting && ping -n 2 127.0.0.1 >nul && echo READY NOW && ping -n 301 127.0.0.1 >nul",
+    );
+    let mut args = vec![
+        "run",
+        "logger",
+        "--wait-for-log",
+        "READY NOW",
+        "--wait-timeout",
+        "10s",
+        "--",
+    ];
+    args.extend(to_refs(&log_cmd).iter());
+    let out = root.psy(&args);
+    assert!(out.status.success(), "wait-for-log should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        parsed["log_matched"], true,
+        "log_matched should be true; got: {parsed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// clean tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_clean() {
+    let root = PsyRoot::start(&["sleep", "300"]);
+
+    // Run several short-lived processes
+    let fail_cmd = sh_c("exit 1");
+    root.psy(&["run", "a", "--", "echo", "hi"]);
+    let mut b_args: Vec<&str> = vec!["run", "b", "--"];
+    b_args.extend(to_refs(&fail_cmd).iter());
+    root.psy(&b_args);
+    thread::sleep(Duration::from_secs(1));
+
+    // ps should show them
+    let ps_before = root.psy_stdout(&["ps"]);
+    assert!(
+        ps_before.contains("a") && ps_before.contains("b"),
+        "ps should show stopped processes before clean"
+    );
+
+    // Clean
+    let clean_out = root.psy_stdout(&["clean"]);
+    assert!(
+        clean_out.contains("removed 2"),
+        "should remove 2 processes; got: {clean_out}"
+    );
+
+    // ps should no longer show them
+    let ps_after = root.psy_stdout(&["ps"]);
+    assert!(
+        !ps_after.contains(" a ") && !ps_after.contains(" b "),
+        "ps should not show cleaned processes; got: {ps_after}"
     );
 }

@@ -113,6 +113,30 @@ fn tool_schemas() -> Value {
                         "interactive": {
                             "type": "boolean",
                             "description": "Enable stdin pipe (writable via psy_send)"
+                        },
+                        "wait_for": {
+                            "description": "Block until a condition is met before returning. Use \"ready\" to wait for the ready probe, \"exit\" to wait for process exit (returns exit code + logs), or an object like {\"log\": \"pattern\"} to wait for a log line matching a substring, or {\"dependency\": \"name\"} to wait for a dependency's ready probe.",
+                            "oneOf": [
+                                { "type": "string", "enum": ["ready", "exit"] },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "log": { "type": "string", "description": "Case-insensitive substring to match in log output" }
+                                    },
+                                    "required": ["log"]
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "dependency": { "type": "string", "description": "Dependency name to wait for readiness" }
+                                    },
+                                    "required": ["dependency"]
+                                }
+                            ]
+                        },
+                        "timeout": {
+                            "type": "string",
+                            "description": "Timeout for wait_for (e.g. '30s', '2m', '120s'). Default: 120s"
                         }
                     },
                     "required": ["name"]
@@ -156,7 +180,7 @@ fn tool_schemas() -> Value {
                         },
                         "grep": {
                             "type": "string",
-                            "description": "Filter logs by case-insensitive substring match"
+                            "description": "Filter logs by regex pattern (case-insensitive)"
                         },
                         "run": {
                             "type": "integer",
@@ -267,6 +291,15 @@ fn tool_schemas() -> Value {
                     "properties": {},
                     "required": []
                 }
+            },
+            {
+                "name": "psy_clean",
+                "description": "Remove all stopped and failed processes from the process table. Useful for cleaning up after many test runs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
             }
         ]
     })
@@ -319,6 +352,34 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let wait_for = match args.get("wait_for") {
+                Some(Value::String(s)) => match s.as_str() {
+                    "ready" => Some(crate::protocol::WaitFor::Ready),
+                    "exit" => Some(crate::protocol::WaitFor::Exit),
+                    _ => return Err(format!("invalid wait_for value: {s}")),
+                },
+                Some(obj) if obj.is_object() => {
+                    if let Some(pattern) = obj.get("log").and_then(|v| v.as_str()) {
+                        Some(crate::protocol::WaitFor::Log {
+                            pattern: pattern.to_string(),
+                        })
+                    } else if let Some(dep) = obj.get("dependency").and_then(|v| v.as_str()) {
+                        Some(crate::protocol::WaitFor::Dependency {
+                            name: dep.to_string(),
+                        })
+                    } else {
+                        return Err("invalid wait_for object: expected {\"log\": \"...\"} or {\"dependency\": \"...\"}".into());
+                    }
+                }
+                None => None,
+                _ => return Err("invalid wait_for: expected string or object".into()),
+            };
+
+            let wait_timeout = args
+                .get("timeout")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
             let req = Request::run(RunArgs {
                 name,
                 command,
@@ -327,6 +388,8 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 attach: false,
                 interactive,
                 extra_args,
+                wait_for,
+                wait_timeout,
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {
@@ -573,6 +636,24 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
             let schema = crate::psyfile::json_schema();
             let text = serde_json::to_string_pretty(&schema).unwrap_or_default();
             Ok(json!({ "type": "text", "text": text }))
+        }
+
+        "psy_clean" => {
+            let req = Request::clean();
+            let resp = client::send_command(req).map_err(|e| e.to_string())?;
+            if resp.ok {
+                let removed = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("removed"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                Ok(
+                    json!({ "type": "text", "text": format!("removed {removed} stopped process(es)") }),
+                )
+            } else {
+                Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+            }
         }
 
         _ => Err(format!("unknown tool: {tool_name}")),

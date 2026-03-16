@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -108,7 +109,7 @@ impl Inner {
         filter: StreamFilter,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
-        grep: Option<&str>,
+        grep: Option<&Regex>,
     ) -> Vec<LogLine> {
         let iter = self.buf.iter().filter(|l| {
             // Stream filter
@@ -134,11 +135,9 @@ impl Inner {
                     return false;
                 }
             }
-            // Grep filter (case-insensitive)
-            if let Some(pattern) = grep {
-                if !pattern.is_empty()
-                    && !l.content.to_lowercase().contains(&pattern.to_lowercase())
-                {
+            // Grep filter (regex, case-insensitive)
+            if let Some(re) = grep {
+                if !re.is_match(&l.content) {
                     return false;
                 }
             }
@@ -189,7 +188,7 @@ impl RingBuffer {
         filter: StreamFilter,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
-        grep: Option<&str>,
+        grep: Option<&Regex>,
     ) -> Vec<LogLine> {
         self.inner
             .lock()
@@ -357,7 +356,8 @@ mod tests {
         rb.push(Stream::Stdout, "foo bar".into());
         rb.push(Stream::Stdout, "Hello Again".into());
 
-        let filtered = rb.lines(None, StreamFilter::All, None, None, Some("hello"));
+        let re = Regex::new("(?i)hello").unwrap();
+        let filtered = rb.lines(None, StreamFilter::All, None, None, Some(&re));
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].content, "hello world");
         assert_eq!(filtered[1].content, "Hello Again");
@@ -371,7 +371,8 @@ mod tests {
         rb.push(Stream::Stdout, "match2".into());
         rb.push(Stream::Stdout, "match3".into());
 
-        let filtered = rb.lines(Some(2), StreamFilter::All, None, None, Some("match"));
+        let re = Regex::new("(?i)match").unwrap();
+        let filtered = rb.lines(Some(2), StreamFilter::All, None, None, Some(&re));
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].content, "match2");
         assert_eq!(filtered[1].content, "match3");
@@ -385,8 +386,23 @@ mod tests {
         rb.push(Stream::Stdout, "Error: mixed".into());
         rb.push(Stream::Stdout, "info: ok".into());
 
-        let filtered = rb.lines(None, StreamFilter::All, None, None, Some("error"));
+        let re = Regex::new("(?i)error").unwrap();
+        let filtered = rb.lines(None, StreamFilter::All, None, None, Some(&re));
         assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn grep_regex_syntax() {
+        let rb = RingBuffer::new();
+        rb.push(Stream::Stdout, "error: file not found".into());
+        rb.push(Stream::Stdout, "warning: deprecated".into());
+        rb.push(Stream::Stdout, "error: permission denied".into());
+        rb.push(Stream::Stdout, "info: started".into());
+
+        let re = Regex::new("(?i)error.*denied").unwrap();
+        let filtered = rb.lines(None, StreamFilter::All, None, None, Some(&re));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].content, "error: permission denied");
     }
 
     #[test]

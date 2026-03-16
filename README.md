@@ -77,6 +77,7 @@ psy up --mcp [--all] [units...]                    Start root with MCP server on
 psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child process
 psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
 psy run --interactive <name> [-- <cmd>]            Launch with writable stdin pipe
+psy run --wait-for <cond> <name> [-- <cmd>]        Launch and block until condition met
 psy send <name> "text"                              Write text to a process's stdin
 psy send --wait <name> "text"                       Send and wait for output
 psy send --raw <name> "text"                        Write without appending newline
@@ -87,6 +88,7 @@ psy logs <name> [-f] [--tail <n>] [--probe]         View captured logs
 psy history <name>                                  Show run history
 psy stop <name>                                     Stop a process (SIGTERM → SIGKILL)
 psy restart <name>                                  Restart with same arguments
+psy clean                                           Remove stopped/failed processes
 psy down                                            Tear down everything
 psy psyfile schema                                  Output JSON Schema for Psyfile
 psy psyfile validate [--file <path>]                Validate a Psyfile
@@ -128,7 +130,8 @@ psy logs server --since 5m         # last 5 minutes
 psy logs server --since 1h         # last hour
 psy logs server --since last       # only new logs since last request
 psy logs server --until 2026-03-12T20:00:00Z
-psy logs server --grep "error"     # case-insensitive filter
+psy logs server --grep "error"     # case-insensitive regex filter
+psy logs server --grep "err.*timeout"  # regex pattern
 psy logs server -f --grep "WARN"   # follow with filter
 ```
 
@@ -228,6 +231,37 @@ Options:
 
 Durations support `ms`, `s`, `m`, and `h` suffixes (e.g. `200ms`, `5s`, `2m`).
 
+### Blocking run (`--wait-for`)
+
+Launch a process and block until a condition is met — useful for build steps, migrations, or waiting for services to become ready:
+
+```bash
+# Wait for the ready probe to pass
+psy run --wait-for ready db -- docker run --rm -p 5432:5432 postgres
+
+# Wait for the process to exit (returns exit code + tail logs)
+psy run --wait-for exit migration -- cargo run --bin migrate
+
+# Wait for a log line matching a substring
+psy run --wait-for-log "listening on" server -- cargo run --bin server
+
+# Wait for a dependency's ready probe
+psy run --wait-for-dep db api -- cargo run --bin api
+
+# Custom timeout (default: 120s)
+psy run --wait-for ready --wait-timeout 60s db -- docker run postgres
+```
+
+The response includes enriched status (ready state, exit code, logs) depending on the condition type. If the timeout expires, `timed_out: true` is included along with whatever status was available.
+
+### Cleaning up
+
+Stopped and failed processes remain in the process table as tombstones. To remove them:
+
+```bash
+psy clean    # removes all stopped/failed processes
+```
+
 ## MCP Integration
 
 psy includes a built-in MCP server. The simplest setup is `psy up --mcp` — it starts a psy root with the MCP JSON-RPC server on stdin/stdout, so you can configure it directly as your agent's MCP server:
@@ -249,7 +283,7 @@ psy up -- claude
 # Claude's MCP config launches "psy mcp" → discovers the root automatically
 ```
 
-Tools exposed: `psy_run` (with `interactive` param), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`, `since: "last"` for incremental viewing), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`
+Tools exposed: `psy_run` (with `interactive`, `wait_for` params), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`, `since: "last"` for incremental viewing, `grep` regex filter), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`, `psy_clean`
 
 ## Psyfile
 
@@ -289,6 +323,26 @@ depends_on = ["api"]
 | `healthcheck` | table | none | Continuous health check |
 | `platforms` | array | all | Restrict to specific OSes (`linux`, `macos`, `windows`) |
 | `platform.<os>` | table | none | Per-platform overrides for command, env, restart, etc. |
+
+### Extra arguments
+
+You can pass extra arguments to Psyfile units at runtime. By default they're appended to the command; use `$@` in the command for explicit placement:
+
+```toml
+[test]
+command = "cargo test"
+
+[migrate]
+command = "cargo run --bin migrate -- $@"
+```
+
+```bash
+psy run test -- --release             # → cargo test --release
+psy run migrate -- --dry-run          # → cargo run --bin migrate -- --dry-run
+psy run test                          # no extra args → cargo test
+```
+
+When `$@` is present, it's replaced with the extra args (or removed if none). Without `$@`, args are appended to the end.
 
 ### Readiness probes
 

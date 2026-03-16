@@ -73,6 +73,18 @@ enum Commands {
         /// Enable stdin pipe (writable via psy send)
         #[arg(long)]
         interactive: bool,
+        /// Block until condition is met: ready, exit
+        #[arg(long, value_name = "CONDITION")]
+        wait_for: Option<String>,
+        /// Block until a log line matches this substring (case-insensitive)
+        #[arg(long, value_name = "PATTERN")]
+        wait_for_log: Option<String>,
+        /// Block until a dependency's ready probe passes
+        #[arg(long, value_name = "NAME")]
+        wait_for_dep: Option<String>,
+        /// Timeout for --wait-for (e.g. 30s, 2m). Default: 120s
+        #[arg(long, default_value = "120s")]
+        wait_timeout: String,
         /// Command to run (required for ad-hoc processes, optional for Psyfile units)
         #[arg(last = true)]
         command: Vec<String>,
@@ -134,7 +146,7 @@ enum Commands {
         /// Show logs until time (e.g. 1m, 2026-03-12T21:00:00Z)
         #[arg(long)]
         until: Option<String>,
-        /// Filter logs by substring (case-insensitive)
+        /// Filter logs by regex pattern (case-insensitive)
         #[arg(long)]
         grep: Option<String>,
         /// Show logs from a specific run ID
@@ -162,6 +174,8 @@ enum Commands {
         /// Process name
         name: String,
     },
+    /// Remove stopped and failed processes from the process table
+    Clean,
     /// Shut down the psy root and all managed processes
     Down,
     /// Start MCP JSON-RPC server on stdin/stdout
@@ -377,11 +391,48 @@ command = "echo 'hello world'"
             envs,
             attach,
             interactive,
+            wait_for,
+            wait_for_log,
+            wait_for_dep,
+            wait_timeout,
             command,
         } => {
             let restart_policy = parse_restart_policy(&restart);
             let env = parse_env_args(&envs);
+
+            // Parse wait_for from CLI flags
+            let wait_for_value = if let Some(ref condition) = wait_for {
+                match condition.as_str() {
+                    "ready" => Some(protocol::WaitFor::Ready),
+                    "exit" => Some(protocol::WaitFor::Exit),
+                    other => {
+                        eprintln!(
+                            "error: invalid --wait-for value '{other}', expected 'ready' or 'exit'"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(ref pattern) = wait_for_log {
+                Some(protocol::WaitFor::Log {
+                    pattern: pattern.clone(),
+                })
+            } else {
+                wait_for_dep
+                    .as_ref()
+                    .map(|dep| protocol::WaitFor::Dependency { name: dep.clone() })
+            };
+
+            let wait_timeout_value = if wait_for_value.is_some() {
+                Some(wait_timeout)
+            } else {
+                None
+            };
+
             if attach {
+                if wait_for_value.is_some() {
+                    eprintln!("error: --wait-for is incompatible with --attach");
+                    std::process::exit(1);
+                }
                 if let Err(e) = client::run_attached(&name, command, restart_policy, env) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -402,6 +453,8 @@ command = "echo 'hello world'"
                     attach: false,
                     interactive,
                     extra_args: extra,
+                    wait_for: wait_for_value,
+                    wait_timeout: wait_timeout_value,
                 });
                 send_and_print(req);
             }
@@ -662,6 +715,32 @@ command = "echo 'hello world'"
         Commands::Down => {
             let req = Request::down();
             send_and_print(req);
+        }
+
+        Commands::Clean => {
+            let req = Request::clean();
+            let resp = match client::send_command(req) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if resp.ok {
+                let removed = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("removed"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!("removed {removed} stopped process(es)");
+            } else {
+                eprintln!(
+                    "error: {}",
+                    resp.error.as_deref().unwrap_or("unknown error")
+                );
+                std::process::exit(1);
+            }
         }
     }
 }

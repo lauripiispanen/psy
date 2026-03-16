@@ -84,6 +84,11 @@ psy/
 - [x] `psy run --env KEY=VAL` — extra env vars
 - [x] `psy run --attach` — connect terminal stdin/stdout to child
 - [x] `psy run --interactive` — enable stdin pipe (writable via psy send)
+- [x] `psy run --wait-for <cond>` — block until ready/exit/log/dependency condition met
+- [x] `psy run --wait-for-log <pattern>` — block until log line matches substring
+- [x] `psy run --wait-for-dep <name>` — block until dependency's ready probe passes
+- [x] `psy run --wait-timeout` — timeout for `--wait-for` (default: 120s)
+- [x] `psy clean` — remove stopped/failed processes from process table
 - [x] `psy ps` — send ps command, format table output
 - [x] `psy logs <name>` — dump captured logs
 - [x] `psy logs --tail <n>` — last N lines
@@ -91,7 +96,7 @@ psy/
 - [x] `psy logs --stdout / --stderr` — filter by stream
 - [x] `psy logs --since` / `--until` — time-based log filtering (relative or RFC 3339)
 - [x] `psy logs --since last` — show logs since last viewed, per-process marker
-- [x] `psy logs --grep` — case-insensitive substring filtering
+- [x] `psy logs --grep` — regex filtering (case-insensitive)
 - [x] `psy logs --run <id>` — view logs from a specific run
 - [x] `psy logs --previous` — view logs from the run before current
 - [x] `psy logs --probe` — show probe logs instead of process logs
@@ -161,6 +166,9 @@ psy/
 - [x] `psy_logs` tool — `format` parameter: `lines` (default, compact) or `structured` (JSON objects)
 - [x] `psy_logs` tool — `since: "last"` for incremental log viewing
 - [x] `psy_run` tool — `interactive` parameter for stdin pipe
+- [x] `psy_run` tool — `wait_for` parameter for blocking run with conditions
+- [x] `psy_logs` tool — `grep` parameter supports regex patterns
+- [x] `psy_clean` tool — remove stopped/failed processes
 - [x] Connect to root via `PSY_SOCK` internally
 
 ### Log Output Format
@@ -354,6 +362,12 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] MCP mode: stdin EOF triggers teardown
 - [x] MCP mode: boot units with `--all` flag
 - [x] MCP mode: incompatible with `-- <command>`
+- [x] `psy run --wait-for exit`: blocks until process exits, returns exit code + logs
+- [x] `psy run --wait-for exit`: non-zero exit code returned correctly
+- [x] `psy run --wait-for ready`: blocks until ready probe passes
+- [x] `psy run --wait-for exit --wait-timeout`: timeout returns partial status
+- [x] `psy run --wait-for-log`: blocks until log line matches
+- [x] `psy clean`: removes stopped/failed processes
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

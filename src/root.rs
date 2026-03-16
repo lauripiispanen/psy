@@ -224,6 +224,8 @@ impl PsyRoot {
                         attach: false,
                         interactive: false,
                         extra_args: None,
+                        wait_for: None,
+                        wait_timeout: None,
                     });
                     let result = handle_request(&self.shared, req).await;
                     if let HandleResult::Response(resp) = result {
@@ -350,6 +352,7 @@ async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
         CMD_HISTORY => HandleResult::Response(handle_history(root, &req).await),
         CMD_SEND => HandleResult::Response(handle_send(root, &req).await),
         CMD_SEND_WAIT => HandleResult::Response(handle_send_wait(root, &req).await),
+        CMD_CLEAN => HandleResult::Response(handle_clean(root, &req).await),
         _ => HandleResult::Response(Response::err(
             &req.id,
             format!("unknown command: {}", req.cmd),
@@ -454,6 +457,8 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
                         attach: false,
                         interactive: false,
                         extra_args: None,
+                        wait_for: None,
+                        wait_timeout: None,
                     });
                     let result = handle_run(root, &dep_req).await;
                     if let HandleResult::Response(ref resp) = result {
@@ -569,10 +574,10 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         });
 
         let interactive = args.interactive || unit.interactive;
-        return spawn_process(
+        let result = spawn_process(
             root,
             &req.id,
-            actual_name,
+            actual_name.clone(),
             shell_cmd,
             final_env,
             restart,
@@ -581,6 +586,15 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             working_dir,
             unit.ready.clone(),
             unit.healthcheck.clone(),
+        )
+        .await;
+        return apply_wait_for(
+            root,
+            &req.id,
+            &actual_name,
+            args.wait_for,
+            args.wait_timeout,
+            result,
         )
         .await;
     }
@@ -593,7 +607,10 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         ));
     }
 
-    spawn_process(
+    let process_name = args.name.clone();
+    let wait_for = args.wait_for.clone();
+    let wait_timeout = args.wait_timeout.clone();
+    let result = spawn_process(
         root,
         &req.id,
         args.name.clone(),
@@ -606,7 +623,248 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         None,
         None,
     )
-    .await
+    .await;
+    apply_wait_for(root, &req.id, &process_name, wait_for, wait_timeout, result).await
+}
+
+/// Apply wait_for logic after a successful spawn. If wait_for is None, returns
+/// the original result unchanged. Otherwise, blocks until the condition is met
+/// or the timeout expires.
+async fn apply_wait_for(
+    root: &Arc<SharedRoot>,
+    req_id: &str,
+    process_name: &str,
+    wait_for: Option<WaitFor>,
+    wait_timeout: Option<String>,
+    result: HandleResult,
+) -> HandleResult {
+    let wait_for = match wait_for {
+        Some(w) => w,
+        None => return result,
+    };
+
+    // Only wait if the spawn succeeded (Response with ok=true, not attach)
+    let response = match &result {
+        HandleResult::Response(ref resp) if resp.ok => resp,
+        _ => return result,
+    };
+
+    let timeout = wait_timeout
+        .as_deref()
+        .and_then(|s| crate::psyfile::parse_duration(s).ok())
+        .unwrap_or(Duration::from_secs(120));
+
+    match wait_for {
+        WaitFor::Ready => {
+            let wait_info = {
+                let table = root.process_table.lock().await;
+                if let Some(entry) = table.get(process_name) {
+                    if entry.ready {
+                        // Already ready
+                        None
+                    } else if entry.ready_config.is_some() {
+                        Some((
+                            Arc::clone(&entry.ready_notify),
+                            Arc::clone(&entry.exit_notify),
+                        ))
+                    } else {
+                        // No ready probe configured — already considered ready
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some((ready_notify, exit_notify)) = wait_info {
+                let timed_out = tokio::select! {
+                    result = async {
+                        tokio::time::timeout(timeout, async {
+                            tokio::select! {
+                                _ = ready_notify.notified() => false,
+                                _ = exit_notify.notified() => false,
+                            }
+                        }).await
+                    } => {
+                        result.unwrap_or(true)
+                    }
+                };
+
+                let table = root.process_table.lock().await;
+                let mut data = response.data.clone().unwrap_or(serde_json::json!({}));
+                if let Some(entry) = table.get(process_name) {
+                    if entry.ready {
+                        data["ready"] = serde_json::json!("ready");
+                    } else if entry.ready_failed {
+                        data["ready"] = serde_json::json!("failed");
+                    } else {
+                        data["ready"] = serde_json::json!("waiting");
+                    }
+                    data["status"] = serde_json::json!(entry.state.to_string());
+                    if let Some(code) = entry.exit_status {
+                        data["exit_code"] = serde_json::json!(code);
+                    }
+                }
+                if timed_out {
+                    data["timed_out"] = serde_json::json!(true);
+                }
+                return HandleResult::Response(Response::ok(req_id, Some(data)));
+            }
+
+            // Already ready — enrich response
+            let table = root.process_table.lock().await;
+            let mut data = response.data.clone().unwrap_or(serde_json::json!({}));
+            if let Some(entry) = table.get(process_name) {
+                data["ready"] = serde_json::json!(if entry.ready { "ready" } else { "waiting" });
+            }
+            HandleResult::Response(Response::ok(req_id, Some(data)))
+        }
+
+        WaitFor::Exit => {
+            let exit_notify = {
+                let table = root.process_table.lock().await;
+                table
+                    .get(process_name)
+                    .filter(|e| e.state == ProcessState::Running)
+                    .map(|e| Arc::clone(&e.exit_notify))
+            };
+
+            let timed_out = if let Some(notify) = exit_notify {
+                match tokio::time::timeout(timeout, notify.notified()).await {
+                    Ok(()) => false,
+                    Err(_) => true,
+                }
+            } else {
+                false // already exited
+            };
+
+            let table = root.process_table.lock().await;
+            let mut data = response.data.clone().unwrap_or(serde_json::json!({}));
+            if let Some(entry) = table.get(process_name) {
+                data["status"] = serde_json::json!(entry.state.to_string());
+                if let Some(code) = entry.exit_status {
+                    data["exit_code"] = serde_json::json!(code);
+                }
+                if let Some(ref sig) = entry.signal {
+                    data["signal"] = serde_json::json!(sig);
+                }
+                // Include tail logs
+                let lines = entry
+                    .stdout_buf
+                    .lines(Some(50), StreamFilter::All, None, None, None);
+                let log_text: Vec<String> = lines.iter().map(|l| l.content.clone()).collect();
+                data["logs"] = serde_json::json!(log_text);
+            }
+            if timed_out {
+                data["timed_out"] = serde_json::json!(true);
+            }
+            HandleResult::Response(Response::ok(req_id, Some(data)))
+        }
+
+        WaitFor::Log { pattern } => {
+            let pattern_lower = pattern.to_lowercase();
+
+            // First check existing lines
+            let (already_matched, rx) = {
+                let table = root.process_table.lock().await;
+                if let Some(entry) = table.get(process_name) {
+                    let existing =
+                        entry
+                            .stdout_buf
+                            .lines(None, StreamFilter::All, None, None, None);
+                    let matched = existing
+                        .iter()
+                        .any(|l| l.content.to_lowercase().contains(&pattern_lower));
+                    let rx = entry.stdout_buf.subscribe();
+                    (matched, Some(rx))
+                } else {
+                    (false, None)
+                }
+            };
+
+            if already_matched {
+                let mut data = response.data.clone().unwrap_or(serde_json::json!({}));
+                data["log_matched"] = serde_json::json!(true);
+                return HandleResult::Response(Response::ok(req_id, Some(data)));
+            }
+
+            let timed_out = if let Some(mut rx) = rx {
+                let result = tokio::time::timeout(timeout, async {
+                    loop {
+                        match rx.recv().await {
+                            Ok(line) => {
+                                if line.content.to_lowercase().contains(&pattern_lower) {
+                                    return;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => return, // channel closed (process exited)
+                        }
+                    }
+                })
+                .await;
+                result.is_err()
+            } else {
+                true
+            };
+
+            let mut data = response.data.clone().unwrap_or(serde_json::json!({}));
+            if timed_out {
+                data["timed_out"] = serde_json::json!(true);
+                data["log_matched"] = serde_json::json!(false);
+            } else {
+                data["log_matched"] = serde_json::json!(true);
+            }
+            // Include current status
+            let table = root.process_table.lock().await;
+            if let Some(entry) = table.get(process_name) {
+                data["status"] = serde_json::json!(entry.state.to_string());
+            }
+            HandleResult::Response(Response::ok(req_id, Some(data)))
+        }
+
+        WaitFor::Dependency { name: dep_name } => {
+            let wait_info = {
+                let table = root.process_table.lock().await;
+                if let Some(entry) = table.get(&dep_name) {
+                    if entry.ready {
+                        None // already ready
+                    } else if entry.ready_config.is_some() {
+                        Some(Arc::clone(&entry.ready_notify))
+                    } else {
+                        None // no probe = already ready
+                    }
+                } else {
+                    return HandleResult::Response(Response::err(
+                        req_id,
+                        format!("dependency '{}' not found in process table", dep_name),
+                    ));
+                }
+            };
+
+            let timed_out = if let Some(notify) = wait_info {
+                match tokio::time::timeout(timeout, notify.notified()).await {
+                    Ok(()) => false,
+                    Err(_) => true,
+                }
+            } else {
+                false
+            };
+
+            let mut data = response.data.clone().unwrap_or(serde_json::json!({}));
+            let table = root.process_table.lock().await;
+            if let Some(dep_entry) = table.get(&dep_name) {
+                data["dependency_ready"] = serde_json::json!(dep_entry.ready);
+            }
+            if let Some(entry) = table.get(process_name) {
+                data["status"] = serde_json::json!(entry.state.to_string());
+            }
+            if timed_out {
+                data["timed_out"] = serde_json::json!(true);
+            }
+            HandleResult::Response(Response::ok(req_id, Some(data)))
+        }
+    }
 }
 
 /// Common process spawning logic used by both Psyfile and ad-hoc modes.
@@ -810,6 +1068,17 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
         Err(e) => return Response::err(&req.id, format!("invalid until timestamp: {e}")),
     };
 
+    // Compile grep regex (case-insensitive)
+    let grep_re = match args.grep.as_deref() {
+        Some(pattern) if !pattern.is_empty() => {
+            match regex::Regex::new(&format!("(?i){}", pattern)) {
+                Ok(re) => Some(re),
+                Err(e) => return Response::err(&req.id, format!("invalid grep pattern: {e}")),
+            }
+        }
+        _ => None,
+    };
+
     // Check if this is a template unit name — collect logs from all instances
     let is_template = root
         .load_psyfile()
@@ -822,7 +1091,7 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
 
     if is_template {
         let prefix = format!("{}.", args.name);
-        let grep_ref = args.grep.as_deref();
+        let grep_ref = grep_re.as_ref();
         let mut all_lines = Vec::new();
 
         for (instance_name, entry) in table.iter() {
@@ -897,7 +1166,7 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
         (Arc::clone(&entry.stdout_buf), Arc::clone(&entry.stderr_buf))
     };
 
-    let grep_ref = args.grep.as_deref();
+    let grep_ref = grep_re.as_ref();
     let stdout_lines = stdout_buf.lines(None, args.stream, since, until, grep_ref);
     let stderr_lines = stderr_buf.lines(None, args.stream, since, until, grep_ref);
 
@@ -1380,6 +1649,20 @@ async fn handle_history(root: &Arc<SharedRoot>, req: &Request) -> Response {
     Response::ok(&req.id, Some(serde_json::to_value(history).unwrap()))
 }
 
+async fn handle_clean(root: &Arc<SharedRoot>, req: &Request) -> Response {
+    let mut table = root.process_table.lock().await;
+    let to_remove: Vec<String> = table
+        .iter()
+        .filter(|(_, e)| e.state != ProcessState::Running && !e.is_main)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let count = to_remove.len();
+    for name in &to_remove {
+        table.remove(name);
+    }
+    Response::ok(&req.id, Some(serde_json::json!({ "removed": count })))
+}
+
 async fn handle_send(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let args: SendArgs = match req
         .args
@@ -1775,6 +2058,9 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
                 }
             }
 
+            // Notify waiters that the process has exited
+            entry.exit_notify.notify_waiters();
+
             let do_restart =
                 !root.shutting_down.load(Ordering::Relaxed) && should_restart(entry, exit_code);
             let backoff = calculate_backoff(entry.restarts);
@@ -2092,7 +2378,22 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    let grep = args.grep.clone();
+    // Compile grep regex (case-insensitive)
+    let grep_re = match args.grep.as_deref() {
+        Some(pattern) if !pattern.is_empty() => {
+            match regex::Regex::new(&format!("(?i){}", pattern)) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    let resp = Response::err(&req.id, format!("invalid grep pattern: {e}"));
+                    let mut json = serde_json::to_string(&resp)?;
+                    json.push('\n');
+                    writer.write_all(json.as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => None,
+    };
 
     let (mut stdout_rx, mut stderr_rx) = {
         let table = root.process_table.lock().await;
@@ -2108,7 +2409,7 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
         };
 
         // Send existing tail lines first (with since/grep filtering)
-        let grep_ref = grep.as_deref();
+        let grep_ref = grep_re.as_ref();
         let stdout_lines = entry
             .stdout_buf
             .lines(None, args.stream, since, None, grep_ref);
@@ -2188,13 +2489,8 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
         }
 
         // Apply grep filter for streamed lines
-        if let Some(ref pattern) = grep {
-            if !pattern.is_empty()
-                && !log_line
-                    .content
-                    .to_lowercase()
-                    .contains(&pattern.to_lowercase())
-            {
+        if let Some(ref re) = grep_re {
+            if !re.is_match(&log_line.content) {
                 continue;
             }
         }

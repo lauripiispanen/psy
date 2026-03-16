@@ -126,6 +126,8 @@ pub struct ProcessEntry {
     /// Notified by healthcheck when the process should be killed.
     /// `monitor_child` selects on this while awaiting the child exit.
     pub kill_notify: Arc<Notify>,
+    /// Notified when the process exits (for `wait_for: exit`).
+    pub exit_notify: Arc<Notify>,
 }
 
 impl ProcessEntry {
@@ -166,6 +168,7 @@ impl ProcessEntry {
             ready_notify: Arc::new(Notify::new()),
             probe_cancel: None,
             kill_notify: Arc::new(Notify::new()),
+            exit_notify: Arc::new(Notify::new()),
         }
     }
 

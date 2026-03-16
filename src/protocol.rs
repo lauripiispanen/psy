@@ -64,6 +64,7 @@ pub const CMD_DOWN: &str = "down";
 pub const CMD_HISTORY: &str = "history";
 pub const CMD_SEND: &str = "send";
 pub const CMD_SEND_WAIT: &str = "send_wait";
+pub const CMD_CLEAN: &str = "clean";
 
 // ---------------------------------------------------------------------------
 // Argument / payload types
@@ -84,6 +85,19 @@ pub struct RunArgs {
     pub interactive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for: Option<WaitFor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_timeout: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitFor {
+    Ready,
+    Exit,
+    Log { pattern: String },
+    Dependency { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +318,10 @@ impl Request {
             CMD_SEND_WAIT,
             Some(serde_json::to_value(args).expect("serialize SendWaitArgs")),
         )
+    }
+
+    pub fn clean() -> Self {
+        Self::new(CMD_CLEAN, None)
     }
 }
 
