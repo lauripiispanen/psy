@@ -3874,3 +3874,296 @@ fn test_clean() {
         "ps should not show cleaned processes; got: {ps_after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Port allocation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_allocation_psyfile_env() {
+    // Verify that PSY_PORT_<NAME> env vars are injected for units with ports
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[server]
+command = "sh -c 'echo PORT=$PSY_PORT_HTTP && sleep 30'"
+ports = ["http"]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let logs = root.psy_stdout(&["logs", "server"]);
+    // Should contain PORT=<some number>
+    assert!(
+        logs.contains("PORT="),
+        "logs should contain PSY_PORT_HTTP value, got: {logs}"
+    );
+    // Extract the port number and verify it's valid
+    for line in logs.lines() {
+        if let Some(rest) = line.split("PORT=").nth(1) {
+            let port_str = rest.trim();
+            let port: u16 = port_str
+                .parse()
+                .unwrap_or_else(|_| panic!("expected valid port number, got: '{port_str}'"));
+            assert!(port > 0, "port should be > 0, got: {port}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_allocation_command_interpolation() {
+    // Verify that ${port.http} is interpolated in the command string
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[server]
+command = "echo ${port.http}"
+ports = ["http"]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let logs = root.psy_stdout(&["logs", "server"]);
+    // The echoed value should be a valid port number
+    let mut found_port = false;
+    for line in logs.lines() {
+        let trimmed = line.split(']').last().unwrap_or("").trim();
+        if let Ok(port) = trimmed.parse::<u16>() {
+            assert!(port > 0, "port should be > 0");
+            found_port = true;
+        }
+    }
+    assert!(found_port, "should find a port number in logs, got: {logs}");
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_allocation_cross_unit_ref() {
+    // Verify that ${port.http@server} works for cross-unit references
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[server]
+command = "sh -c 'echo SERVER_PORT=$PSY_PORT_HTTP && sleep 30'"
+ports = ["http"]
+
+[worker]
+command = "sh -c 'echo WORKER_PORT=${port.http@server} && sleep 30'"
+depends_on = ["server"]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "worker"]);
+    thread::sleep(Duration::from_secs(3));
+
+    let server_logs = root.psy_stdout(&["logs", "server"]);
+    let worker_logs = root.psy_stdout(&["logs", "worker"]);
+
+    // Extract the server port
+    let server_port = server_logs
+        .lines()
+        .find_map(|line| {
+            line.split("SERVER_PORT=")
+                .nth(1)
+                .and_then(|s| s.trim().parse::<u16>().ok())
+        })
+        .expect("should find server port in logs");
+
+    // Extract the worker's cross-reference port
+    let worker_port = worker_logs
+        .lines()
+        .find_map(|line| {
+            line.split("WORKER_PORT=")
+                .nth(1)
+                .and_then(|s| s.trim().parse::<u16>().ok())
+        })
+        .expect("should find worker port in logs");
+
+    assert_eq!(
+        server_port, worker_port,
+        "worker should see the same port as server"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_allocation_ps_shows_ports() {
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[server]
+command = "sleep 30"
+ports = ["http", "grpc"]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let ps = root.psy_stdout(&["ps"]);
+    assert!(
+        ps.contains("PORTS"),
+        "ps header should include PORTS column, got: {ps}"
+    );
+    assert!(
+        ps.contains("http=") && ps.contains("grpc="),
+        "ps should show port allocations, got: {ps}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_allocation_adhoc() {
+    // Verify ad-hoc --port flag works
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start(&to_refs(&sl));
+
+    #[cfg(unix)]
+    root.psy(&[
+        "run",
+        "srv",
+        "--port",
+        "http",
+        "--",
+        "sh",
+        "-c",
+        "echo PORT=$PSY_PORT_HTTP && sleep 30",
+    ]);
+    #[cfg(windows)]
+    root.psy(&[
+        "run",
+        "srv",
+        "--port",
+        "http",
+        "--",
+        "cmd",
+        "/c",
+        "echo PORT=%PSY_PORT_HTTP% && ping -n 31 127.0.0.1",
+    ]);
+
+    thread::sleep(Duration::from_secs(2));
+
+    let logs = root.psy_stdout(&["logs", "srv"]);
+    assert!(
+        logs.contains("PORT="),
+        "logs should contain PSY_PORT_HTTP value, got: {logs}"
+    );
+    // Verify port is a valid number
+    for line in logs.lines() {
+        if let Some(rest) = line.split("PORT=").nth(1) {
+            let port_str = rest.trim();
+            let port: u16 = port_str
+                .parse()
+                .unwrap_or_else(|_| panic!("expected valid port number, got: '{port_str}'"));
+            assert!(port > 0, "port should be > 0, got: {port}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_default_preferred() {
+    // Verify that the default port is used when available
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[server]
+command = "sh -c 'echo PORT=$PSY_PORT_HTTP && sleep 30'"
+ports = [{ name = "http", default = 48901 }]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let logs = root.psy_stdout(&["logs", "server"]);
+    assert!(
+        logs.contains("PORT=48901"),
+        "should use default port 48901 when available, got: {logs}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_run_response_includes_ports() {
+    // Verify that the run response includes allocated ports
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[server]
+command = "sleep 30"
+ports = ["http"]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    let output = root.psy_stdout(&["run", "server"]);
+    assert!(
+        output.contains("http") && output.contains("ports"),
+        "run response should include allocated ports, got: {output}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_port_default_fallback_when_taken() {
+    // Hold a port so the preferred default is unavailable, verify fallback to dynamic
+    let blocker =
+        std::net::TcpListener::bind("127.0.0.1:48902").expect("bind blocker on port 48902");
+    let blocked_port = blocker.local_addr().unwrap().port();
+    assert_eq!(blocked_port, 48902);
+
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[server]
+command = "sh -c 'echo PORT=$PSY_PORT_HTTP && sleep 30'"
+ports = [{ name = "http", default = 48902 }]
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "server"]);
+    thread::sleep(Duration::from_secs(2));
+
+    let logs = root.psy_stdout(&["logs", "server"]);
+    // Should NOT get 48902 since we're holding it
+    assert!(
+        !logs.contains("PORT=48902"),
+        "should NOT use blocked port 48902, got: {logs}"
+    );
+    // Should still get a valid port
+    let allocated_port = logs
+        .lines()
+        .find_map(|line| {
+            line.split("PORT=")
+                .nth(1)
+                .and_then(|s| s.trim().parse::<u16>().ok())
+        })
+        .expect("should find a port number in logs");
+    assert!(
+        allocated_port > 0 && allocated_port != 48902,
+        "should fall back to a different port, got: {allocated_port}"
+    );
+
+    drop(blocker);
+}

@@ -46,6 +46,8 @@ pub struct SharedRoot {
     /// socket (Unix direct mode), this equals `socket_path`. When indirect
     /// (Unix long chain or Windows), this is a separate file.
     pub anchor_path: Option<PathBuf>,
+    /// Port allocations per process: process_name -> (port_name -> port_number)
+    pub port_allocations: Mutex<HashMap<String, HashMap<String, u16>>>,
 }
 
 impl SharedRoot {
@@ -148,6 +150,7 @@ impl PsyRoot {
             template_counters: Mutex::new(HashMap::new()),
             logs_markers: Mutex::new(HashMap::new()),
             anchor_path,
+            port_allocations: Mutex::new(HashMap::new()),
         });
 
         Ok(Self {
@@ -226,6 +229,7 @@ impl PsyRoot {
                         extra_args: None,
                         wait_for: None,
                         wait_timeout: None,
+                        ports: vec![],
                     });
                     let result = handle_request(&self.shared, req).await;
                     if let HandleResult::Response(resp) = result {
@@ -360,6 +364,40 @@ async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
     }
 }
 
+/// Allocate a TCP port. If `preferred` is given, try that first; fall back to OS-assigned.
+fn allocate_port(preferred: Option<u16>) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(port) = preferred {
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return Ok(port);
+        }
+        // Fall through to dynamic allocation
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Interpolate `${...}` references in probe config string values.
+fn interpolate_probe_config(
+    config: &psyfile::ProbeConfig,
+    env: &HashMap<String, String>,
+) -> psyfile::ProbeConfig {
+    let probe = match &config.probe {
+        psyfile::ProbeKind::Tcp(s) => psyfile::ProbeKind::Tcp(psyfile::interpolate(s, env)),
+        psyfile::ProbeKind::Http(s) => psyfile::ProbeKind::Http(psyfile::interpolate(s, env)),
+        psyfile::ProbeKind::Exec(s) => psyfile::ProbeKind::Exec(psyfile::interpolate(s, env)),
+        psyfile::ProbeKind::Exit(n) => psyfile::ProbeKind::Exit(*n),
+    };
+    psyfile::ProbeConfig {
+        probe,
+        interval: config.interval,
+        timeout: config.timeout,
+        retries: config.retries,
+    }
+}
+
 fn handle_run<'a>(
     root: &'a Arc<SharedRoot>,
     req: &'a Request,
@@ -459,6 +497,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
                         extra_args: None,
                         wait_for: None,
                         wait_timeout: None,
+                        ports: vec![],
                     });
                     let result = handle_run(root, &dep_req).await;
                     if let HandleResult::Response(ref resp) = result {
@@ -533,12 +572,59 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             full_env.insert(k.clone(), v.clone());
         }
 
+        // Allocate ports if the unit declares them
+        let allocated_ports = if !unit.ports.is_empty() {
+            let mut ports_map = HashMap::new();
+            for port_def in &unit.ports {
+                let port = match allocate_port(port_def.default) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return HandleResult::Response(Response::err(
+                            &req.id,
+                            format!("failed to allocate port '{}': {e}", port_def.name),
+                        ));
+                    }
+                };
+                full_env.insert(format!("port.{}", port_def.name), port.to_string());
+                ports_map.insert(port_def.name.clone(), port);
+            }
+            // Inject cross-unit port references from dependencies
+            let port_allocs = root.port_allocations.lock().await;
+            for dep in &unit.depends_on {
+                if let Some(dep_ports) = port_allocs.get(&dep.name) {
+                    for (pname, pval) in dep_ports {
+                        full_env.insert(format!("port.{}@{}", pname, dep.name), pval.to_string());
+                    }
+                }
+            }
+            drop(port_allocs);
+            ports_map
+        } else {
+            // Still inject cross-unit port references even if this unit has no ports
+            let port_allocs = root.port_allocations.lock().await;
+            for dep in &unit.depends_on {
+                if let Some(dep_ports) = port_allocs.get(&dep.name) {
+                    for (pname, pval) in dep_ports {
+                        full_env.insert(format!("port.{}@{}", pname, dep.name), pval.to_string());
+                    }
+                }
+            }
+            drop(port_allocs);
+            HashMap::new()
+        };
+
         let cmd_str = psyfile::interpolate(&cmd_str, &full_env);
 
-        let resolved_env: HashMap<String, String> = resolved_env
+        let mut resolved_env: HashMap<String, String> = resolved_env
             .into_iter()
             .map(|(k, v)| (k, psyfile::interpolate(&v, &full_env)))
             .collect();
+
+        // Inject PSY_PORT_<NAME> env vars for allocated ports
+        for (pname, pval) in &allocated_ports {
+            let env_key = format!("PSY_PORT_{}", pname.to_uppercase().replace('-', "_"));
+            resolved_env.insert(env_key, pval.to_string());
+        }
 
         // Determine process name (singleton vs template)
         let (actual_name, instance_env) = if unit.singleton {
@@ -573,6 +659,22 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             std::path::PathBuf::from(psyfile::interpolate(&s, &full_env))
         });
 
+        // Interpolate probe configs (so ${port.*} references work in probes)
+        let ready = unit
+            .ready
+            .as_ref()
+            .map(|c| interpolate_probe_config(c, &full_env));
+        let healthcheck = unit
+            .healthcheck
+            .as_ref()
+            .map(|c| interpolate_probe_config(c, &full_env));
+
+        // Store port allocations for cross-unit references
+        if !allocated_ports.is_empty() {
+            let mut port_allocs = root.port_allocations.lock().await;
+            port_allocs.insert(actual_name.clone(), allocated_ports.clone());
+        }
+
         let interactive = args.interactive || unit.interactive;
         let result = spawn_process(
             root,
@@ -584,8 +686,8 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             args.attach,
             interactive,
             working_dir,
-            unit.ready.clone(),
-            unit.healthcheck.clone(),
+            ready,
+            healthcheck,
         )
         .await;
         return apply_wait_for(
@@ -607,6 +709,31 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         ));
     }
 
+    // Allocate ports for ad-hoc processes if requested
+    let mut adhoc_env = args.env.clone();
+    if !args.ports.is_empty() {
+        let mut allocated = HashMap::new();
+        for port_arg in &args.ports {
+            let port = match allocate_port(port_arg.default) {
+                Ok(p) => p,
+                Err(e) => {
+                    return HandleResult::Response(Response::err(
+                        &req.id,
+                        format!("failed to allocate port '{}': {e}", port_arg.name),
+                    ));
+                }
+            };
+            let env_key = format!(
+                "PSY_PORT_{}",
+                port_arg.name.to_uppercase().replace('-', "_")
+            );
+            adhoc_env.insert(env_key, port.to_string());
+            allocated.insert(port_arg.name.clone(), port);
+        }
+        let mut port_allocs = root.port_allocations.lock().await;
+        port_allocs.insert(args.name.clone(), allocated);
+    }
+
     let process_name = args.name.clone();
     let wait_for = args.wait_for.clone();
     let wait_timeout = args.wait_timeout.clone();
@@ -615,7 +742,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         &req.id,
         args.name.clone(),
         args.command.clone(),
-        args.env.clone(),
+        adhoc_env,
         args.restart,
         args.attach,
         args.interactive,
@@ -998,10 +1125,19 @@ async fn spawn_process(
         monitor_child(root_clone, monitor_name).await;
     });
 
-    let response = Response::ok(
-        req_id,
-        Some(serde_json::json!({ "name": name, "status": "running" })),
-    );
+    // Include port allocations in response if present
+    let ports_data = {
+        let port_allocs = root.port_allocations.lock().await;
+        port_allocs.get(&name).cloned()
+    };
+    let mut data = serde_json::json!({ "name": name, "status": "running" });
+    if let Some(ports) = ports_data {
+        if !ports.is_empty() {
+            data["ports"] = serde_json::to_value(ports).unwrap();
+        }
+    }
+
+    let response = Response::ok(req_id, Some(data));
 
     if attach {
         HandleResult::AttachSession { name, response }
@@ -1012,7 +1148,19 @@ async fn spawn_process(
 
 async fn handle_ps(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let table = root.process_table.lock().await;
-    let processes: Vec<ProcessInfo> = table.values().map(|e| e.to_ps_entry()).collect();
+    let port_allocs = root.port_allocations.lock().await;
+    let processes: Vec<ProcessInfo> = table
+        .values()
+        .map(|e| {
+            let mut info = e.to_ps_entry();
+            if let Some(ports) = port_allocs.get(&e.name) {
+                if !ports.is_empty() {
+                    info.ports = Some(ports.clone());
+                }
+            }
+            info
+        })
+        .collect();
     let ps_response = PsResponse { processes };
     Response::ok(&req.id, Some(serde_json::to_value(ps_response).unwrap()))
 }
@@ -1376,29 +1524,105 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
     }
 
     // Re-resolve command from Psyfile if this is a unit (hot-reload)
-    let (command, env, restart_policy, working_dir) = if let Some(unit) = unit_def {
-        let cmd_str = psyfile::build_command_with_args(&unit.command, &[]);
-        let mut full_env: HashMap<String, String> = std::env::vars().collect();
-        full_env.insert("PSY_SOCK".into(), root.psy_sock.clone());
-        full_env.insert("PSY_ROOT_PID".into(), root.psy_root_pid.to_string());
-        for (k, v) in &unit.env {
-            full_env.insert(k.clone(), v.clone());
-        }
-        let cmd_str = psyfile::interpolate(&cmd_str, &full_env);
-        let resolved_env: HashMap<String, String> = unit
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), psyfile::interpolate(v, &full_env)))
-            .collect();
-        let shell_cmd = psyfile::build_shell_command(&cmd_str);
-        let wd = unit.working_dir.as_ref().map(|d| {
-            let s = d.to_string_lossy().to_string();
-            std::path::PathBuf::from(psyfile::interpolate(&s, &full_env))
-        });
-        (shell_cmd, resolved_env, unit.restart, wd)
-    } else {
-        (old_command, old_env, old_restart, old_working_dir)
-    };
+    let (command, env, restart_policy, working_dir, ready_cfg, healthcheck_cfg) =
+        if let Some(unit) = unit_def {
+            let cmd_str = psyfile::build_command_with_args(&unit.command, &[]);
+            let mut full_env: HashMap<String, String> = std::env::vars().collect();
+            full_env.insert("PSY_SOCK".into(), root.psy_sock.clone());
+            full_env.insert("PSY_ROOT_PID".into(), root.psy_root_pid.to_string());
+            for (k, v) in &unit.env {
+                full_env.insert(k.clone(), v.clone());
+            }
+
+            // Re-allocate ports (try to reuse old ones)
+            if !unit.ports.is_empty() {
+                let mut port_allocs = root.port_allocations.lock().await;
+                let old_ports = port_allocs.get(&args.name).cloned().unwrap_or_default();
+                let mut new_ports = HashMap::new();
+                for port_def in &unit.ports {
+                    // Try to reuse old port, then try default, then dynamic
+                    let preferred = old_ports.get(&port_def.name).copied().or(port_def.default);
+                    let port = match allocate_port(preferred) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Response::err(
+                                &req.id,
+                                format!("failed to allocate port '{}': {e}", port_def.name),
+                            );
+                        }
+                    };
+                    full_env.insert(format!("port.{}", port_def.name), port.to_string());
+                    new_ports.insert(port_def.name.clone(), port);
+                }
+                port_allocs.insert(args.name.clone(), new_ports);
+                drop(port_allocs);
+
+                // Inject cross-unit port references from dependencies
+                let port_allocs = root.port_allocations.lock().await;
+                for dep in &unit.depends_on {
+                    if let Some(dep_ports) = port_allocs.get(&dep.name) {
+                        for (pname, pval) in dep_ports {
+                            full_env
+                                .insert(format!("port.{}@{}", pname, dep.name), pval.to_string());
+                        }
+                    }
+                }
+                drop(port_allocs);
+            }
+
+            let cmd_str = psyfile::interpolate(&cmd_str, &full_env);
+            let mut resolved_env: HashMap<String, String> = unit
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), psyfile::interpolate(v, &full_env)))
+                .collect();
+
+            // Inject PSY_PORT_<NAME> env vars
+            if !unit.ports.is_empty() {
+                let port_allocs = root.port_allocations.lock().await;
+                if let Some(ports) = port_allocs.get(&args.name) {
+                    for (pname, pval) in ports {
+                        let env_key =
+                            format!("PSY_PORT_{}", pname.to_uppercase().replace('-', "_"));
+                        resolved_env.insert(env_key, pval.to_string());
+                    }
+                }
+            }
+
+            let shell_cmd = psyfile::build_shell_command(&cmd_str);
+            let wd = unit.working_dir.as_ref().map(|d| {
+                let s = d.to_string_lossy().to_string();
+                std::path::PathBuf::from(psyfile::interpolate(&s, &full_env))
+            });
+
+            // Interpolate probe configs
+            let ready = unit
+                .ready
+                .as_ref()
+                .map(|c| interpolate_probe_config(c, &full_env));
+            let healthcheck = unit
+                .healthcheck
+                .as_ref()
+                .map(|c| interpolate_probe_config(c, &full_env));
+
+            (
+                shell_cmd,
+                resolved_env,
+                unit.restart,
+                wd,
+                ready,
+                healthcheck,
+            )
+        } else {
+            (
+                old_command,
+                old_env,
+                old_restart,
+                old_working_dir,
+                unit_def.and_then(|u| u.ready.clone()),
+                unit_def.and_then(|u| u.healthcheck.clone()),
+            )
+        };
 
     // Archive current run and re-create with fresh buffers
     {
@@ -1416,9 +1640,9 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
         entry.current_run_id = next_id;
         entry.working_dir = working_dir;
 
-        // Configure readiness probes from Psyfile unit
-        let ready_config = unit_def.and_then(|u| u.ready.clone());
-        let healthcheck_config = unit_def.and_then(|u| u.healthcheck.clone());
+        // Configure readiness probes (already interpolated above)
+        let ready_config = ready_cfg;
+        let healthcheck_config = healthcheck_cfg;
 
         let is_exit_probe = matches!(
             ready_config.as_ref().map(|c| &c.probe),

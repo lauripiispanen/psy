@@ -85,6 +85,9 @@ enum Commands {
         /// Timeout for --wait-for (e.g. 30s, 2m). Default: 120s
         #[arg(long, default_value = "120s")]
         wait_timeout: String,
+        /// Allocate a named port (repeatable). Format: NAME or NAME=DEFAULT_PORT
+        #[arg(long = "port", value_name = "NAME[=PORT]")]
+        ports: Vec<String>,
         /// Command to run (required for ad-hoc processes, optional for Psyfile units)
         #[arg(last = true)]
         command: Vec<String>,
@@ -395,10 +398,35 @@ command = "echo 'hello world'"
             wait_for_log,
             wait_for_dep,
             wait_timeout,
+            ports,
             command,
         } => {
             let restart_policy = parse_restart_policy(&restart);
             let env = parse_env_args(&envs);
+
+            // Parse --port flags: NAME or NAME=PORT
+            let port_defs: Vec<protocol::PortDefArg> = ports
+                .iter()
+                .map(|s| {
+                    if let Some((name, default_str)) = s.split_once('=') {
+                        let default: u16 = default_str.parse().unwrap_or_else(|_| {
+                            eprintln!(
+                                "error: invalid port default '{default_str}' for port '{name}'"
+                            );
+                            std::process::exit(1);
+                        });
+                        protocol::PortDefArg {
+                            name: name.to_string(),
+                            default: Some(default),
+                        }
+                    } else {
+                        protocol::PortDefArg {
+                            name: s.clone(),
+                            default: None,
+                        }
+                    }
+                })
+                .collect();
 
             // Parse wait_for from CLI flags
             let wait_for_value = if let Some(ref condition) = wait_for {
@@ -455,6 +483,7 @@ command = "echo 'hello world'"
                     extra_args: extra,
                     wait_for: wait_for_value,
                     wait_timeout: wait_timeout_value,
+                    ports: port_defs,
                 });
                 send_and_print(req);
             }
@@ -834,11 +863,25 @@ fn print_ps_table(ps: &PsResponse) {
         println!("No processes running");
         return;
     }
-    println!(
-        "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} RESTART",
-        "NAME", "PID", "STATUS", "READY", "EXIT", "UPTIME", "RESTARTS"
-    );
-    println!("{}", "-".repeat(86));
+    // Check if any process has ports
+    let has_ports = ps
+        .processes
+        .iter()
+        .any(|p| p.ports.as_ref().map(|m| !m.is_empty()).unwrap_or(false));
+
+    if has_ports {
+        println!(
+            "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} {:<24} RESTART",
+            "NAME", "PID", "STATUS", "READY", "EXIT", "UPTIME", "RESTARTS", "PORTS"
+        );
+        println!("{}", "-".repeat(110));
+    } else {
+        println!(
+            "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} RESTART",
+            "NAME", "PID", "STATUS", "READY", "EXIT", "UPTIME", "RESTARTS"
+        );
+        println!("{}", "-".repeat(86));
+    }
     for p in &ps.processes {
         let pid_str = p.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
         let ready_str = p.ready.as_deref().unwrap_or("-");
@@ -854,10 +897,37 @@ fn print_ps_table(ps: &PsResponse) {
             .map(format_uptime)
             .unwrap_or_else(|| "-".into());
         let restart = format!("{:?}", p.restart_policy).to_lowercase();
-        println!(
-            "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} {}",
-            p.name, pid_str, p.status, ready_str, exit_str, uptime, p.restarts, restart
-        );
+        if has_ports {
+            let ports_str = match &p.ports {
+                Some(m) if !m.is_empty() => {
+                    let mut pairs: Vec<_> = m.iter().collect();
+                    pairs.sort_by_key(|(k, _)| (*k).clone());
+                    pairs
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+                _ => "-".into(),
+            };
+            println!(
+                "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} {:<24} {}",
+                p.name,
+                pid_str,
+                p.status,
+                ready_str,
+                exit_str,
+                uptime,
+                p.restarts,
+                ports_str,
+                restart
+            );
+        } else {
+            println!(
+                "{:<20} {:<8} {:<10} {:<8} {:<8} {:<14} {:<10} {}",
+                p.name, pid_str, p.status, ready_str, exit_str, uptime, p.restarts, restart
+            );
+        }
     }
 }
 

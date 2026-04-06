@@ -137,6 +137,23 @@ fn tool_schemas() -> Value {
                         "timeout": {
                             "type": "string",
                             "description": "Timeout for wait_for (e.g. '30s', '2m', '120s'). Default: 120s"
+                        },
+                        "ports": {
+                            "type": "array",
+                            "items": {
+                                "oneOf": [
+                                    { "type": "string", "description": "Port name (dynamic allocation)" },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "default": { "type": "integer", "description": "Preferred port number" }
+                                        },
+                                        "required": ["name"]
+                                    }
+                                ]
+                            },
+                            "description": "Named ports to allocate for this process"
                         }
                     },
                     "required": ["name"]
@@ -380,6 +397,32 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
+            let ports: Vec<crate::protocol::PortDefArg> = args
+                .get("ports")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            if let Some(s) = item.as_str() {
+                                Some(crate::protocol::PortDefArg {
+                                    name: s.to_string(),
+                                    default: None,
+                                })
+                            } else if let Some(obj) = item.as_object() {
+                                let name = obj.get("name")?.as_str()?.to_string();
+                                let default = obj
+                                    .get("default")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|n| n as u16);
+                                Some(crate::protocol::PortDefArg { name, default })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let req = Request::run(RunArgs {
                 name,
                 command,
@@ -390,6 +433,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 extra_args,
                 wait_for,
                 wait_timeout,
+                ports,
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {

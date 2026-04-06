@@ -47,12 +47,19 @@ pub struct UnitDef {
     pub ready: Option<ProbeConfig>,
     pub healthcheck: Option<ProbeConfig>,
     pub interactive: bool,
+    pub ports: Vec<PortDef>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Dependency {
     pub name: String,
     pub restart: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortDef {
+    pub name: String,
+    pub default: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +140,7 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             "platforms",
             "platform",
             "interactive",
+            "ports",
         ];
         for key in unit_table.keys() {
             if !known_fields.contains(&key.as_str()) {
@@ -295,6 +303,73 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let ports = match unit_table.get("ports") {
+            Some(v) => {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| format!("unit '{name}': 'ports' must be an array"))?;
+                let mut port_names = HashSet::new();
+                arr.iter()
+                    .map(|item| {
+                        if let Some(s) = item.as_str() {
+                            validate_port_name(s, name)?;
+                            if !port_names.insert(s.to_string()) {
+                                return Err(format!("unit '{name}': duplicate port name '{s}'"));
+                            }
+                            Ok(PortDef {
+                                name: s.to_string(),
+                                default: None,
+                            })
+                        } else if let Some(tbl) = item.as_table() {
+                            let port_name =
+                                tbl.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                                    format!(
+                                        "unit '{name}': ports table entry requires 'name' string"
+                                    )
+                                })?;
+                            validate_port_name(port_name, name)?;
+                            if !port_names.insert(port_name.to_string()) {
+                                return Err(format!(
+                                    "unit '{name}': duplicate port name '{port_name}'"
+                                ));
+                            }
+                            let default = match tbl.get("default") {
+                                Some(v) => {
+                                    let n = v.as_integer().ok_or_else(|| {
+                                        format!("unit '{name}': ports 'default' must be an integer")
+                                    })?;
+                                    if !(1..=65535).contains(&n) {
+                                        return Err(format!(
+                                            "unit '{name}': port default {n} out of range (1-65535)"
+                                        ));
+                                    }
+                                    Some(n as u16)
+                                }
+                                None => None,
+                            };
+                            // Reject unknown keys
+                            for key in tbl.keys() {
+                                if key != "name" && key != "default" {
+                                    return Err(format!(
+                                        "unit '{name}': unknown field '{key}' in ports entry"
+                                    ));
+                                }
+                            }
+                            Ok(PortDef {
+                                name: port_name.to_string(),
+                                default,
+                            })
+                        } else {
+                            Err(format!(
+                                "unit '{name}': 'ports' entries must be strings or tables"
+                            ))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            None => Vec::new(),
+        };
+
         let working_dir = unit_table
             .get("working_dir")
             .and_then(|v| v.as_str())
@@ -421,11 +496,61 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
                 ready,
                 healthcheck,
                 interactive,
+                ports,
             },
         );
     }
 
+    // Auto-upgrade depends_on restart=true for units that reference another unit's ports.
+    // This ensures that when a dependency restarts with new ports, dependents are cascaded.
+    let unit_names: Vec<String> = units.keys().cloned().collect();
+    for uname in &unit_names {
+        let mut port_ref_units: HashSet<String> = HashSet::new();
+        {
+            let unit = &units[uname];
+            let mut strings_to_scan = vec![unit.command.clone()];
+            for v in unit.env.values() {
+                strings_to_scan.push(v.clone());
+            }
+            for s in &strings_to_scan {
+                for (_port_name, ref_unit) in extract_port_refs(s) {
+                    port_ref_units.insert(ref_unit);
+                }
+            }
+        }
+        if !port_ref_units.is_empty() {
+            let unit = units.get_mut(uname).unwrap();
+            for dep in &mut unit.depends_on {
+                if port_ref_units.contains(&dep.name) {
+                    dep.restart = true;
+                }
+            }
+        }
+    }
+
     Ok(Psyfile { units })
+}
+
+/// Validate a port name: must be `[a-zA-Z][a-zA-Z0-9_-]*`.
+fn validate_port_name(port_name: &str, unit_name: &str) -> Result<(), String> {
+    if port_name.is_empty() {
+        return Err(format!("unit '{unit_name}': port name must not be empty"));
+    }
+    let mut chars = port_name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() {
+        return Err(format!(
+            "unit '{unit_name}': invalid port name '{port_name}': must start with a letter"
+        ));
+    }
+    for c in chars {
+        if !c.is_ascii_alphanumeric() && c != '_' && c != '-' {
+            return Err(format!(
+                "unit '{unit_name}': invalid port name '{port_name}': must be [a-zA-Z][a-zA-Z0-9_-]*"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -610,9 +735,85 @@ pub fn validate(psyfile: &Psyfile) -> Result<(), String> {
         }
     }
 
+    // Validate port references: ${port.name@unit} must reference a dependency that declares that port
+    validate_port_references(psyfile)?;
+
     // Circular dependency detection via topological sort (Kahn's algorithm)
     detect_cycles(psyfile)?;
 
+    Ok(())
+}
+
+/// Extract cross-unit port references (`${port.name@unit}`) from a string.
+/// Returns a vec of `(port_name, unit_name)` tuples.
+fn extract_port_refs(s: &str) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    let prefix = "${port.";
+    let mut search_from = 0;
+    while let Some(start) = s[search_from..].find(prefix) {
+        let abs_start = search_from + start + prefix.len();
+        if let Some(end) = s[abs_start..].find('}') {
+            let inner = &s[abs_start..abs_start + end];
+            if let Some(at) = inner.find('@') {
+                let port_name = &inner[..at];
+                let unit_name = &inner[at + 1..];
+                if !port_name.is_empty() && !unit_name.is_empty() {
+                    refs.push((port_name.to_string(), unit_name.to_string()));
+                }
+            }
+            search_from = abs_start + end + 1;
+        } else {
+            break;
+        }
+    }
+    refs
+}
+
+fn validate_port_references(psyfile: &Psyfile) -> Result<(), String> {
+    for (name, unit) in &psyfile.units {
+        // Collect all strings that could contain port references
+        let mut strings_to_scan = vec![unit.command.clone()];
+        for v in unit.env.values() {
+            strings_to_scan.push(v.clone());
+        }
+        if let Some(ref probe) = unit.ready {
+            match &probe.probe {
+                ProbeKind::Tcp(s) | ProbeKind::Http(s) | ProbeKind::Exec(s) => {
+                    strings_to_scan.push(s.clone());
+                }
+                ProbeKind::Exit(_) => {}
+            }
+        }
+        if let Some(ref probe) = unit.healthcheck {
+            match &probe.probe {
+                ProbeKind::Tcp(s) | ProbeKind::Http(s) | ProbeKind::Exec(s) => {
+                    strings_to_scan.push(s.clone());
+                }
+                ProbeKind::Exit(_) => {}
+            }
+        }
+
+        let dep_names: HashSet<String> = unit.depends_on.iter().map(|d| d.name.clone()).collect();
+
+        for s in &strings_to_scan {
+            for (port_name, ref_unit) in extract_port_refs(s) {
+                if !dep_names.contains(&ref_unit) {
+                    return Err(format!(
+                        "unit '{name}': port reference '${{port.{port_name}@{ref_unit}}}' \
+                         requires '{ref_unit}' in depends_on"
+                    ));
+                }
+                if let Some(ref_unit_def) = psyfile.units.get(&ref_unit) {
+                    if !ref_unit_def.ports.iter().any(|p| p.name == port_name) {
+                        return Err(format!(
+                            "unit '{name}': port reference '${{port.{port_name}@{ref_unit}}}' \
+                             but '{ref_unit}' does not declare port '{port_name}'"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -997,6 +1198,24 @@ pub fn json_schema() -> serde_json::Value {
                     "type": "boolean",
                     "default": false,
                     "description": "Enable stdin pipe (writable via psy send)"
+                },
+                "ports": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            { "type": "string", "description": "Port name (dynamic allocation)" },
+                            {
+                                "type": "object",
+                                "required": ["name"],
+                                "properties": {
+                                    "name": { "type": "string", "description": "Port name" },
+                                    "default": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Preferred port (falls back to dynamic if unavailable)" }
+                                },
+                                "additionalProperties": false
+                            }
+                        ]
+                    },
+                    "description": "Named port allocations for this unit"
                 },
                 "platforms": {
                     "type": "array",
@@ -1974,5 +2193,194 @@ command = "overridden-cmd"
         );
         let pf = parse_str(&content).unwrap();
         assert_eq!(pf.units["server"].command, "overridden-cmd");
+    }
+
+    // -- ports ---------------------------------------------------------------
+
+    #[test]
+    fn parse_ports_simple() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["http", "grpc"]
+"#;
+        let pf = parse_str(content).unwrap();
+        let unit = &pf.units["server"];
+        assert_eq!(unit.ports.len(), 2);
+        assert_eq!(unit.ports[0].name, "http");
+        assert!(unit.ports[0].default.is_none());
+        assert_eq!(unit.ports[1].name, "grpc");
+        assert!(unit.ports[1].default.is_none());
+    }
+
+    #[test]
+    fn parse_ports_with_default() {
+        let content = r#"
+[server]
+command = "serve"
+ports = [{ name = "http", default = 8080 }]
+"#;
+        let pf = parse_str(content).unwrap();
+        let unit = &pf.units["server"];
+        assert_eq!(unit.ports.len(), 1);
+        assert_eq!(unit.ports[0].name, "http");
+        assert_eq!(unit.ports[0].default, Some(8080));
+    }
+
+    #[test]
+    fn parse_ports_mixed() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["metrics", { name = "http", default = 8080 }]
+"#;
+        let pf = parse_str(content).unwrap();
+        let unit = &pf.units["server"];
+        assert_eq!(unit.ports.len(), 2);
+        assert_eq!(unit.ports[0].name, "metrics");
+        assert!(unit.ports[0].default.is_none());
+        assert_eq!(unit.ports[1].name, "http");
+        assert_eq!(unit.ports[1].default, Some(8080));
+    }
+
+    #[test]
+    fn parse_ports_duplicate_name_rejected() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["http", "http"]
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(err.contains("duplicate port name"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ports_invalid_name() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["123invalid"]
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(err.contains("must start with a letter"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ports_invalid_default_range() {
+        let content = r#"
+[server]
+command = "serve"
+ports = [{ name = "http", default = 0 }]
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ports_unknown_field_in_entry() {
+        let content = r#"
+[server]
+command = "serve"
+ports = [{ name = "http", foo = 123 }]
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(err.contains("unknown field 'foo'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_port_ref_requires_dependency() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["http"]
+
+[worker]
+command = "work --port ${port.http@server}"
+"#;
+        let pf = parse_str(content).unwrap();
+        let err = validate(&pf).unwrap_err();
+        assert!(
+            err.contains("requires 'server' in depends_on"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_port_ref_unknown_port_name() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["http"]
+
+[worker]
+command = "work --port ${port.grpc@server}"
+depends_on = ["server"]
+"#;
+        let pf = parse_str(content).unwrap();
+        let err = validate(&pf).unwrap_err();
+        assert!(err.contains("does not declare port 'grpc'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_port_ref_valid() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["http"]
+
+[worker]
+command = "work --port ${port.http@server}"
+depends_on = ["server"]
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(validate(&pf).is_ok());
+    }
+
+    #[test]
+    fn port_ref_auto_upgrades_restart_cascade() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["http"]
+
+[worker]
+command = "work --port ${port.http@server}"
+depends_on = ["server"]
+"#;
+        let pf = parse_str(content).unwrap();
+        let worker = &pf.units["worker"];
+        // Port reference should auto-upgrade the dependency to restart=true
+        assert!(worker.depends_on[0].restart);
+    }
+
+    #[test]
+    fn port_ref_no_upgrade_without_ref() {
+        let content = r#"
+[server]
+command = "serve"
+ports = ["http"]
+
+[worker]
+command = "work"
+depends_on = ["server"]
+"#;
+        let pf = parse_str(content).unwrap();
+        let worker = &pf.units["worker"];
+        // No port reference, so restart stays false
+        assert!(!worker.depends_on[0].restart);
+    }
+
+    #[test]
+    fn extract_port_refs_works() {
+        let refs = extract_port_refs("--port ${port.http@server} --db ${port.pg@db}");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], ("http".to_string(), "server".to_string()));
+        assert_eq!(refs[1], ("pg".to_string(), "db".to_string()));
+    }
+
+    #[test]
+    fn extract_port_refs_own_port_not_cross_ref() {
+        let refs = extract_port_refs("--port ${port.http}");
+        assert!(refs.is_empty());
     }
 }

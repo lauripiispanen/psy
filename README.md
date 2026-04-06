@@ -77,6 +77,7 @@ psy up --mcp [--all] [units...]                    Start root with MCP server on
 psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child process
 psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
 psy run --interactive <name> [-- <cmd>]            Launch with writable stdin pipe
+psy run --port <name[=port]> <name> [-- <cmd>]      Allocate named ports for ad-hoc processes
 psy run --wait-for <cond> <name> [-- <cmd>]        Launch and block until condition met
 psy send <name> "text"                              Write text to a process's stdin
 psy send --wait <name> "text"                       Send and wait for output
@@ -283,7 +284,7 @@ psy up -- claude
 # Claude's MCP config launches "psy mcp" → discovers the root automatically
 ```
 
-Tools exposed: `psy_run` (with `interactive`, `wait_for` params), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`, `since: "last"` for incremental viewing, `grep` regex filter), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`, `psy_clean`
+Tools exposed: `psy_run` (with `interactive`, `wait_for`, `ports` params), `psy_ps`, `psy_logs` (with `format` param: `lines`/`structured`, `since: "last"` for incremental viewing, `grep` regex filter), `psy_send` (with `wait` mode), `psy_stop`, `psy_restart`, `psy_history`, `psy_psyfile_schema`, `psy_clean`
 
 ## Psyfile
 
@@ -318,6 +319,7 @@ depends_on = ["api"]
 | `depends_on` | array | `[]` | Dependencies — strings or `{ name, restart }` tables |
 | `singleton` | bool | `true` | `false` = template unit (multiple instances) |
 | `interactive` | bool | `false` | Enable writable stdin pipe |
+| `ports` | array | `[]` | Named port allocations (strings or `{ name, default }` tables) |
 | `working_dir` | string | cwd | Working directory |
 | `ready` | table | none | Startup readiness probe |
 | `healthcheck` | table | none | Continuous health check |
@@ -377,6 +379,51 @@ When a dependency restarts, dependents with `restart = true` automatically resta
 depends_on = [{ name = "db", restart = true }]
 # If db restarts, api restarts automatically (in dependency order)
 ```
+
+### Port allocation
+
+psy can dynamically allocate non-conflicting TCP ports for your services. This is especially useful when running multiple psy roots concurrently (CI, parallel test suites, multiple developers) — each root gets unique ports with zero coordination.
+
+```toml
+[db]
+command = "postgres -p ${port.pg}"
+ports = [{ name = "pg", default = 5432 }]
+ready = { tcp = "${port.pg}" }
+
+[api]
+command = "cargo run --bin api -- --port ${port.http}"
+ports = [{ name = "http", default = 8080 }, "metrics"]
+env = { PORT = "${port.http}", METRICS_PORT = "${port.metrics}" }
+depends_on = ["db"]
+
+[worker]
+command = "worker --db-port ${port.pg@db} --api-port ${port.http@api}"
+depends_on = ["api"]
+```
+
+**Port definition formats:**
+- `"http"` — dynamic port (OS-assigned)
+- `{ name = "http", default = 8080 }` — tries port 8080 first, falls back to dynamic if unavailable
+
+**How ports reach your process:**
+- **Auto env vars:** `ports = ["http"]` → child gets `PSY_PORT_HTTP=<port>`
+- **Interpolation:** `${port.http}` works in `command`, `env` values, and probe configs
+- **Cross-unit refs:** `${port.http@api}` references another unit's port (requires `depends_on`)
+
+**Ad-hoc processes** can also request ports via the CLI:
+
+```bash
+psy run srv --port http --port grpc -- node server.js
+# Child gets PSY_PORT_HTTP and PSY_PORT_GRPC env vars
+psy run srv --port http=8080 -- node server.js
+# Tries port 8080 first, falls back to dynamic
+```
+
+**Automatic restart cascade:** Cross-unit port references (`${port.x@unit}`) automatically imply `restart = true` on that dependency. If the upstream unit restarts with new ports, dependents restart too.
+
+**Port reuse on restart:** When a process restarts, psy tries to reuse its previous ports. If a port was grabbed by something else, a fresh one is allocated.
+
+`psy ps` shows a PORTS column when any process has allocated ports.
 
 ### Multi-platform support
 

@@ -286,6 +286,7 @@ pub fn run_attached(
         extra_args: None,
         wait_for: None,
         wait_timeout: None,
+        ports: vec![],
     });
     let mut payload =
         serde_json::to_string(&request).map_err(|e| format!("serialize error: {e}"))?;

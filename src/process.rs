@@ -247,6 +247,7 @@ impl ProcessEntry {
             signal: self.signal.clone(),
             restarts: self.restarts,
             ready,
+            ports: None,
         }
     }
 }

@@ -89,6 +89,15 @@ pub struct RunArgs {
     pub wait_for: Option<WaitFor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortDefArg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortDefArg {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +244,8 @@ pub struct ProcessInfo {
     pub restarts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<HashMap<String, u16>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

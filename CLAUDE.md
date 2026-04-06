@@ -84,6 +84,8 @@ psy/
 - [x] `psy run --env KEY=VAL` — extra env vars
 - [x] `psy run --attach` — connect terminal stdin/stdout to child
 - [x] `psy run --interactive` — enable stdin pipe (writable via psy send)
+- [x] `psy run --port <name>` — allocate named ports for ad-hoc processes
+- [x] `psy run --port <name>=<default>` — allocate with preferred port
 - [x] `psy run --wait-for <cond>` — block until ready/exit/log/dependency condition met
 - [x] `psy run --wait-for-log <pattern>` — block until log line matches substring
 - [x] `psy run --wait-for-dep <name>` — block until dependency's ready probe passes
@@ -166,6 +168,7 @@ psy/
 - [x] `psy_logs` tool — `format` parameter: `lines` (default, compact) or `structured` (JSON objects)
 - [x] `psy_logs` tool — `since: "last"` for incremental log viewing
 - [x] `psy_run` tool — `interactive` parameter for stdin pipe
+- [x] `psy_run` tool — `ports` parameter for port allocation
 - [x] `psy_run` tool — `wait_for` parameter for blocking run with conditions
 - [x] `psy_logs` tool — `grep` parameter supports regex patterns
 - [x] `psy_clean` tool — remove stopped/failed processes
@@ -194,7 +197,7 @@ psy/
 ### Psyfile (`src/psyfile.rs`)
 - [x] TOML parsing with field validation (reject unknown fields)
 - [x] File discovery: walk upward from cwd for `Psyfile` or `Psyfile.toml`
-- [x] Unit definition: command, restart, env, depends_on, singleton, working_dir, ready, healthcheck, interactive
+- [x] Unit definition: command, restart, env, depends_on, singleton, working_dir, ready, healthcheck, interactive, ports
 - [x] Environment variable interpolation: `${VAR}` and `${VAR:-default}`
 - [x] Circular dependency detection (Kahn's algorithm)
 - [x] Dependency resolution: topological sort for start order
@@ -222,6 +225,26 @@ psy/
 - [x] Platform override env merge: platform env merged on top of base (platform wins on conflict)
 - [x] Platform filtering at parse time: excluded units removed, downstream sees resolved units
 - [x] Platform validation: reject unknown platform names and override fields
+
+### Port Allocation (`src/psyfile.rs`, `src/root.rs`)
+- [x] `PortDef` struct: name + optional default port
+- [x] `ports` field in UnitDef: mixed string/table parsing (like `depends_on`)
+- [x] Port name validation: `[a-zA-Z][a-zA-Z0-9_-]*`
+- [x] Cross-unit port reference validation: `${port.name@unit}` requires dependency
+- [x] Implicit restart cascade: port cross-references auto-upgrade `depends_on` to `restart = true`
+- [x] Port allocation via `TcpListener::bind("127.0.0.1:0")` — OS-assigned, no coordination needed
+- [x] Preferred port with fallback: try `default` first, fall back to dynamic
+- [x] Port reuse on restart: try old port first, then default, then dynamic
+- [x] Port env injection: `PSY_PORT_<NAME>` auto-injected into child env
+- [x] Port interpolation: `${port.name}` in command, env, probe configs
+- [x] Cross-unit port interpolation: `${port.name@unit}` for dependency ports
+- [x] Probe config interpolation: `${port.*}` resolved in tcp/http/exec probe values
+- [x] Port allocations stored in `SharedRoot::port_allocations`
+- [x] Port allocations included in run response and `psy ps` output
+- [x] `psy ps` PORTS column (shown only when ports are allocated)
+- [x] Ad-hoc port allocation via `--port` CLI flag and `RunArgs.ports`
+- [x] MCP `psy_run` tool — `ports` parameter
+- [x] JSON Schema includes `ports` field
 
 ### Root Auto-Discovery (`src/platform/unix.rs`, `src/platform/windows.rs`, `src/client.rs`)
 - [x] Anchor file creation on root startup (PID ancestor chain encoded in filename)
@@ -277,6 +300,10 @@ psy/
 - [x] Anchor chain filename: formatting and parsing roundtrip
 - [x] Anchor socket path: direct mode (short chain), indirect mode (long chain)
 - [x] `roots_dir`: returns path containing "roots"
+- [x] Port parsing: simple string, with default, mixed, duplicate rejected, invalid name, invalid range, unknown field
+- [x] Port reference validation: requires dependency, referenced port must exist, valid refs pass
+- [x] Port ref auto-upgrades restart cascade
+- [x] `extract_port_refs`: parses cross-unit refs, ignores own-unit refs
 
 ### Integration Tests (`tests/integration.rs`)
 All integration tests pass on macOS. Must also pass on Linux and Windows via GitHub Actions.
@@ -368,6 +395,14 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] `psy run --wait-for exit --wait-timeout`: timeout returns partial status
 - [x] `psy run --wait-for-log`: blocks until log line matches
 - [x] `psy clean`: removes stopped/failed processes
+- [x] Port allocation: PSY_PORT_<NAME> env var injected for Psyfile unit with ports
+- [x] Port allocation: `${port.http}` interpolated in command string
+- [x] Port allocation: `${port.http@server}` cross-unit reference matches server's port
+- [x] Port allocation: `psy ps` shows PORTS column
+- [x] Port allocation: `--port` flag works for ad-hoc processes
+- [x] Port allocation: default port used when available
+- [x] Port allocation: fallback to dynamic when default port is taken
+- [x] Port allocation: run response includes allocated ports
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest
