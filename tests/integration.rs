@@ -4376,13 +4376,6 @@ sub_root = true
 #[test]
 #[ignore]
 #[parallel(discovery)]
-// macOS has a documented limitation: the pipe-trick cleanup mechanism only
-// reaches direct children. With a sub-root in the chain (parent → sub-root →
-// grandchild), great-grandchildren of the parent rely on a watchdog in the
-// sub-root process that doesn't run reliably under SIGKILL. Linux uses
-// PR_SET_PDEATHSIG which cascades through every level, and Windows Job
-// Objects do the same. So this guarantee is exercised on Linux and Windows.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn test_subroot_parent_kill_kills_grandchildren() {
     // The most important guarantee: SIGKILL the parent psy and verify that
     // grandchildren (children of the sub-root) are also dead. This exercises
@@ -4618,4 +4611,383 @@ sub_root = true
         let resp: serde_json::Value = serde_json::from_str(&line).expect("parse");
         assert_eq!(resp["ok"], serde_json::Value::Bool(false));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hard-kill cleanup (Linux: PDEATHSIG, macOS: cleanup sidecar, Windows: Job Object)
+// ---------------------------------------------------------------------------
+
+/// Find the macOS cleanup sidecar PID for a given parent psy.
+///
+/// The sidecar's argv contains `psy macos-cleanup --parent-pid <pid>`. We
+/// look it up via `ps` so the test is independent of how psy stores the
+/// handle internally.
+#[cfg(target_os = "macos")]
+fn find_macos_sidecar_pid(parent_pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-eo", "pid,command"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let needle = format!("--parent-pid {parent_pid}");
+    for line in stdout.lines() {
+        if !line.contains("macos-cleanup") || !line.contains(&needle) {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if let Some(pid_str) = parts.next() {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_parent_sigkill_kills_direct_child() {
+    // Spawn a psy root, run a long-living child, SIGKILL the root, and
+    // verify the child dies. This is the most basic OS-level cleanup
+    // guarantee — it must work on every platform.
+    let sl = sleep_cmd(60);
+    let mut root = PsyRoot::start(&to_refs(&sl));
+
+    let long = sleep_cmd(600);
+    let long_refs = to_refs(&long);
+    let mut args = vec!["run", "victim", "--"];
+    args.extend(long_refs);
+    let out = root.psy(&args);
+    assert!(
+        out.status.success(),
+        "psy run should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Grab the child's PID from `psy ps`.
+    let mut child_pid: Option<u32> = None;
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(200));
+        let ps = root.psy_stdout(&["ps"]);
+        if let Some(line) = ps.lines().find(|l| l.contains("victim")) {
+            let mut parts = line.split_whitespace();
+            parts.next();
+            if let Some(pid_str) = parts.next() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    child_pid = Some(pid);
+                    break;
+                }
+            }
+        }
+    }
+    let pid = child_pid.expect("could not capture child pid");
+
+    // SIGKILL the root directly (not via psy down — we want the OS-level
+    // cleanup path).
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(root.child.id() as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = root.child.kill();
+    }
+    let _ = root.child.wait();
+
+    // Child must die within a reasonable window.
+    let dead = wait_until(Duration::from_secs(15), || {
+        #[cfg(unix)]
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        #[cfg(windows)]
+        let alive = is_pid_alive_win(pid);
+        !alive
+    });
+    assert!(dead, "child pid {pid} should be dead after parent SIGKILL");
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_parent_sigkill_kills_many_children() {
+    // Spawn several children, then SIGKILL the parent, and verify every
+    // child dies. Exercises the sidecar's tracked-PID set under load.
+    let sl = sleep_cmd(60);
+    let mut root = PsyRoot::start(&to_refs(&sl));
+
+    let names = ["c1", "c2", "c3", "c4", "c5"];
+    for name in &names {
+        let long = sleep_cmd(600);
+        let long_refs = to_refs(&long);
+        let mut args = vec!["run", *name, "--"];
+        args.extend(long_refs);
+        let out = root.psy(&args);
+        assert!(
+            out.status.success(),
+            "spawn {name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let mut pids: Vec<u32> = Vec::new();
+    let collected = wait_until(Duration::from_secs(8), || {
+        pids.clear();
+        let ps = root.psy_stdout(&["ps"]);
+        for name in &names {
+            if let Some(line) = ps.lines().find(|l| l.starts_with(name)) {
+                let mut parts = line.split_whitespace();
+                parts.next();
+                if let Some(pid_str) = parts.next() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        pids.push(pid);
+                        continue;
+                    }
+                }
+            }
+            return false;
+        }
+        pids.len() == names.len()
+    });
+    assert!(collected, "could not collect all child pids; got {pids:?}");
+
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(root.child.id() as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = root.child.kill();
+    }
+    let _ = root.child.wait();
+
+    let all_dead = wait_until(Duration::from_secs(15), || {
+        pids.iter().all(|&pid| {
+            #[cfg(unix)]
+            let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+            #[cfg(windows)]
+            let alive = is_pid_alive_win(pid);
+            !alive
+        })
+    });
+    assert!(
+        all_dead,
+        "every child should be dead after parent SIGKILL; survivors: {:?}",
+        pids.iter()
+            .filter(|&&pid| {
+                #[cfg(unix)]
+                let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                #[cfg(windows)]
+                let alive = is_pid_alive_win(pid);
+                alive
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_parent_sigkill_kills_restarted_pid() {
+    // After a `psy restart`, the running child has a NEW pid. Verify the
+    // sidecar tracks the new pid (not just the original) by confirming the
+    // post-restart pid dies on parent SIGKILL.
+    let sl = sleep_cmd(60);
+    let mut root = PsyRoot::start(&to_refs(&sl));
+
+    let long = sleep_cmd(600);
+    let long_refs = to_refs(&long);
+    let mut args = vec!["run", "rerun", "--"];
+    args.extend(long_refs);
+    let out = root.psy(&args);
+    assert!(out.status.success());
+
+    let original_pid = wait_until_pid(&root, "rerun");
+    root.psy(&["restart", "rerun"]);
+
+    // Wait for the pid to change (restart spawned a new process).
+    let new_pid = {
+        let mut found = None;
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(200));
+            let ps = root.psy_stdout(&["ps"]);
+            if let Some(line) = ps.lines().find(|l| l.starts_with("rerun")) {
+                let mut parts = line.split_whitespace();
+                parts.next();
+                if let Some(pid_str) = parts.next() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        if pid != original_pid {
+                            found = Some(pid);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        found.expect("post-restart pid did not appear")
+    };
+    assert_ne!(new_pid, original_pid, "restart should produce a new pid");
+
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(root.child.id() as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = root.child.kill();
+    }
+    let _ = root.child.wait();
+
+    let dead = wait_until(Duration::from_secs(15), || {
+        #[cfg(unix)]
+        let alive = unsafe { libc::kill(new_pid as i32, 0) == 0 };
+        #[cfg(windows)]
+        let alive = is_pid_alive_win(new_pid);
+        !alive
+    });
+    assert!(dead, "post-restart pid {new_pid} should be dead");
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_concurrent_psy_roots_are_isolated() {
+    // Two psy roots running concurrently. Killing one must not kill the
+    // other's children. This guards against the sidecar accidentally
+    // tracking PIDs across psys (e.g. via PID reuse or PID leakage).
+    let sl1 = sleep_cmd(60);
+    let mut root1 = PsyRoot::start(&to_refs(&sl1));
+    let sl2 = sleep_cmd(60);
+    let root2 = PsyRoot::start(&to_refs(&sl2));
+
+    let long = sleep_cmd(600);
+    let long_refs = to_refs(&long);
+
+    let mut a1 = vec!["run", "victim1", "--"];
+    a1.extend(long_refs.clone());
+    root1.psy(&a1);
+    let mut a2 = vec!["run", "victim2", "--"];
+    a2.extend(long_refs);
+    root2.psy(&a2);
+
+    let pid1 = wait_until_pid(&root1, "victim1");
+    let pid2 = wait_until_pid(&root2, "victim2");
+
+    // SIGKILL root1 only.
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(root1.child.id() as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = root1.child.kill();
+    }
+    let _ = root1.child.wait();
+
+    // root1's child must die.
+    let dead1 = wait_until(Duration::from_secs(15), || {
+        #[cfg(unix)]
+        let alive = unsafe { libc::kill(pid1 as i32, 0) == 0 };
+        #[cfg(windows)]
+        let alive = is_pid_alive_win(pid1);
+        !alive
+    });
+    assert!(dead1, "root1 child {pid1} should die");
+
+    // root2's child must STILL be alive a couple seconds later.
+    thread::sleep(Duration::from_secs(2));
+    #[cfg(unix)]
+    let alive2 = unsafe { libc::kill(pid2 as i32, 0) == 0 };
+    #[cfg(windows)]
+    let alive2 = is_pid_alive_win(pid2);
+    assert!(
+        alive2,
+        "root2 child {pid2} must survive root1 SIGKILL (cross-psy isolation)"
+    );
+
+    // Cleanup: root2 will Drop normally.
+    drop(root2);
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+#[cfg(target_os = "macos")]
+fn test_macos_sidecar_respawns_after_kill() {
+    // Kill the cleanup sidecar mid-flight and verify (a) it gets respawned
+    // by psy's supervisor, and (b) the new sidecar correctly cleans up the
+    // original child PID on a subsequent parent SIGKILL.
+    let sl = sleep_cmd(60);
+    let mut root = PsyRoot::start(&to_refs(&sl));
+
+    let long = sleep_cmd(600);
+    let long_refs = to_refs(&long);
+    let mut args = vec!["run", "victim", "--"];
+    args.extend(long_refs);
+    root.psy(&args);
+
+    let child_pid = wait_until_pid(&root, "victim");
+    let parent_pid = root.child.id();
+
+    // Locate the sidecar by argv.
+    let sidecar_pid = wait_until_some(Duration::from_secs(5), || {
+        find_macos_sidecar_pid(parent_pid)
+    })
+    .expect("sidecar should exist after root start");
+
+    // SIGKILL the sidecar.
+    let _ = unsafe { libc::kill(sidecar_pid as i32, libc::SIGKILL) };
+
+    // Supervisor should respawn within a few seconds — find a *different* pid
+    // matching the parent.
+    let respawned = wait_until_some(Duration::from_secs(8), || {
+        find_macos_sidecar_pid(parent_pid).filter(|&p| p != sidecar_pid)
+    });
+    let new_sidecar_pid = respawned.expect("supervisor should respawn the sidecar");
+    assert_ne!(
+        new_sidecar_pid, sidecar_pid,
+        "respawn must produce a fresh pid"
+    );
+
+    // Now SIGKILL the parent — the new sidecar must clean up the original
+    // child (it should have been re-announced from the process table).
+    let _ = unsafe { libc::kill(parent_pid as i32, libc::SIGKILL) };
+    let _ = root.child.wait();
+
+    let dead = wait_until(Duration::from_secs(15), || unsafe {
+        libc::kill(child_pid as i32, 0) != 0
+    });
+    assert!(
+        dead,
+        "child {child_pid} must die after parent SIGKILL even when the sidecar was respawned"
+    );
+}
+
+/// Helper: capture a unit's pid from `psy ps`, polling for up to ~6 seconds.
+fn wait_until_pid(root: &PsyRoot, name: &str) -> u32 {
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(200));
+        let ps = root.psy_stdout(&["ps"]);
+        if let Some(line) = ps.lines().find(|l| l.starts_with(name)) {
+            let mut parts = line.split_whitespace();
+            parts.next();
+            if let Some(pid_str) = parts.next() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    return pid;
+                }
+            }
+        }
+    }
+    panic!("could not capture pid for unit '{name}'");
+}
+
+/// Helper: poll until `cond` returns Some, up to `timeout`.
+fn wait_until_some<T, F: FnMut() -> Option<T>>(timeout: Duration, mut cond: F) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(v) = cond() {
+            return Some(v);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    cond()
 }

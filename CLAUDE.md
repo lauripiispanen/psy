@@ -141,9 +141,13 @@ psy/
 - [x] `prctl(PR_SET_CHILD_SUBREAPER, 1)` on root
 - [x] `prctl(PR_SET_PDEATHSIG, SIGKILL)` in child pre_exec
 
-### Platform: macOS (`src/platform/unix.rs`)
-- [x] Pipe trick as primary mechanism (shared with Linux)
-- [ ] kqueue `EVFILT_PROC` + `NOTE_EXIT` watchdog (optional secondary, not implemented)
+### Platform: macOS (`src/platform/unix.rs`, `src/macos_cleanup.rs`)
+- [x] Cleanup sidecar: per-root `psy macos-cleanup --parent-pid <pid>` watches the parent via kqueue `EVFILT_PROC + NOTE_EXIT` and SIGKILLs every announced child PID on parent death
+- [x] Sidecar uses `setsid()` to escape psy's session/process group so signals targeting that group don't reach it
+- [x] Append-only PID stream from psy → sidecar over a CLOEXEC'd pipe (read end deliberately inherited via pre_exec hook)
+- [x] Supervisor task in psy: respawns sidecar if it dies, re-announces all running PIDs from the process table
+- [x] Notification wired into all spawn sites: main process, ad-hoc/Psyfile spawn_process, restart-in-monitor_child, handle_restart_inner
+- [x] Pipe trick (death pipe) created but watchdog thread not wired (kept for future use)
 
 ### Platform: Windows (`src/platform/windows.rs`)
 - [x] Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
@@ -425,7 +429,8 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Sub-root: registers and shows up in parent's ps with `--in` resolvable
 - [x] Sub-root: inner units invisible to parent's ps but visible via `--in`
 - [x] Sub-root: parent `psy stop <subroot>` tears down grandchildren
-- [x] Sub-root: parent SIGKILL → grandchildren die (Linux + Windows; macOS limitation documented)
+- [x] Sub-root: parent SIGKILL → grandchildren die on all platforms (macOS via cleanup sidecar)
+- [x] Hard-kill: parent SIGKILL → direct children die on all platforms (`test_parent_sigkill_kills_direct_child`)
 - [x] Sub-root: Psyfile validation rejects `sub_root + interactive` and `sub_root + ready={exit}`
 - [x] Sub-root: `--in` for non-sub-root unit errors gracefully
 - [x] Sub-root: registration with non-descendant PID rejected

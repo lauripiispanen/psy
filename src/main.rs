@@ -1,4 +1,6 @@
 pub mod client;
+#[cfg(target_os = "macos")]
+pub mod macos_cleanup;
 pub mod mcp;
 pub mod platform;
 pub mod probe;
@@ -197,6 +199,13 @@ enum Commands {
     },
     /// Print version information
     Version,
+    /// (internal) macOS cleanup sidecar — not for direct use.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacosCleanup {
+        #[arg(long)]
+        parent_pid: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -226,6 +235,11 @@ fn main() {
     if let Some(ref subroot_name) = cli.target_subroot {
         match &cli.command {
             Commands::Up { .. } | Commands::Version | Commands::Mcp | Commands::Psyfile { .. } => {
+                eprintln!("psy: --in is not valid for this command");
+                std::process::exit(1);
+            }
+            #[cfg(target_os = "macos")]
+            Commands::MacosCleanup { .. } => {
                 eprintln!("psy: --in is not valid for this command");
                 std::process::exit(1);
             }
@@ -353,6 +367,11 @@ fn main() {
 
         Commands::Version => {
             println!("psy {}", env!("CARGO_PKG_VERSION"));
+        }
+
+        #[cfg(target_os = "macos")]
+        Commands::MacosCleanup { parent_pid } => {
+            macos_cleanup::run(parent_pid);
         }
 
         Commands::Mcp => {

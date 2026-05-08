@@ -51,6 +51,11 @@ pub struct SharedRoot {
     /// The root's own name (defaults to `psy-<pid>`). Used as the unit name
     /// when registering as a sub-root with a parent.
     pub root_name: String,
+    /// macOS cleanup sidecar handle. The supervisor may swap this in/out on
+    /// respawn, so it's wrapped in a sync `Mutex` (writes are infrequent and
+    /// don't need to be async).
+    #[cfg(target_os = "macos")]
+    pub macos_sidecar: std::sync::Mutex<Option<Arc<crate::macos_cleanup::SidecarHandle>>>,
 }
 
 impl SharedRoot {
@@ -140,6 +145,18 @@ impl PsyRoot {
         let psy_sock = socket_path.clone();
         let (main_exit_tx, main_exit_rx) = watch::channel(None);
 
+        // macOS cleanup sidecar: spawn at root startup so it's already
+        // watching us before we spawn any children. If it fails to start we
+        // log and continue — graceful teardown still works without it.
+        #[cfg(target_os = "macos")]
+        let macos_sidecar = match crate::macos_cleanup::spawn_sidecar(pid) {
+            Ok(handle) => std::sync::Mutex::new(Some(Arc::new(handle))),
+            Err(e) => {
+                eprintln!("psy: macOS cleanup sidecar failed to start: {e}");
+                std::sync::Mutex::new(None)
+            }
+        };
+
         let shared = Arc::new(SharedRoot {
             process_table: Arc::new(Mutex::new(HashMap::new())),
             socket_path,
@@ -155,6 +172,8 @@ impl PsyRoot {
             anchor_path,
             port_allocations: Mutex::new(HashMap::new()),
             root_name: name,
+            #[cfg(target_os = "macos")]
+            macos_sidecar,
         });
 
         Ok(Self {
@@ -213,6 +232,14 @@ impl PsyRoot {
                     eprintln!("psy: socket listener error: {e}");
                 }
             });
+        }
+
+        // macOS-only: supervise the cleanup sidecar so a crashed sidecar
+        // gets respawned rather than silently leaving us unprotected.
+        #[cfg(target_os = "macos")]
+        {
+            let root = Arc::clone(&self.shared);
+            tokio::spawn(supervise_macos_sidecar(root));
         }
 
         // Write the anchor file for root discovery.
@@ -297,6 +324,9 @@ impl PsyRoot {
                 let child =
                     spawn_child(&mut entry, &self.shared.psy_sock, self.shared.psy_root_pid)?;
                 entry.child = Some(child);
+                if let Some(pid) = entry.pid {
+                    notify_macos_sidecar(&self.shared, pid);
+                }
                 table.insert("main".into(), entry);
             }
 
@@ -417,6 +447,87 @@ async fn register_with_parent(
             return Err(resp.error.unwrap_or_else(|| "unknown parent error".into()));
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS cleanup sidecar integration
+// ---------------------------------------------------------------------------
+
+/// Tell the macOS cleanup sidecar about a newly spawned child. No-op on
+/// other platforms.
+#[allow(unused_variables)]
+fn notify_macos_sidecar(root: &SharedRoot, pid: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        let handle = match root.macos_sidecar.lock() {
+            Ok(g) => g.as_ref().map(Arc::clone),
+            Err(_) => None,
+        };
+        if let Some(h) = handle {
+            h.notify(pid);
+        }
+    }
+}
+
+/// Supervisor task that waits for the sidecar to exit and respawns it if
+/// the root isn't shutting down. After respawn, it re-announces every
+/// running PID from the process table so the new sidecar has full state.
+#[cfg(target_os = "macos")]
+async fn supervise_macos_sidecar(root: Arc<SharedRoot>) {
+    loop {
+        // Take ownership of the current sidecar's `Child` so we can wait
+        // on it without holding the SharedRoot lock.
+        let current = match root.macos_sidecar.lock() {
+            Ok(g) => g.as_ref().map(Arc::clone),
+            Err(_) => None,
+        };
+        let handle = match current {
+            Some(h) => h,
+            None => return, // No sidecar present — nothing to supervise.
+        };
+
+        // Wait for the sidecar to exit (blocking; spawn_blocking).
+        let handle_for_wait = Arc::clone(&handle);
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(mut child) = handle_for_wait.child.lock() {
+                let _ = child.wait();
+            }
+        })
+        .await;
+
+        if root.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Sidecar died unexpectedly — respawn.
+        eprintln!("psy: macOS cleanup sidecar exited unexpectedly; respawning");
+        let new_handle = match crate::macos_cleanup::spawn_sidecar(root.psy_root_pid) {
+            Ok(h) => Arc::new(h),
+            Err(e) => {
+                eprintln!("psy: failed to respawn macOS cleanup sidecar: {e}");
+                // Clear so future notifies are no-ops; give up.
+                if let Ok(mut g) = root.macos_sidecar.lock() {
+                    *g = None;
+                }
+                return;
+            }
+        };
+
+        // Re-announce every currently running PID so the new sidecar
+        // catches up with state.
+        let running_pids: Vec<u32> = {
+            let table = root.process_table.lock().await;
+            table.values().filter_map(|e| e.pid).collect()
+        };
+        for pid in running_pids {
+            new_handle.notify(pid);
+        }
+
+        // Swap in the new handle and loop to supervise it.
+        if let Ok(mut g) = root.macos_sidecar.lock() {
+            *g = Some(new_handle);
+        }
     }
 }
 
@@ -1222,6 +1333,9 @@ async fn spawn_process(
     };
 
     entry.child = Some(child);
+    if let Some(pid) = entry.pid {
+        notify_macos_sidecar(root, pid);
+    }
 
     // Set up probe cancellation channel
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -1827,6 +1941,9 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
         };
 
         entry.child = Some(child);
+        if let Some(pid) = entry.pid {
+            notify_macos_sidecar(root, pid);
+        }
 
         // Set up probe cancellation and launch probe tasks
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -2575,6 +2692,9 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
             match spawn_child(entry, &root.psy_sock, root.psy_root_pid) {
                 Ok(child) => {
                     entry.child = Some(child);
+                    if let Some(pid) = entry.pid {
+                        notify_macos_sidecar(&root, pid);
+                    }
 
                     // Relaunch probe tasks
                     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);

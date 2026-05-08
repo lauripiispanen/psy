@@ -509,7 +509,7 @@ psy creates a Unix domain socket (or named pipe on Windows) and manages a proces
 
 **Cleanup guarantees:**
 - **Linux** — `PR_SET_CHILD_SUBREAPER` + `PR_SET_PDEATHSIG` ensures children die with the parent
-- **macOS** — Pipe trick: children detect parent death via EOF on an inherited file descriptor
+- **macOS** — A cleanup sidecar (`psy macos-cleanup`) per root watches the parent via kqueue `NOTE_EXIT` and SIGKILLs every tracked child if the parent is hard-killed
 - **Windows** — Job Object with `KILL_ON_JOB_CLOSE` terminates all descendants
 
 **Signal handling:** SIGTERM and SIGINT on the root trigger graceful teardown of all children before exit.
