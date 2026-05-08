@@ -48,6 +48,9 @@ pub struct SharedRoot {
     pub anchor_path: Option<PathBuf>,
     /// Port allocations per process: process_name -> (port_name -> port_number)
     pub port_allocations: Mutex<HashMap<String, HashMap<String, u16>>>,
+    /// The root's own name (defaults to `psy-<pid>`). Used as the unit name
+    /// when registering as a sub-root with a parent.
+    pub root_name: String,
 }
 
 impl SharedRoot {
@@ -86,7 +89,7 @@ pub struct PsyRoot {
 }
 
 impl PsyRoot {
-    pub fn new(_name: String, psyfile_path: Option<PathBuf>) -> RootResult<Self> {
+    pub fn new(name: String, psyfile_path: Option<PathBuf>) -> RootResult<Self> {
         // Platform-specific root setup (setsid / subreaper / Job Object)
         platform::setup_root();
 
@@ -151,6 +154,7 @@ impl PsyRoot {
             logs_markers: Mutex::new(HashMap::new()),
             anchor_path,
             port_allocations: Mutex::new(HashMap::new()),
+            root_name: name,
         });
 
         Ok(Self {
@@ -164,6 +168,8 @@ impl PsyRoot {
     /// `main_command` — the main process command (or `None` to use `$SHELL`).
     /// `mcp_mode` — if true, run the MCP JSON-RPC server on stdin/stdout
     /// instead of spawning a main process.
+    /// `parent_sock` — if `Some`, this is a sub-root: register with the parent
+    /// at that socket path before starting boot units.
     ///
     /// Returns the main process exit code.
     pub async fn run(
@@ -171,6 +177,7 @@ impl PsyRoot {
         main_command: Option<Vec<String>>,
         boot_units: Vec<String>,
         mcp_mode: bool,
+        parent_sock: Option<String>,
     ) -> RootResult<i32> {
         // Determine the main command (not needed in MCP mode)
         let main_cmd = if mcp_mode {
@@ -185,11 +192,24 @@ impl PsyRoot {
             }))
         };
 
-        // Spawn the socket listener first (so boot units can use the socket)
+        // Bind the socket synchronously so that sub-root registration with a
+        // parent (and any other early clients) can rely on the listener being
+        // ready. The accept loop is then spawned in the background.
+        #[cfg(unix)]
+        let listener = tokio::net::UnixListener::bind(&self.shared.socket_path)?;
+
+        #[cfg(windows)]
+        let listener = {
+            use tokio::net::windows::named_pipe::ServerOptions;
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&self.shared.socket_path)?
+        };
+
         {
             let root = Arc::clone(&self.shared);
             tokio::spawn(async move {
-                if let Err(e) = run_socket_listener(root).await {
+                if let Err(e) = run_socket_listener(root, listener).await {
                     eprintln!("psy: socket listener error: {e}");
                 }
             });
@@ -207,6 +227,24 @@ impl PsyRoot {
                     eprintln!("psy: failed to write anchor file: {e}");
                 }
             }
+        }
+
+        // If we are a managed sub-root, register with the parent now that our
+        // own socket is ready to serve.
+        if let Some(ref psock) = parent_sock {
+            if let Err(e) = register_with_parent(
+                psock,
+                &self.shared.socket_path,
+                self.shared.psy_root_pid,
+                &self.shared.root_name,
+            )
+            .await
+            {
+                return Err(format!("sub-root registration failed: {e}").into());
+            }
+            // Expose the parent socket to inner processes for diagnostic tools
+            // that may want to walk upward.
+            std::env::set_var("PSY_PARENT_SOCK", psock);
         }
 
         // Start boot units from Psyfile (before main process)
@@ -296,6 +334,93 @@ impl PsyRoot {
 }
 
 // ---------------------------------------------------------------------------
+// Sub-root registration with a parent psy
+// ---------------------------------------------------------------------------
+
+/// Connect to a parent psy socket and send a `register_subroot` request. The
+/// parent validates the registration (PID descent, matching unit) and replies
+/// with success or an error.
+async fn register_with_parent(
+    parent_sock: &str,
+    own_socket: &str,
+    own_pid: u32,
+    own_name: &str,
+) -> Result<(), String> {
+    let payload = serde_json::to_string(&Request::register_subroot(RegisterSubrootArgs {
+        name: own_name.to_string(),
+        socket_path: own_socket.to_string(),
+        pid: own_pid,
+    }))
+    .map_err(|e| format!("serialize register_subroot: {e}"))?;
+
+    let mut line = String::with_capacity(payload.len() + 1);
+    line.push_str(&payload);
+    line.push('\n');
+
+    #[cfg(unix)]
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let stream = tokio::net::UnixStream::connect(parent_sock)
+            .await
+            .map_err(|e| format!("cannot connect to parent {parent_sock}: {e}"))?;
+        let (reader, mut writer) = stream.into_split();
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("write to parent: {e}"))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| format!("flush to parent: {e}"))?;
+        let mut response = String::new();
+        BufReader::new(reader)
+            .read_line(&mut response)
+            .await
+            .map_err(|e| format!("read parent response: {e}"))?;
+        if response.is_empty() {
+            return Err("parent closed connection without response".into());
+        }
+        let resp: Response = serde_json::from_str(response.trim_end())
+            .map_err(|e| format!("invalid parent response: {e}"))?;
+        if !resp.ok {
+            return Err(resp.error.unwrap_or_else(|| "unknown parent error".into()));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe = ClientOptions::new()
+            .open(parent_sock)
+            .map_err(|e| format!("cannot connect to parent {parent_sock}: {e}"))?;
+        let (reader, mut writer) = tokio::io::split(pipe);
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("write to parent: {e}"))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| format!("flush to parent: {e}"))?;
+        let mut response = String::new();
+        BufReader::new(reader)
+            .read_line(&mut response)
+            .await
+            .map_err(|e| format!("read parent response: {e}"))?;
+        if response.is_empty() {
+            return Err("parent closed connection without response".into());
+        }
+        let resp: Response = serde_json::from_str(response.trim_end())
+            .map_err(|e| format!("invalid parent response: {e}"))?;
+        if !resp.ok {
+            return Err(resp.error.unwrap_or_else(|| "unknown parent error".into()));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Signal handling
 // ---------------------------------------------------------------------------
 
@@ -357,6 +482,7 @@ async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
         CMD_SEND => HandleResult::Response(handle_send(root, &req).await),
         CMD_SEND_WAIT => HandleResult::Response(handle_send_wait(root, &req).await),
         CMD_CLEAN => HandleResult::Response(handle_clean(root, &req).await),
+        CMD_REGISTER_SUBROOT => HandleResult::Response(handle_register_subroot(root, &req).await),
         _ => HandleResult::Response(Response::err(
             &req.id,
             format!("unknown command: {}", req.cmd),
@@ -647,7 +773,28 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             unit.restart
         };
 
-        let shell_cmd = psyfile::build_shell_command(&cmd_str);
+        let inner_shell_cmd = psyfile::build_shell_command(&cmd_str);
+        let shell_cmd = if unit.sub_root {
+            // Rewrite the command to invoke this same `psy` binary as a sub-root
+            // that registers with us (the parent) via PSY_SOCK and runs the
+            // unit's command as its main process.
+            let psy_bin = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "psy".to_string());
+            let mut argv = vec![
+                psy_bin,
+                "up".into(),
+                "--parent".into(),
+                root.psy_sock.clone(),
+                "--name".into(),
+                actual_name.clone(),
+                "--".into(),
+            ];
+            argv.extend(inner_shell_cmd);
+            argv
+        } else {
+            inner_shell_cmd
+        };
 
         let mut final_env = resolved_env;
         for (k, v) in instance_env {
@@ -688,6 +835,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             working_dir,
             ready,
             healthcheck,
+            unit.sub_root,
         )
         .await;
         return apply_wait_for(
@@ -749,6 +897,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         None,
         None,
         None,
+        false,
     )
     .await;
     apply_wait_for(root, &req.id, &process_name, wait_for, wait_timeout, result).await
@@ -1008,6 +1157,7 @@ async fn spawn_process(
     working_dir: Option<std::path::PathBuf>,
     ready_config: Option<crate::psyfile::ProbeConfig>,
     healthcheck_config: Option<crate::psyfile::ProbeConfig>,
+    is_subroot: bool,
 ) -> HandleResult {
     let mut table = root.process_table.lock().await;
 
@@ -1030,6 +1180,7 @@ async fn spawn_process(
 
     let mut entry = ProcessEntry::new(name.clone(), command, env, restart, false);
     entry.working_dir = working_dir;
+    entry.is_subroot = is_subroot;
 
     // Configure readiness probes
     let is_exit_probe = matches!(
@@ -1252,7 +1403,7 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
             let stderr_lines = entry
                 .stderr_buf
                 .lines(None, args.stream, since, until, grep_ref);
-            for mut line in stdout_lines.into_iter().chain(stderr_lines.into_iter()) {
+            for mut line in stdout_lines.into_iter().chain(stderr_lines) {
                 // Prefix content with instance name
                 line.content = format!("[{}] {}", instance_name, line.content);
                 all_lines.push(line);
@@ -1318,10 +1469,7 @@ async fn handle_logs(root: &Arc<SharedRoot>, req: &Request) -> Response {
     let stdout_lines = stdout_buf.lines(None, args.stream, since, until, grep_ref);
     let stderr_lines = stderr_buf.lines(None, args.stream, since, until, grep_ref);
 
-    let mut all_lines: Vec<_> = stdout_lines
-        .into_iter()
-        .chain(stderr_lines.into_iter())
-        .collect();
+    let mut all_lines: Vec<_> = stdout_lines.into_iter().chain(stderr_lines).collect();
     all_lines.sort_by_key(|l| l.timestamp);
 
     if let Some(n) = args.tail {
@@ -1589,7 +1737,25 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
                 }
             }
 
-            let shell_cmd = psyfile::build_shell_command(&cmd_str);
+            let inner_shell_cmd = psyfile::build_shell_command(&cmd_str);
+            let shell_cmd = if unit.sub_root {
+                let psy_bin = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "psy".to_string());
+                let mut argv = vec![
+                    psy_bin,
+                    "up".into(),
+                    "--parent".into(),
+                    root.psy_sock.clone(),
+                    "--name".into(),
+                    args.name.clone(),
+                    "--".into(),
+                ];
+                argv.extend(inner_shell_cmd);
+                argv
+            } else {
+                inner_shell_cmd
+            };
             let wd = unit.working_dir.as_ref().map(|d| {
                 let s = d.to_string_lossy().to_string();
                 std::path::PathBuf::from(psyfile::interpolate(&s, &full_env))
@@ -1639,6 +1805,7 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
         entry.run_history = history;
         entry.current_run_id = next_id;
         entry.working_dir = working_dir;
+        entry.is_subroot = unit_def.map(|u| u.sub_root).unwrap_or(false);
 
         // Configure readiness probes (already interpolated above)
         let ready_config = ready_cfg;
@@ -1871,6 +2038,91 @@ async fn handle_history(root: &Arc<SharedRoot>, req: &Request) -> Response {
     };
 
     Response::ok(&req.id, Some(serde_json::to_value(history).unwrap()))
+}
+
+async fn handle_register_subroot(root: &Arc<SharedRoot>, req: &Request) -> Response {
+    let args: RegisterSubrootArgs = match req
+        .args
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(a) => a,
+        None => return Response::err(&req.id, "invalid or missing register_subroot args"),
+    };
+
+    if !validate_name(&args.name) {
+        return Response::err(
+            &req.id,
+            "invalid sub-root unit name: must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,62}",
+        );
+    }
+
+    if args.socket_path.is_empty() {
+        return Response::err(&req.id, "sub-root socket_path must not be empty");
+    }
+
+    // Authorization: the sub-root's PID must be a descendant of this parent.
+    if !platform::is_descendant_of(args.pid, root.psy_root_pid) {
+        return Response::err(
+            &req.id,
+            format!(
+                "sub-root pid {} is not a descendant of parent psy pid {}",
+                args.pid, root.psy_root_pid
+            ),
+        );
+    }
+
+    let mut table = root.process_table.lock().await;
+    let entry = match table.get_mut(&args.name) {
+        Some(e) => e,
+        None => {
+            return Response::err(
+                &req.id,
+                format!("no unit '{}' to register as sub-root", args.name),
+            )
+        }
+    };
+
+    if entry.state != ProcessState::Running {
+        return Response::err(&req.id, format!("unit '{}' is not running", args.name));
+    }
+
+    if !entry.is_subroot {
+        return Response::err(
+            &req.id,
+            format!(
+                "unit '{}' was not started as a sub-root (parent did not flag it)",
+                args.name
+            ),
+        );
+    }
+
+    // Match the registering pid against the spawned child's pid. We accept
+    // either an exact match or a descendant of it (sub-root psy may have
+    // re-execed). Exact match is the common case.
+    match entry.pid {
+        Some(p) if p == args.pid => {}
+        Some(p) if platform::is_descendant_of(args.pid, p) => {}
+        Some(_) | None => {
+            return Response::err(
+                &req.id,
+                format!(
+                    "sub-root pid {} does not match spawned child for unit '{}'",
+                    args.pid, args.name
+                ),
+            );
+        }
+    }
+
+    entry.subroot_socket = Some(args.socket_path.clone());
+
+    Response::ok(
+        &req.id,
+        Some(serde_json::json!({
+            "name": args.name,
+            "registered": true,
+        })),
+    )
 }
 
 async fn handle_clean(root: &Arc<SharedRoot>, req: &Request) -> Response {
@@ -2391,9 +2643,10 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-async fn run_socket_listener(root: Arc<SharedRoot>) -> RootResult<()> {
-    let listener = tokio::net::UnixListener::bind(&root.socket_path)?;
-
+async fn run_socket_listener(
+    root: Arc<SharedRoot>,
+    listener: tokio::net::UnixListener,
+) -> RootResult<()> {
     loop {
         let (stream, _addr) = listener.accept().await?;
 
@@ -2482,15 +2735,14 @@ async fn handle_logs_follow(
 
 // Windows: use tokio named pipes for IPC.
 #[cfg(windows)]
-async fn run_socket_listener(root: Arc<SharedRoot>) -> RootResult<()> {
+async fn run_socket_listener(
+    root: Arc<SharedRoot>,
+    initial_server: tokio::net::windows::named_pipe::NamedPipeServer,
+) -> RootResult<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let pipe_name = &root.socket_path;
-
-    // Create the first pipe instance.
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(pipe_name)?;
+    let mut server = initial_server;
 
     loop {
         // Wait for a client to connect.
@@ -2641,10 +2893,7 @@ async fn handle_logs_follow_impl<W: tokio::io::AsyncWrite + Unpin>(
             .stderr_buf
             .lines(None, args.stream, since, None, grep_ref);
 
-        let mut all_lines: Vec<_> = stdout_lines
-            .into_iter()
-            .chain(stderr_lines.into_iter())
-            .collect();
+        let mut all_lines: Vec<_> = stdout_lines.into_iter().chain(stderr_lines).collect();
         all_lines.sort_by_key(|l| l.timestamp);
 
         if let Some(n) = args.tail {

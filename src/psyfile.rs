@@ -48,6 +48,10 @@ pub struct UnitDef {
     pub healthcheck: Option<ProbeConfig>,
     pub interactive: bool,
     pub ports: Vec<PortDef>,
+    /// Run this unit as a managed sub-root (`psy up --parent <parent_sock>`).
+    /// The unit's `command` runs as the sub-root's main process; the sub-root
+    /// has its own scoped socket and can manage its own children independently.
+    pub sub_root: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +145,7 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             "platform",
             "interactive",
             "ports",
+            "sub_root",
         ];
         for key in unit_table.keys() {
             if !known_fields.contains(&key.as_str()) {
@@ -300,6 +305,11 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
 
         let interactive = unit_table
             .get("interactive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let sub_root = unit_table
+            .get("sub_root")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -484,6 +494,25 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
             )
         };
 
+        // Sub-root validation: incompatible with interactive (parent doesn't
+        // own the sub-root's stdin pipe — the sub-root's main process owns it).
+        if sub_root && interactive {
+            return Err(format!(
+                "unit '{name}': 'sub_root = true' is incompatible with 'interactive = true'"
+            ));
+        }
+        // Sub-root readiness via 'exit' makes no sense — a sub-root psy is
+        // long-lived; it doesn't exit-on-success the way a build step does.
+        if sub_root {
+            if let Some(ref probe) = ready {
+                if matches!(probe.probe, ProbeKind::Exit(_)) {
+                    return Err(format!(
+                        "unit '{name}': 'sub_root = true' is incompatible with 'ready = {{ exit = ... }}'"
+                    ));
+                }
+            }
+        }
+
         units.insert(
             name.clone(),
             UnitDef {
@@ -497,6 +526,7 @@ pub fn parse_str(content: &str) -> Result<Psyfile, String> {
                 healthcheck,
                 interactive,
                 ports,
+                sub_root,
             },
         );
     }
@@ -1199,6 +1229,11 @@ pub fn json_schema() -> serde_json::Value {
                     "default": false,
                     "description": "Enable stdin pipe (writable via psy send)"
                 },
+                "sub_root": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Run this unit as a managed sub-root with its own scoped socket"
+                },
                 "ports": {
                     "type": "array",
                     "items": {
@@ -1389,6 +1424,72 @@ command = "cargo run"
 "#;
         let pf = parse_str(content).unwrap();
         assert!(!pf.units["server"].interactive);
+    }
+
+    // -- sub_root ------------------------------------------------------------
+
+    #[test]
+    fn parse_sub_root_true() {
+        let content = r#"
+[instance]
+command = "echo inner"
+sub_root = true
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(pf.units["instance"].sub_root);
+    }
+
+    #[test]
+    fn parse_sub_root_default_false() {
+        let content = r#"
+[plain]
+command = "echo plain"
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(!pf.units["plain"].sub_root);
+    }
+
+    #[test]
+    fn parse_sub_root_with_interactive_rejected() {
+        let content = r#"
+[bad]
+command = "python3"
+sub_root = true
+interactive = true
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(
+            err.contains("incompatible") && err.contains("interactive"),
+            "expected sub_root+interactive rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sub_root_with_exit_probe_rejected() {
+        let content = r#"
+[bad]
+command = "echo done"
+sub_root = true
+ready = { exit = 0 }
+"#;
+        let err = parse_str(content).unwrap_err();
+        assert!(
+            err.contains("incompatible") && err.contains("exit"),
+            "expected sub_root+exit-probe rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sub_root_with_tcp_probe_ok() {
+        let content = r#"
+[instance]
+command = "echo inner"
+sub_root = true
+ready = { tcp = "localhost:5432" }
+"#;
+        let pf = parse_str(content).unwrap();
+        assert!(pf.units["instance"].sub_root);
+        assert!(pf.units["instance"].ready.is_some());
     }
 
     // -- validate ------------------------------------------------------------

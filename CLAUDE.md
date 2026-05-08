@@ -78,6 +78,7 @@ psy/
 - [x] `psy up <units>` — start specified Psyfile units on boot
 - [x] `psy up --all` — start all Psyfile units on boot
 - [x] `psy up --mcp` — run MCP JSON-RPC server on stdin/stdout instead of main process
+- [x] `psy up --parent <sock>` — register as a managed sub-root of an existing psy
 - [x] `psy run <name> -- <command>` — send run command to root via PSY_SOCK
 - [x] `psy run <name>` — run Psyfile unit (no `--` needed)
 - [x] `psy run --restart <policy>` — restart policy
@@ -115,6 +116,7 @@ psy/
 - [x] `psy stop <name>` — send stop command
 - [x] `psy restart <name>` — send restart command
 - [x] `psy down` — send down command
+- [x] `psy --in <name> <subcommand>` — global flag, proxies to a named sub-root's socket
 - [x] `psy version` — print version
 
 ### Client Mode (`src/client.rs`)
@@ -225,6 +227,23 @@ psy/
 - [x] Platform override env merge: platform env merged on top of base (platform wins on conflict)
 - [x] Platform filtering at parse time: excluded units removed, downstream sees resolved units
 - [x] Platform validation: reject unknown platform names and override fields
+
+### Sub-roots (`src/root.rs`, `src/psyfile.rs`, `src/main.rs`)
+- [x] `Request::register_subroot` protocol message + `CMD_REGISTER_SUBROOT` constant
+- [x] `RegisterSubrootArgs { name, socket_path, pid }` payload
+- [x] `is_subroot` and `subroot_socket` fields on `ProcessEntry` and `ProcessInfo`
+- [x] `is_descendant_of(child, ancestor)` helper in both platform modules
+- [x] `psy up --parent <sock>` flag, mutually exclusive with `--mcp`
+- [x] Listener pre-bind (synchronous) so registration races are eliminated
+- [x] `register_with_parent` async helper sends NDJSON registration over the parent socket
+- [x] Parent-side `handle_register_subroot`: validates name, socket, PID descent, matching unit, running state
+- [x] Psyfile `sub_root = true` field; rejects combo with `interactive` or `ready = { exit }`
+- [x] Parent rewrites sub-root unit command to `<self_exe> up --parent <sock> --name <unit> -- <orig>`
+- [x] `is_subroot` propagated through `spawn_process` and `handle_restart_inner`
+- [x] `PSY_PARENT_SOCK` env var exposed to inner main process
+- [x] Global `--in <name>` flag: resolves sub-root socket via parent's `ps`, overrides `PSY_SOCK`
+- [x] `--in` rejected for `up`/`version`/`mcp`/`psyfile` subcommands
+- [x] JSON Schema includes `sub_root` field
 
 ### Port Allocation (`src/psyfile.rs`, `src/root.rs`)
 - [x] `PortDef` struct: name + optional default port
@@ -403,6 +422,13 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 - [x] Port allocation: default port used when available
 - [x] Port allocation: fallback to dynamic when default port is taken
 - [x] Port allocation: run response includes allocated ports
+- [x] Sub-root: registers and shows up in parent's ps with `--in` resolvable
+- [x] Sub-root: inner units invisible to parent's ps but visible via `--in`
+- [x] Sub-root: parent `psy stop <subroot>` tears down grandchildren
+- [x] Sub-root: parent SIGKILL → grandchildren die (Linux + Windows; macOS limitation documented)
+- [x] Sub-root: Psyfile validation rejects `sub_root + interactive` and `sub_root + ready={exit}`
+- [x] Sub-root: `--in` for non-sub-root unit errors gracefully
+- [x] Sub-root: registration with non-descendant PID rejected
 
 ### CI / GitHub Actions (`.github/workflows/ci.yml`)
 - [x] Matrix: ubuntu-latest, macos-latest, windows-latest

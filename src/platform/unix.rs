@@ -221,6 +221,22 @@ pub fn roots_dir() -> PathBuf {
     primary_socket_dir(uid).join("roots")
 }
 
+/// Return true if `ancestor` appears in `pid`'s ancestor chain (excluding
+/// `pid` itself). Used by parent psy to authorize sub-root registration:
+/// a sub-root is only allowed to register with a parent whose PID lies on
+/// its own ancestor chain.
+pub fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
+    if pid == ancestor {
+        return false;
+    }
+    let chain = get_ancestor_chain(pid);
+    // chain contains pid as last element; ancestor must appear earlier.
+    chain
+        .iter()
+        .take(chain.len().saturating_sub(1))
+        .any(|&p| p == ancestor)
+}
+
 /// Build the PID ancestor chain from PID 1 (or init) down to `pid`.
 ///
 /// Returns e.g. `[1, 423, 1500, pid]`. If the chain cannot be built
@@ -440,5 +456,25 @@ mod tests {
     fn test_roots_dir() {
         let dir = roots_dir();
         assert!(dir.to_string_lossy().contains("roots"));
+    }
+
+    #[test]
+    fn test_is_descendant_of_self_is_not_descendant() {
+        let pid = std::process::id();
+        assert!(!is_descendant_of(pid, pid));
+    }
+
+    #[test]
+    fn test_is_descendant_of_init() {
+        let pid = std::process::id();
+        // Init (PID 1) is always an ancestor of any process.
+        assert!(is_descendant_of(pid, 1));
+    }
+
+    #[test]
+    fn test_is_descendant_of_unrelated() {
+        // PID 4_000_000 is extremely unlikely to be in our chain.
+        let pid = std::process::id();
+        assert!(!is_descendant_of(pid, 4_000_000));
     }
 }

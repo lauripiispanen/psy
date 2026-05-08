@@ -74,6 +74,7 @@ Download from [GitHub Releases](https://github.com/lauripiispanen/psy/releases) 
 psy up [--name <name>] [units...] [-- <command>]   Start a psy root session
 psy up --all [-- <command>]                        Start all Psyfile units
 psy up --mcp [--all] [units...]                    Start root with MCP server on stdin/stdout
+psy up --parent <SOCK> -- <command>                Start as a managed sub-root of an existing psy
 psy run <name> [--restart <policy>] [-- <cmd>]     Launch a managed child process
 psy run --attach <name> [-- <cmd>]                 Launch and attach stdin/stdout
 psy run --interactive <name> [-- <cmd>]            Launch with writable stdin pipe
@@ -320,6 +321,7 @@ depends_on = ["api"]
 | `singleton` | bool | `true` | `false` = template unit (multiple instances) |
 | `interactive` | bool | `false` | Enable writable stdin pipe |
 | `ports` | array | `[]` | Named port allocations (strings or `{ name, default }` tables) |
+| `sub_root` | bool | `false` | Run this unit as a managed sub-root with its own scoped socket |
 | `working_dir` | string | cwd | Working directory |
 | `ready` | table | none | Startup readiness probe |
 | `healthcheck` | table | none | Continuous health check |
@@ -452,6 +454,40 @@ platform.windows.env = { PORT = "3000", RUST_LOG = "debug" }
 Platform overrides can set: `command`, `env`, `restart`, `depends_on`, `working_dir`, `ready`, `healthcheck`. Environment variables are merged (platform wins on conflict). Units excluded by `platforms` are invisible — they won't appear in `psy ps` and can't be started.
 
 Valid platform names: `linux`, `macos`, `windows`.
+
+### Sub-roots
+
+A unit declared with `sub_root = true` runs as a managed sub-root: its `command` is wrapped in a fresh `psy up --parent <parent_sock>` invocation, and the resulting psy registers itself with the umbrella psy as a unit. The sub-root has its own scoped socket and manages its own children independently — they're invisible to the umbrella's other units, and the sub-root's lifecycle is controlled from the umbrella (one place to kill everything; clean teardown on umbrella crash).
+
+```toml
+[instance-a]
+command = "./worker"
+sub_root = true
+restart = "on-failure"
+ports = [{ name = "pg", default = 5432 }]
+ready = { tcp = "localhost:${port.pg}" }
+```
+
+```bash
+psy up --all
+psy ps                                  # umbrella's units, including instance-a
+psy ps --in instance-a                  # drill in: shows instance-a's own units
+psy logs --in instance-a worker         # logs of instance-a's worker, from inside its tree
+psy stop instance-a                     # tears down instance-a and everything inside it
+```
+
+`--in <name>` is a global flag that resolves the named sub-root unit's socket via the umbrella and proxies the command there. It's equivalent to running `psy ps`/`psy logs`/etc. from inside the sub-root.
+
+You can also start a sub-root externally with `psy up --parent <SOCK>` — useful for tools that supervise their own sub-tenants under one umbrella psy.
+
+**Constraints on sub-root units:**
+- Incompatible with `interactive = true` (the sub-root psy owns the inner stdin pipe).
+- Incompatible with `ready = { exit = ... }` (sub-root psys are long-lived).
+- Probes on a sub-root unit run from the parent's perspective (e.g. `ready = { tcp = ... }` waits for the inner workload to listen). The sub-root's own units have their own probes inside the sub-root's Psyfile, independent of the parent.
+
+**Cleanup contract:** stopping the sub-root unit from the parent SIGTERMs the sub-root's main process; the sub-root tears down its own children and exits. Killing the parent psy itself cascades through OS-level mechanisms (subreaper / pipe trick / Job Object), so grandchildren also die.
+
+**Authorization:** the registering sub-root's PID must be a descendant of the parent psy. Unrelated processes that happen to know the parent socket path cannot inject themselves as sub-roots.
 
 ### Hot-reload
 

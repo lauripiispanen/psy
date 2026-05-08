@@ -490,7 +490,7 @@ fn test_name_validation() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_duplicate_name() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -572,7 +572,7 @@ fn test_multiple_roots() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_env_passing() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -925,7 +925,7 @@ fn test_logs_grep_no_match() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_attach_output_and_exit() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -971,7 +971,7 @@ fn test_attach_output_and_exit() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_attach_detach_keeps_running() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -3841,7 +3841,7 @@ fn test_wait_for_log() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_clean() {
     let root = PsyRoot::start(&["sleep", "300"]);
 
@@ -4166,4 +4166,456 @@ ports = [{ name = "http", default = 48902 }]
     );
 
     drop(blocker);
+}
+
+// ---------------------------------------------------------------------------
+// Sub-roots
+// ---------------------------------------------------------------------------
+
+/// Wait up to `timeout` for `cond` to return true, polling every 100ms.
+fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    cond()
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_subroot_registers_and_shows_in_ps() {
+    // Sub-root unit's main is `sleep 60`. After spawn the sub-root psy should
+    // register itself with the parent and the parent's ps should show
+    // is_subroot=true with a non-empty subroot_socket.
+    let inner = if cfg!(unix) {
+        "sleep 60"
+    } else {
+        "ping -n 60 127.0.0.1"
+    };
+    let psyfile_content = format!(
+        r#"
+[instance]
+command = "{inner}"
+sub_root = true
+"#
+    );
+    let psyfile = TempPsyfileDir::new(&psyfile_content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "instance"]);
+
+    // Wait for the sub-root to bind its socket and register.
+    let registered = wait_until(Duration::from_secs(8), || {
+        let out = root.psy_stdout(&["ps"]);
+        out.contains("instance") && out.contains("running")
+    });
+    assert!(registered, "sub-root unit should appear in parent ps");
+
+    // Get raw JSON ps (not via psy ps which formats), by using a plain
+    // protocol call. We already exercise both forms; check the table view here
+    // and the structured fields via --in below.
+    // Confirm `--in` can resolve the sub-root socket — that requires
+    // is_subroot=true and subroot_socket=Some on the parent's entry.
+    let in_ok = wait_until(Duration::from_secs(8), || {
+        let out = root.psy(&["--in", "instance", "ps"]);
+        out.status.success()
+    });
+    assert!(
+        in_ok,
+        "`psy --in instance ps` should succeed once sub-root has registered"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_subroot_in_proxy_isolates_units() {
+    // Spawn a sub-root, then run a child INSIDE the sub-root's tree.
+    // From the parent's view, the child must NOT appear (only the sub-root
+    // itself appears). From the sub-root's view (via --in), the child must
+    // appear.
+    let inner = if cfg!(unix) {
+        "sleep 60"
+    } else {
+        "ping -n 60 127.0.0.1"
+    };
+    let psyfile_content = format!(
+        r#"
+[instance]
+command = "{inner}"
+sub_root = true
+"#
+    );
+    let psyfile = TempPsyfileDir::new(&psyfile_content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "instance"]);
+    let registered = wait_until(Duration::from_secs(8), || {
+        root.psy(&["--in", "instance", "ps"]).status.success()
+    });
+    assert!(registered, "sub-root must register before we can drill in");
+
+    // Run a unit inside the sub-root via --in.
+    let inner_sl = sleep_cmd(120);
+    let inner_refs = to_refs(&inner_sl);
+    let mut args = vec!["--in", "instance", "run", "inner-worker", "--"];
+    args.extend(inner_refs);
+    let out = root.psy(&args);
+    assert!(
+        out.status.success(),
+        "inner run via --in should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    thread::sleep(Duration::from_secs(1));
+
+    // Sub-root's ps must show inner-worker.
+    let inner_ps = root.psy_stdout(&["--in", "instance", "ps"]);
+    assert!(
+        inner_ps.contains("inner-worker"),
+        "sub-root ps should list inner-worker, got: {inner_ps}"
+    );
+
+    // Parent's ps must NOT show inner-worker.
+    let parent_ps = root.psy_stdout(&["ps"]);
+    assert!(
+        !parent_ps.contains("inner-worker"),
+        "parent ps must not show sub-root's child, got: {parent_ps}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_subroot_stop_tears_down_grandchildren() {
+    // Verify that stopping a sub-root from the parent terminates its
+    // grandchildren as well. We grab the grandchild PID via --in ps before
+    // stopping, then poll for its termination.
+    let inner = if cfg!(unix) {
+        "sleep 60"
+    } else {
+        "ping -n 60 127.0.0.1"
+    };
+    let psyfile_content = format!(
+        r#"
+[instance]
+command = "{inner}"
+sub_root = true
+"#
+    );
+    let psyfile = TempPsyfileDir::new(&psyfile_content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "instance"]);
+    let registered = wait_until(Duration::from_secs(8), || {
+        root.psy(&["--in", "instance", "ps"]).status.success()
+    });
+    assert!(registered, "sub-root must register");
+
+    // Spawn a long-running grandchild inside the sub-root.
+    let long = sleep_cmd(600);
+    let long_refs = to_refs(&long);
+    let mut args = vec!["--in", "instance", "run", "victim", "--"];
+    args.extend(long_refs);
+    root.psy(&args);
+
+    // Grab grandchild pid from --in ps. The output table prints PID in
+    // column 2, so just look for "victim" line and parse.
+    let mut grandchild_pid: Option<u32> = None;
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(200));
+        let out = root.psy_stdout(&["--in", "instance", "ps"]);
+        if let Some(line) = out.lines().find(|l| l.contains("victim")) {
+            let mut parts = line.split_whitespace();
+            parts.next(); // name
+            if let Some(pid_str) = parts.next() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+        }
+    }
+    let pid = grandchild_pid.expect("could not capture grandchild pid");
+
+    // Sanity: grandchild is alive.
+    #[cfg(unix)]
+    let alive_now = unsafe { libc::kill(pid as i32, 0) == 0 };
+    #[cfg(windows)]
+    let alive_now = is_pid_alive_win(pid);
+    assert!(
+        alive_now,
+        "grandchild pid {pid} should be alive before stop"
+    );
+
+    // Stop the sub-root from the parent.
+    root.psy(&["stop", "instance"]);
+
+    // Grandchild should die within a few seconds (parent SIGTERMs sub-root,
+    // sub-root tears down its children, OS reaps the rest).
+    let dead = wait_until(Duration::from_secs(15), || {
+        #[cfg(unix)]
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        #[cfg(windows)]
+        let alive = is_pid_alive_win(pid);
+        !alive
+    });
+    assert!(
+        dead,
+        "grandchild pid {pid} should be dead after sub-root stop"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+// macOS has a documented limitation: the pipe-trick cleanup mechanism only
+// reaches direct children. With a sub-root in the chain (parent → sub-root →
+// grandchild), great-grandchildren of the parent rely on a watchdog in the
+// sub-root process that doesn't run reliably under SIGKILL. Linux uses
+// PR_SET_PDEATHSIG which cascades through every level, and Windows Job
+// Objects do the same. So this guarantee is exercised on Linux and Windows.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn test_subroot_parent_kill_kills_grandchildren() {
+    // The most important guarantee: SIGKILL the parent psy and verify that
+    // grandchildren (children of the sub-root) are also dead. This exercises
+    // the OS-level cleanup chain (subreaper / pipe trick / Job Object).
+    let inner = if cfg!(unix) {
+        "sleep 60"
+    } else {
+        "ping -n 60 127.0.0.1"
+    };
+    let psyfile_content = format!(
+        r#"
+[instance]
+command = "{inner}"
+sub_root = true
+"#
+    );
+    let psyfile = TempPsyfileDir::new(&psyfile_content);
+    let sl = sleep_cmd(120);
+    let mut root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    root.psy(&["run", "instance"]);
+    let registered = wait_until(Duration::from_secs(8), || {
+        root.psy(&["--in", "instance", "ps"]).status.success()
+    });
+    assert!(registered, "sub-root must register");
+
+    // Spawn grandchild inside sub-root.
+    let long = sleep_cmd(600);
+    let long_refs = to_refs(&long);
+    let mut args = vec!["--in", "instance", "run", "victim", "--"];
+    args.extend(long_refs);
+    root.psy(&args);
+
+    let mut grandchild_pid: Option<u32> = None;
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(200));
+        let out = root.psy_stdout(&["--in", "instance", "ps"]);
+        if let Some(line) = out.lines().find(|l| l.contains("victim")) {
+            let mut parts = line.split_whitespace();
+            parts.next();
+            if let Some(pid_str) = parts.next() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+        }
+    }
+    let pid = grandchild_pid.expect("could not capture grandchild pid");
+
+    // SIGKILL the parent psy. We must do this directly, not via psy down,
+    // to test the OS-level cascade.
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(root.child.id() as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        let _ = root.child.kill();
+    }
+    let _ = root.child.wait();
+
+    // Within a few seconds the grandchild must be dead.
+    let dead = wait_until(Duration::from_secs(15), || {
+        #[cfg(unix)]
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        #[cfg(windows)]
+        let alive = is_pid_alive_win(pid);
+        !alive
+    });
+    assert!(
+        dead,
+        "grandchild pid {pid} should be dead after parent SIGKILL"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_subroot_validation_rejects_interactive() {
+    // sub_root + interactive in the same Psyfile unit should fail to parse.
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[bad]
+command = "python3"
+sub_root = true
+interactive = true
+"#,
+    );
+    let out = Command::new(psy_bin())
+        .args(["psyfile", "validate", "--file"])
+        .arg(psyfile.psyfile_path())
+        .output()
+        .expect("psyfile validate");
+    assert!(!out.status.success(), "validate should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("incompatible") || stderr.contains("interactive"),
+        "expected interactive incompatibility error, got: {stderr}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_subroot_validation_rejects_exit_probe() {
+    // sub_root + ready={exit=N} should fail at parse time.
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[bad]
+command = "echo done"
+sub_root = true
+ready = { exit = 0 }
+"#,
+    );
+    let out = Command::new(psy_bin())
+        .args(["psyfile", "validate", "--file"])
+        .arg(psyfile.psyfile_path())
+        .output()
+        .expect("psyfile validate");
+    assert!(!out.status.success(), "validate should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("incompatible") || stderr.contains("exit"),
+        "expected exit-probe incompatibility error, got: {stderr}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_subroot_in_for_unrelated_unit_errors() {
+    // Drilling --in for a unit that is NOT a sub-root must error gracefully.
+    let psyfile = TempPsyfileDir::new(
+        r#"
+[plain]
+command = "sleep 30"
+"#,
+    );
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+    root.psy(&["run", "plain"]);
+    thread::sleep(Duration::from_secs(1));
+
+    let out = root.psy(&["--in", "plain", "ps"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "--in for non-sub-root should fail, got: {combined}"
+    );
+    assert!(
+        combined.to_lowercase().contains("not a sub-root")
+            || combined.to_lowercase().contains("not a sub_root"),
+        "error should explain why, got: {combined}"
+    );
+}
+
+#[test]
+#[ignore]
+#[parallel(discovery)]
+fn test_subroot_unrelated_pid_registration_rejected() {
+    // Manually craft a register_subroot request claiming an arbitrary external
+    // pid (PID 1) as the registering process. The parent must reject because
+    // pid 1 is not a descendant of the parent psy.
+    use std::io::{BufRead, BufReader, Write};
+
+    let inner = if cfg!(unix) {
+        "sleep 60"
+    } else {
+        "ping -n 60 127.0.0.1"
+    };
+    let psyfile_content = format!(
+        r#"
+[instance]
+command = "{inner}"
+sub_root = true
+"#
+    );
+    let psyfile = TempPsyfileDir::new(&psyfile_content);
+    let sl = sleep_cmd(60);
+    let root = PsyRoot::start_with_psyfile(&psyfile.psyfile_path(), &[], &to_refs(&sl));
+
+    // Send register_subroot directly to the parent's socket impersonating pid 1.
+    let req = serde_json::json!({
+        "id": "test-1",
+        "cmd": "register_subroot",
+        "args": {
+            "name": "instance",
+            "socket_path": "/tmp/fake.sock",
+            "pid": 1u32,
+        }
+    });
+
+    #[cfg(unix)]
+    {
+        let stream =
+            std::os::unix::net::UnixStream::connect(&root.sock).expect("connect to parent sock");
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+        let mut payload = serde_json::to_string(&req).unwrap();
+        payload.push('\n');
+        writer.write_all(payload.as_bytes()).expect("write");
+        writer.flush().expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        let resp: serde_json::Value = serde_json::from_str(&line).expect("parse");
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false));
+        let err = resp["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("descendant") || err.contains("not a sub-root"),
+            "expected descendant rejection or not-running error, got: {err}"
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows the named pipe path is in root.sock; opening a client.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&root.sock)
+            .expect("open named pipe");
+        let mut payload = serde_json::to_string(&req).unwrap();
+        payload.push('\n');
+        file.write_all(payload.as_bytes()).expect("write");
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        let resp: serde_json::Value = serde_json::from_str(&line).expect("parse");
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false));
+    }
 }

@@ -30,6 +30,10 @@ use protocol::{
     version
 )]
 struct Cli {
+    /// Drill into a managed sub-root: resolve the named sub-root unit in the
+    /// current root and proxy this command to its socket.
+    #[arg(long = "in", value_name = "NAME", global = true)]
+    target_subroot: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -53,6 +57,9 @@ enum Commands {
         /// Run MCP JSON-RPC server on stdin/stdout instead of a main process
         #[arg(long)]
         mcp: bool,
+        /// Run as a managed sub-root: register with the parent psy at this socket path
+        #[arg(long, value_name = "SOCK")]
+        parent: Option<String>,
         /// Command to run as the main process (default: $SHELL)
         #[arg(last = true)]
         command: Vec<String>,
@@ -213,6 +220,27 @@ enum PsyfileCommands {
 fn main() {
     let cli = Cli::parse();
 
+    // If --in <name> was supplied, resolve the named sub-root's socket via
+    // the current root and override PSY_SOCK before dispatching. Up/Version/
+    // Mcp/Psyfile commands don't make sense to proxy and reject --in.
+    if let Some(ref subroot_name) = cli.target_subroot {
+        match &cli.command {
+            Commands::Up { .. } | Commands::Version | Commands::Mcp | Commands::Psyfile { .. } => {
+                eprintln!("psy: --in is not valid for this command");
+                std::process::exit(1);
+            }
+            _ => match resolve_subroot_sock(subroot_name) {
+                Ok(sock) => {
+                    std::env::set_var("PSY_SOCK", sock);
+                }
+                Err(e) => {
+                    eprintln!("psy: --in: {e}");
+                    std::process::exit(1);
+                }
+            },
+        }
+    }
+
     match cli.command {
         Commands::Up {
             name,
@@ -220,10 +248,15 @@ fn main() {
             all,
             file,
             mcp,
+            parent,
             command,
         } => {
             if mcp && !command.is_empty() {
                 eprintln!("psy up: --mcp is incompatible with -- <command>");
+                std::process::exit(1);
+            }
+            if mcp && parent.is_some() {
+                eprintln!("psy up: --mcp is incompatible with --parent");
                 std::process::exit(1);
             }
             // Resolve the Psyfile path
@@ -307,7 +340,7 @@ fn main() {
             };
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             let exit_code = rt.block_on(async {
-                match psy_root.run(main_cmd, boot_units, mcp).await {
+                match psy_root.run(main_cmd, boot_units, mcp, parent).await {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("psy: {e}");
@@ -777,6 +810,34 @@ command = "echo 'hello world'"
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Look up a sub-root unit's socket path via the current root's `ps` response.
+/// Used by `--in <name>` to redirect subsequent calls to the sub-root.
+fn resolve_subroot_sock(name: &str) -> Result<String, String> {
+    let resp = client::send_command(Request::ps())?;
+    if !resp.ok {
+        return Err(resp.error.unwrap_or_else(|| "ps failed".into()));
+    }
+    let data = resp
+        .data
+        .ok_or_else(|| "empty ps response from root".to_string())?;
+    let ps: PsResponse =
+        serde_json::from_value(data).map_err(|e| format!("invalid ps response: {e}"))?;
+    let entry = ps
+        .processes
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("no unit named '{name}' in current root"))?;
+    if !entry.is_subroot {
+        return Err(format!("unit '{name}' is not a sub-root"));
+    }
+    match &entry.subroot_socket {
+        Some(s) => Ok(s.clone()),
+        None => Err(format!(
+            "sub-root '{name}' has not yet registered (its socket is not available)"
+        )),
+    }
+}
 
 fn send_and_print(req: Request) {
     match client::send_command(req) {

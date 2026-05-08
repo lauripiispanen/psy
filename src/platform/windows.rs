@@ -178,6 +178,21 @@ pub fn roots_dir() -> PathBuf {
     }
 }
 
+/// Return true if `ancestor` appears in `pid`'s ancestor chain (excluding
+/// `pid` itself). Used by parent psy to authorize sub-root registration:
+/// a sub-root is only allowed to register with a parent whose PID lies on
+/// its own ancestor chain.
+pub fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
+    if pid == ancestor {
+        return false;
+    }
+    let chain = get_ancestor_chain(pid);
+    chain
+        .iter()
+        .take(chain.len().saturating_sub(1))
+        .any(|&p| p == ancestor)
+}
+
 /// Build the PID ancestor chain from the root of the tree down to `pid`.
 ///
 /// Returns e.g. `[4, 423, 1500, pid]`. On Windows the top-level PID is

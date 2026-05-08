@@ -128,6 +128,12 @@ pub struct ProcessEntry {
     pub kill_notify: Arc<Notify>,
     /// Notified when the process exits (for `wait_for: exit`).
     pub exit_notify: Arc<Notify>,
+    /// Whether this unit is a managed sub-root (`sub_root = true` or started
+    /// with `psy up --parent`).
+    pub is_subroot: bool,
+    /// Set after the sub-root registers its socket path with this parent.
+    /// Clients use it to drill in via `--in <name>`.
+    pub subroot_socket: Option<String>,
 }
 
 impl ProcessEntry {
@@ -169,6 +175,8 @@ impl ProcessEntry {
             probe_cancel: None,
             kill_notify: Arc::new(Notify::new()),
             exit_notify: Arc::new(Notify::new()),
+            is_subroot: false,
+            subroot_socket: None,
         }
     }
 
@@ -248,6 +256,8 @@ impl ProcessEntry {
             restarts: self.restarts,
             ready,
             ports: None,
+            subroot_socket: self.subroot_socket.clone(),
+            is_subroot: self.is_subroot,
         }
     }
 }

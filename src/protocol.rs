@@ -65,6 +65,7 @@ pub const CMD_HISTORY: &str = "history";
 pub const CMD_SEND: &str = "send";
 pub const CMD_SEND_WAIT: &str = "send_wait";
 pub const CMD_CLEAN: &str = "clean";
+pub const CMD_REGISTER_SUBROOT: &str = "register_subroot";
 
 // ---------------------------------------------------------------------------
 // Argument / payload types
@@ -222,6 +223,18 @@ pub struct StopArgs {
     pub name: String,
 }
 
+/// Sent by a sub-root to its parent so the parent can record the sub-root's
+/// socket path and authorize the connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSubrootArgs {
+    /// The unit name the sub-root expects to be registered as.
+    pub name: String,
+    /// The sub-root's own socket/pipe path (clients can drill in via `--in`).
+    pub socket_path: String,
+    /// The sub-root's own PID — must be a descendant of the parent psy.
+    pub pid: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartArgs {
     pub name: String,
@@ -246,6 +259,14 @@ pub struct ProcessInfo {
     pub ready: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<HashMap<String, u16>>,
+    /// Set when this unit is a managed sub-root and registration succeeded.
+    /// Clients use this for `--in <name>` proxying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subroot_socket: Option<String>,
+    /// Set when this unit was started as a sub-root (`sub_root = true` or
+    /// `psy up --parent`), regardless of whether registration has completed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_subroot: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +354,13 @@ impl Request {
 
     pub fn clean() -> Self {
         Self::new(CMD_CLEAN, None)
+    }
+
+    pub fn register_subroot(args: RegisterSubrootArgs) -> Self {
+        Self::new(
+            CMD_REGISTER_SUBROOT,
+            Some(serde_json::to_value(args).expect("serialize RegisterSubrootArgs")),
+        )
     }
 }
 
