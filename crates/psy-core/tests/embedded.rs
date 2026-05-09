@@ -8,11 +8,21 @@
 //! Run with `cargo test --test embedded -- --ignored`.
 
 #![cfg(target_os = "macos")]
+//
+// All tests use `cargo test ... -- --test-threads=1` semantics (each test
+// constructs a `PsyRoot` and binds a per-PID socket; running concurrent
+// tests in the same test binary would collide on the socket path).
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Coarse global lock to serialize tests that build a real `PsyRoot`.
+/// Without it, two tests in the same process race on the per-PID socket
+/// path and the second `bind` returns `Address already in use`.
+static ROOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Find the embedded_fixture binary. Cargo builds examples to
 /// `target/<profile>/examples/<name>` — we resolve via the test executable's
@@ -42,6 +52,66 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
 
 fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)] // intentional: serializes test runs
+async fn test_embedded_smoke_spawn_list_stop_shutdown() {
+    use psy_core::{PsyRoot, RestartPolicy, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let root = PsyRoot::start(RootOptions::new("smoke-host"))
+        .await
+        .expect("PsyRoot::start");
+
+    // Spawn a long-running child.
+    let h = root
+        .spawn(Spawn::new("worker", ["sleep", "60"]).with_restart(RestartPolicy::No))
+        .await
+        .expect("spawn");
+    assert_eq!(h.name, "worker");
+    assert!(h.pid.is_some());
+
+    // list/status both visible.
+    let listing = root.list().await.expect("list");
+    assert!(listing.iter().any(|p| p.name == "worker"));
+    let status = root.status("worker").await.expect("status");
+    assert_eq!(status.status, "running");
+
+    // stop ↦ entry stays in the table as a tombstone with status != running.
+    root.stop("worker").await.expect("stop");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = root.status("worker").await.expect("status post-stop");
+    assert_ne!(after.status, "running", "worker should be stopped");
+
+    // clean removes the tombstone.
+    let removed = root.clean().await.expect("clean");
+    assert!(removed >= 1, "clean should remove >=1 entry");
+
+    // shutdown without errors.
+    root.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[ignore]
+#[allow(clippy::await_holding_lock)] // intentional: serializes test runs
+async fn test_embedded_runtime_injection_current_thread() {
+    // Smoke: same as above but on a current_thread runtime, validating that
+    // the library doesn't depend on the multi-threaded runtime.
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let root = PsyRoot::start(RootOptions::new("ct-host"))
+        .await
+        .expect("PsyRoot::start");
+    let _h = root
+        .spawn(Spawn::new("idle", ["sleep", "30"]))
+        .await
+        .expect("spawn");
+    let listing = root.list().await.expect("list");
+    assert!(listing.iter().any(|p| p.name == "idle"));
+    root.shutdown().await.expect("shutdown");
 }
 
 #[test]

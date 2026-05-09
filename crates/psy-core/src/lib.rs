@@ -4,11 +4,34 @@
 //! also be embedded directly in a host process to supervise children without
 //! a separate `psy` process.
 //!
-//! Today the module surface is `pub` so the in-tree CLI binary, MCP server,
-//! and wire-protocol client can use it. The Phase B work in this release
-//! introduces the curated `RootOptions` / `RootHandle` / `Spawn` API on top
-//! of these modules; the modules themselves stay pub for advanced use.
+//! ## Quick start (embedded)
+//!
+//! ```no_run
+//! use psy_core::{PsyRoot, RootOptions, Spawn, RestartPolicy};
+//!
+//! // At the very top of your `main()` — before any other initialization.
+//! psy_core::dispatch_macos_cleanup_if_invoked();
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let root = PsyRoot::start(RootOptions::new("my-host")).await?;
+//! let _h = root
+//!     .spawn(Spawn::new("worker", ["my-program", "--flag"])
+//!         .with_restart(RestartPolicy::OnFailure))
+//!     .await?;
+//! // ... do host work ...
+//! root.shutdown().await?;
+//! # Ok(()) }
+//! ```
+//!
+//! ## Modules
+//!
+//! The curated public API lives at the crate root via re-exports below.
+//! The underlying modules (`protocol`, `process`, `root`, `psyfile`, …)
+//! stay `pub` so advanced callers and the in-tree CLI / MCP / client crates
+//! can reach in. Only the items re-exported here carry SemVer guarantees;
+//! anything else is subject to change.
 
+pub mod api;
 pub mod macos_cleanup;
 pub mod platform;
 pub mod probe;
@@ -18,7 +41,11 @@ pub mod psyfile;
 pub mod ring_buffer;
 pub mod root;
 
-// Convenience re-exports for the most common embedded-mode entry points.
+// Curated public surface.
+pub use api::{
+    LogLine, LogPage, LogsQuery, ProcessInfo, PsyError, PsyRoot, PsyfileSource, RestartPolicy,
+    RootHandle, RootOptions, RunInfo, SocketBinding, Spawn, SpawnHandle, StreamKind, WaitFor,
+};
 pub use macos_cleanup::{
     dispatch_macos_cleanup_if_invoked, dispatch_macos_cleanup_if_invoked_with_sentinel,
     SidecarStrategy, DEFAULT_SENTINEL,

@@ -329,6 +329,7 @@ fn run_sidecar(parent_pid: u32) -> ! {
         eprintln!("psy macos-cleanup: {CLEANUP_FD_ENV} not set");
         std::process::exit(2);
     });
+    let _ = parent_pid;
     let fd: RawFd = match fd_str.parse() {
         Ok(n) => n,
         Err(_) => {
@@ -387,11 +388,13 @@ fn run_sidecar(parent_pid: u32) -> ! {
         )
     };
     if registered < 0 {
-        eprintln!(
-            "psy macos-cleanup: kevent register failed: {}",
-            std::io::Error::last_os_error()
-        );
-        std::process::exit(2);
+        // The parent died between sidecar fork+exec and our kqueue
+        // register call (ESRCH on macOS). Pipe will EOF shortly — the
+        // reader thread drains buffered PIDs from the kernel pipe and
+        // SIGKILLs them. Sleep just long enough for that to happen, then
+        // join the reader's exit path.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        sigkill_all_and_exit(&pids);
     }
 
     let mut kev_out = libc::kevent {

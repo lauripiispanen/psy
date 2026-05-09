@@ -122,6 +122,12 @@ impl PsyRoot {
         Arc::clone(&self.shared)
     }
 
+    /// Clone of the main-exit watch sender. Used by the public
+    /// `RootHandle::shutdown` to signal teardown completion.
+    pub fn main_exit_tx_for_test(&self) -> watch::Sender<Option<i32>> {
+        self.shared.main_exit_tx.clone()
+    }
+
     pub fn new(name: String, psyfile_path: Option<PathBuf>) -> RootResult<Self> {
         Self::new_with_strategy(
             name,
@@ -2555,7 +2561,7 @@ async fn handle_send_wait(root: &Arc<SharedRoot>, req: &Request) -> Response {
 // Teardown
 // ---------------------------------------------------------------------------
 
-async fn teardown(root: Arc<SharedRoot>) {
+pub(crate) async fn teardown(root: Arc<SharedRoot>) {
     root.shutting_down.store(true, Ordering::Relaxed);
 
     // Collect running PIDs
