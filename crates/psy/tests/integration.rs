@@ -4981,6 +4981,7 @@ fn wait_until_pid(root: &PsyRoot, name: &str) -> u32 {
 }
 
 /// Helper: poll until `cond` returns Some, up to `timeout`.
+#[cfg(target_os = "macos")]
 fn wait_until_some<T, F: FnMut() -> Option<T>>(timeout: Duration, mut cond: F) -> Option<T> {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
