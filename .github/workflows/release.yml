@@ -11,6 +11,12 @@ env:
 permissions:
   contents: write
 
+# Toolchain version pinned in rust-toolchain.toml (currently 1.95.0). The
+# release workflow installs that exact version directly so cross-compile
+# targets can be added on the same toolchain (otherwise cargo follows the
+# pin and tries to use 1.95.0 without the requested target installed,
+# producing "can't find crate for `core`").
+
 jobs:
   lint:
     name: Lint
@@ -19,8 +25,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
@@ -35,10 +42,10 @@ jobs:
             ${{ runner.os }}-cargo-lint-
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test
@@ -47,7 +54,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -61,7 +70,7 @@ jobs:
             ${{ runner.os }}-cargo-test-
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
 
   build:
     name: Build ${{ matrix.target }}
@@ -94,8 +103,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build
@@ -116,9 +126,9 @@ jobs:
       - name: Build release binary
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --target ${{ matrix.target }} -p psy
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target ${{ matrix.target }} -p psy
           fi
         shell: bash
 
