@@ -1,10 +1,15 @@
+//! psy-client — NDJSON wire-protocol client for talking to a running psy.
+//!
+//! Today this is the same client the in-tree CLI binary uses. It connects
+//! to a psy root via Unix domain socket (Linux/macOS) or named pipe
+//! (Windows), discovered via `PSY_SOCK` or auto-discovery through the
+//! ancestor anchor chain.
+
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
-use serde_json;
-
-use crate::platform;
-use crate::protocol::{
+use psy_core::platform;
+use psy_core::protocol::{
     LogsArgs, Request, Response, RestartPolicy, RunArgs, StdinData, StreamFilter,
 };
 

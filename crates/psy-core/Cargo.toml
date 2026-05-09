@@ -1,0 +1,32 @@
+[package]
+name = "psy-core"
+version.workspace = true
+edition.workspace = true
+description = "Cross-platform process lifecycle supervisor — embeddable library"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "signal", "user"] }
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
+    "Win32_Foundation",
+] }

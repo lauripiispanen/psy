@@ -22,6 +22,24 @@ use crate::ring_buffer::Stream as RBStream;
 
 pub type RootResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// What runs as the "main" of a psy root.
+///
+/// `Default` spawns a normal child process (a shell, a user-supplied command,
+/// etc.) and tracks it in the process table as `main`. `Custom` hands control
+/// to a caller-supplied closure on a blocking task — the CLI uses this to
+/// host the MCP JSON-RPC server in-process without `psy-core` having to know
+/// about MCP. When the closure returns, root teardown follows.
+pub enum MainMode {
+    Default,
+    Custom(Box<dyn FnOnce() + Send + 'static>),
+}
+
+impl Default for MainMode {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared root state (Arc-friendly)
 // ---------------------------------------------------------------------------
@@ -184,9 +202,13 @@ impl PsyRoot {
 
     /// Run the psy root server.
     ///
-    /// `main_command` — the main process command (or `None` to use `$SHELL`).
-    /// `mcp_mode` — if true, run the MCP JSON-RPC server on stdin/stdout
-    /// instead of spawning a main process.
+    /// `main_command` — the main process command. Ignored if `main_mode`
+    /// is `MainMode::Custom`. If `None` and `main_mode` is `Default`,
+    /// `$SHELL` (Unix) / `%COMSPEC%` (Windows) is used.
+    /// `main_mode` — what runs as the "main" of this root: a spawned child
+    /// process (the default) or a custom callback (used by the CLI to host
+    /// an MCP server in-process). The callback runs on a blocking task and
+    /// must return when its work is done; root teardown follows.
     /// `parent_sock` — if `Some`, this is a sub-root: register with the parent
     /// at that socket path before starting boot units.
     ///
@@ -195,20 +217,19 @@ impl PsyRoot {
         mut self,
         main_command: Option<Vec<String>>,
         boot_units: Vec<String>,
-        mcp_mode: bool,
+        main_mode: MainMode,
         parent_sock: Option<String>,
     ) -> RootResult<i32> {
-        // Determine the main command (not needed in MCP mode)
-        let main_cmd = if mcp_mode {
-            None
-        } else {
-            Some(main_command.unwrap_or_else(|| {
+        // Determine the main command (not needed in Custom mode)
+        let main_cmd = match main_mode {
+            MainMode::Default => Some(main_command.unwrap_or_else(|| {
                 #[cfg(unix)]
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
                 #[cfg(windows)]
                 let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
                 vec![shell]
-            }))
+            })),
+            MainMode::Custom(_) => None,
         };
 
         // Bind the socket synchronously so that sub-root registration with a
@@ -337,18 +358,17 @@ impl PsyRoot {
                     monitor_child(root, "main".into()).await;
                 });
             }
-        } else {
-            // MCP mode: run the MCP JSON-RPC server on stdin/stdout.
-            // When stdin closes (agent disconnects), signal teardown.
+        } else if let MainMode::Custom(callback) = main_mode {
+            // Custom main: run the caller-supplied closure on a blocking
+            // task. Used by the CLI to host the MCP JSON-RPC server in-process.
+            // When the callback returns (e.g. stdin closes), trigger teardown.
             let exit_tx = self.shared.main_exit_tx.clone();
             let psy_sock = self.shared.psy_sock.clone();
             let psy_root_pid = self.shared.psy_root_pid;
             tokio::task::spawn_blocking(move || {
-                // Set PSY_SOCK so the MCP server's client calls can find us.
                 std::env::set_var("PSY_SOCK", &psy_sock);
                 std::env::set_var("PSY_ROOT_PID", psy_root_pid.to_string());
-                let _ = crate::mcp::run();
-                // stdin closed — trigger teardown.
+                callback();
                 let _ = exit_tx.send(Some(0));
             });
         }

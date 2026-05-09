@@ -1,0 +1,14 @@
+[package]
+name = "psy-mcp"
+version.workspace = true
+edition.workspace = true
+description = "MCP JSON-RPC server for psy"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+psy-core = { path = "../psy-core", version = "2.0.0" }
+psy-client = { path = "../psy-client", version = "2.0.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }

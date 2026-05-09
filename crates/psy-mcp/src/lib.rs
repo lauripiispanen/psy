@@ -9,8 +9,8 @@ use std::io::{self, BufRead, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::client;
-use crate::protocol::{
+use psy_client as client;
+use psy_core::protocol::{
     HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
     RunArgs, SendArgs, SendWaitArgs, StopArgs, StreamFilter,
 };
@@ -371,17 +371,17 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
 
             let wait_for = match args.get("wait_for") {
                 Some(Value::String(s)) => match s.as_str() {
-                    "ready" => Some(crate::protocol::WaitFor::Ready),
-                    "exit" => Some(crate::protocol::WaitFor::Exit),
+                    "ready" => Some(psy_core::protocol::WaitFor::Ready),
+                    "exit" => Some(psy_core::protocol::WaitFor::Exit),
                     _ => return Err(format!("invalid wait_for value: {s}")),
                 },
                 Some(obj) if obj.is_object() => {
                     if let Some(pattern) = obj.get("log").and_then(|v| v.as_str()) {
-                        Some(crate::protocol::WaitFor::Log {
+                        Some(psy_core::protocol::WaitFor::Log {
                             pattern: pattern.to_string(),
                         })
                     } else if let Some(dep) = obj.get("dependency").and_then(|v| v.as_str()) {
-                        Some(crate::protocol::WaitFor::Dependency {
+                        Some(psy_core::protocol::WaitFor::Dependency {
                             name: dep.to_string(),
                         })
                     } else {
@@ -397,14 +397,14 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let ports: Vec<crate::protocol::PortDefArg> = args
+            let ports: Vec<psy_core::protocol::PortDefArg> = args
                 .get("ports")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|item| {
                             if let Some(s) = item.as_str() {
-                                Some(crate::protocol::PortDefArg {
+                                Some(psy_core::protocol::PortDefArg {
                                     name: s.to_string(),
                                     default: None,
                                 })
@@ -414,7 +414,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                                     .get("default")
                                     .and_then(|v| v.as_u64())
                                     .map(|n| n as u16);
-                                Some(crate::protocol::PortDefArg { name, default })
+                                Some(psy_core::protocol::PortDefArg { name, default })
                             } else {
                                 None
                             }
@@ -677,7 +677,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
         }
 
         "psy_psyfile_schema" => {
-            let schema = crate::psyfile::json_schema();
+            let schema = psy_core::psyfile::json_schema();
             let text = serde_json::to_string_pretty(&schema).unwrap_or_default();
             Ok(json!({ "type": "text", "text": text }))
         }

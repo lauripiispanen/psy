@@ -1,0 +1,12 @@
+[package]
+name = "psy-client"
+version.workspace = true
+edition.workspace = true
+description = "NDJSON wire-protocol client for talking to a running psy supervisor"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+psy-core = { path = "../psy-core", version = "2.0.0" }
+serde_json = { workspace = true }

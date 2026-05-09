@@ -476,20 +476,51 @@ dependencies = [
 
 [[package]]
 name = "psy"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "chrono",
  "clap",
+ "libc",
+ "psy-client",
+ "psy-core",
+ "psy-mcp",
+ "serde_json",
+ "serial_test",
+ "tokio",
+]
+
+[[package]]
+name = "psy-client"
+version = "2.0.0"
+dependencies = [
+ "psy-core",
+ "serde_json",
+]
+
+[[package]]
+name = "psy-core"
+version = "2.0.0"
+dependencies = [
+ "chrono",
  "libc",
  "nix",
  "regex",
  "serde",
  "serde_json",
- "serial_test",
  "tokio",
  "toml",
  "uuid",
  "windows",
+]
+
+[[package]]
+name = "psy-mcp"
+version = "2.0.0"
+dependencies = [
+ "psy-client",
+ "psy-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

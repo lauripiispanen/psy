@@ -2239,7 +2239,7 @@ env = {{ OVERRIDE = "platform-override", ADDED = "platform-added" }}
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_basic() {
     // Start an interactive cat process, send text, check logs
     let sl = sleep_cmd(60);
@@ -2263,7 +2263,7 @@ fn test_send_basic() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_multiple_lines() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2287,7 +2287,7 @@ fn test_send_multiple_lines() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_non_interactive_error() {
     // Sending to a non-interactive process should fail
     let sl = sleep_cmd(60);
@@ -2312,7 +2312,7 @@ fn test_send_non_interactive_error() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_eof_closes_stdin() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2342,7 +2342,7 @@ fn test_send_eof_closes_stdin() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_not_found() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2359,7 +2359,7 @@ fn test_send_not_found() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_psyfile_interactive() {
     // Test interactive flag in Psyfile
     let tmp = TempPsyfileDir::new(
@@ -2388,7 +2388,7 @@ interactive = true
 #[cfg(unix)]
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_file() {
     // Test --file flag
     let sl = sleep_cmd(60);
@@ -2417,7 +2417,7 @@ fn test_send_file() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_raw_no_newline() {
     // Test --raw flag (no auto newline)
     let sl = sleep_cmd(60);
@@ -2442,7 +2442,7 @@ fn test_send_raw_no_newline() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_stopped_process_error() {
     let sl = sleep_cmd(60);
     let root = PsyRoot::start(&to_refs(&sl));
@@ -2490,7 +2490,7 @@ fn test_send_stopped_process_error() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_psyfile_interactive_with_deps() {
     // Interactive process with a dependency
     let tmp = TempPsyfileDir::new(
@@ -2880,7 +2880,7 @@ fn test_psyfile_schema_has_interactive() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_wait_basic() {
     // Send to cat with --wait, verify echoed output is returned
     let sl = sleep_cmd(60);
@@ -2905,7 +2905,7 @@ fn test_send_wait_basic() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_wait_prompt() {
     // Process outputs a prompt pattern, verify early return.
     // Uses a Python script file for cross-platform compatibility.
@@ -2964,7 +2964,7 @@ fn test_send_wait_prompt() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_wait_timeout() {
     // Process that doesn't produce output — verify timeout returns partial
     let sl = sleep_cmd(60);
@@ -2999,7 +2999,7 @@ fn test_send_wait_timeout() {
 
 #[test]
 #[ignore]
-#[parallel(discovery)]
+#[serial(discovery)]
 fn test_send_wait_non_interactive_error() {
     // send --wait to non-interactive process should error
     let sl = sleep_cmd(60);

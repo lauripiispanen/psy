@@ -1,25 +1,18 @@
-pub mod client;
-#[cfg(target_os = "macos")]
-pub mod macos_cleanup;
-pub mod mcp;
-pub mod platform;
-pub mod probe;
-pub mod process;
-pub mod protocol;
-pub mod psyfile;
-pub mod ring_buffer;
-pub mod root;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 
-use protocol::{
-    HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
+use psy_client as client;
+#[cfg(target_os = "macos")]
+use psy_core::macos_cleanup;
+use psy_core::protocol::{
+    self, HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
     RunArgs, SendArgs, SendWaitArgs, StopArgs, StreamFilter,
 };
+use psy_core::{psyfile, root};
+use psy_mcp as mcp;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -352,9 +345,16 @@ fn main() {
             } else {
                 Some(command)
             };
+            let main_mode = if mcp {
+                root::MainMode::Custom(Box::new(|| {
+                    let _ = mcp::run();
+                }))
+            } else {
+                root::MainMode::Default
+            };
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             let exit_code = rt.block_on(async {
-                match psy_root.run(main_cmd, boot_units, mcp, parent).await {
+                match psy_root.run(main_cmd, boot_units, main_mode, parent).await {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("psy: {e}");
