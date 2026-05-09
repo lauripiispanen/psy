@@ -3937,7 +3937,7 @@ ports = ["http"]
     // The echoed value should be a valid port number
     let mut found_port = false;
     for line in logs.lines() {
-        let trimmed = line.split(']').last().unwrap_or("").trim();
+        let trimmed = line.split(']').next_back().unwrap_or("").trim();
         if let Ok(port) = trimmed.parse::<u16>() {
             assert!(port > 0, "port should be > 0");
             found_port = true;

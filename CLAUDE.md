@@ -10,6 +10,19 @@ cargo test --workspace -- --ignored        # integration tests (require built bi
 cargo build --workspace --examples && cargo test --workspace -- --ignored  # full test run
 ```
 
+The Rust toolchain is pinned in `rust-toolchain.toml` (currently 1.95.0) so
+local development and CI use the same `rustc`/`clippy`/`rustfmt`. With
+rustup installed, `cargo` auto-installs and uses the pinned version on
+first invocation. CI's GitHub workflow uses `dtolnay/rust-toolchain@master`
+with `toolchain: 1.95.0` to match.
+
+To upgrade the toolchain:
+
+1. Bump `channel` in `rust-toolchain.toml`.
+2. Bump `toolchain:` in `.github/workflows/ci.yml` (lint + test jobs).
+3. Run `cargo clippy --workspace --all-targets -- -D warnings` locally to catch any new lints introduced by the newer clippy.
+4. Commit both files together so the local↔CI version pin stays in sync.
+
 ## Project Structure
 
 v2.0 split psy into a workspace:

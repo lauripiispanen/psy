@@ -10,19 +10,26 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Toolchain version is pinned in rust-toolchain.toml at the repo root so
+# local dev environments and CI use the same rustc/clippy/rustfmt. We use
+# `dtolnay/rust-toolchain@master` (which respects rust-toolchain.toml)
+# rather than `@stable` (which would ignore the pin and install whatever
+# the latest stable happens to be that day, drifting from local dev).
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     strategy:
@@ -32,11 +39,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --workspace --verbose
+      - name: Build examples
+        run: cargo build --workspace --examples --verbose
       - name: Unit tests
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
       - name: Integration tests
-        run: cargo test --verbose -- --ignored --nocapture
+        run: cargo test --workspace --verbose -- --ignored --nocapture
