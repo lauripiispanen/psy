@@ -2,11 +2,17 @@
 
 > *"ps... why?"*
 
-A single-binary process supervisor that creates an isolated process tree. All child processes are guaranteed to be killed when psy exits, even on crash. Think "docker compose for raw processes" — without containers, images, or daemons.
+A cross-platform process supervisor: a single-binary CLI **and** an embeddable Rust library. Manages an isolated process tree where all child processes are guaranteed to be killed when psy exits — even on crash. Think "docker compose for raw processes" — without containers, images, or daemons.
 
 ## Why
 
 AI coding agents (Claude Code, Codex, Cursor, etc.) often need long-running sidecar processes — dev servers, watchers, databases. These processes should share the agent's lifecycle and be discoverable from within the agent's shell. psy makes that trivial.
+
+Other use cases:
+
+- **Embeddable supervisor** for desktop apps (Tauri, Electron-via-FFI) that want fork+exec-free supervision of their own children. Add `psy-core` as a dependency and you get cleanup guarantees, restart policies, log buffering, and Psyfile loading without shipping a separate binary.
+- **CI / parallel-test orchestration** where each test run gets a clean process tree that's reliably torn down even if the harness crashes.
+- **Per-tenant isolation** via sub-roots — supervise multiple independent worlds under one umbrella, with each world's processes hidden from the others.
 
 ## Quick Start
 
@@ -264,6 +270,56 @@ Stopped and failed processes remain in the process table as tombstones. To remov
 psy clean    # removes all stopped/failed processes
 ```
 
+## Embedding (Rust library)
+
+psy ships as a workspace of crates. The CLI binary (`psy`) is a thin shell over the library; hosts that want supervision in-process can depend on `psy-core` directly:
+
+```toml
+[dependencies]
+psy-core = "2"
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use psy_core::{PsyRoot, RestartPolicy, RootOptions, Spawn};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Call this as the very first thing in main(). On macOS, when the
+    // sidecar re-spawns this binary with the cleanup sentinel, this call
+    // intercepts and exits the process. No-op on Linux / Windows.
+    psy_core::dispatch_macos_cleanup_if_invoked();
+
+    let root = PsyRoot::start(RootOptions::new("my-host")).await?;
+
+    let _h = root
+        .spawn(
+            Spawn::new("worker", ["my-program", "--flag"])
+                .with_restart(RestartPolicy::OnFailure),
+        )
+        .await?;
+
+    // ... do host work; supervised processes run alongside ...
+
+    root.shutdown().await?;
+    Ok(())
+}
+```
+
+What you get embedded:
+
+- **Same cleanup guarantees as the CLI.** Linux uses `PR_SET_CHILD_SUBREAPER` + `PR_SET_PDEATHSIG=SIGKILL`; macOS uses a per-root cleanup sidecar (kqueue `NOTE_EXIT`); Windows uses Job Objects with `KILL_ON_JOB_CLOSE`. All applied to the **host process** — your Tauri/Axum/CLI binary becomes the supervisor.
+- **Programmatic `Spawn` API** with the full feature set: restart policies, ready/health probes (Phase B+: WaitFor today, full probe API in Phase C), dependency cascades, port allocation, environment overrides, working directories.
+- **In-process sub-roots** for per-tenant isolation: `RootHandle::sub_root(SubRootOptions::new("instance-a"))` returns a fresh `RootHandle` with its own process table, sharing the host's runtime and cleanup sidecar. One sub-root's children are invisible to siblings.
+- **Optional IPC socket.** `SocketBinding::None` (default for embedded hosts) means the host's API surface is the only way in. `SocketBinding::Auto` exposes a discoverable socket so an operator running `psy ps` in another shell can introspect.
+- **Workspace crates** if you only want a piece: `psy-client` (NDJSON wire-protocol client without the supervisor), `psy-mcp` (MCP JSON-RPC server).
+
+### Embedded-mode caveats
+
+- **Linux subreaper is process-wide.** Once `install_host_cleanup = true` (the default), your host adopts every orphaned descendant — not just psy-spawned ones. Tauri webview helpers, native messaging hosts, anything any dependency forks internally. Either tolerate them as zombies until host exit (fine for a desktop app) or wire your own reaper. Set `install_host_cleanup = false` to opt out.
+- **In-process sub-roots share address space.** A panic mid-mutation of a shared `Mutex` poisons it; a blocking task in one sub-root starves the shared runtime; OOM kills everyone. The recommended default for hosts that don't need full crash isolation; switch individual sub-roots to `SubRootKind::OutOfProcess` if you need address-space isolation. (`OutOfProcess` ships in a future version; v2.0 supports `InProcess` only.)
+- **macOS sidecar requires host cooperation.** Calling `dispatch_macos_cleanup_if_invoked()` at the top of `main()` is mandatory on macOS embedded hosts. If your binary is re-spawned as a sidecar (which psy does to cover hard-kill cleanup), that call is what runs the sidecar logic.
+
 ## MCP Integration
 
 psy includes a built-in MCP server. The simplest setup is `psy up --mcp` — it starts a psy root with the MCP JSON-RPC server on stdin/stdout, so you can configure it directly as your agent's MCP server:
@@ -505,11 +561,13 @@ psy psyfile init        # generate a starter Psyfile
 
 psy creates a Unix domain socket (or named pipe on Windows) and manages a process table in memory. Child processes inherit `PSY_SOCK` and `PSY_ROOT_PID` environment variables, allowing any process in the tree to communicate with the root.
 
+**Workspace layout (v2.0):** `psy-core` is the supervisor library; `psy` is a thin CLI shell over it; `psy-client` is the NDJSON wire-protocol client; `psy-mcp` is the MCP JSON-RPC server. The CLI and any embedded host build on the same `psy-core` so behaviour is identical between modes.
+
 **Auto-discovery:** When `PSY_SOCK` is not set, psy automatically discovers the nearest running root by matching PID ancestor chains. This means you can open a new terminal window and run `psy ps`, `psy logs`, etc. without being inside the psy session — psy finds the right root automatically.
 
 **Cleanup guarantees:**
 - **Linux** — `PR_SET_CHILD_SUBREAPER` + `PR_SET_PDEATHSIG` ensures children die with the parent
-- **macOS** — A cleanup sidecar (`psy macos-cleanup`) per root watches the parent via kqueue `NOTE_EXIT` and SIGKILLs every tracked child if the parent is hard-killed
+- **macOS** — A cleanup sidecar per root watches the parent via kqueue `NOTE_EXIT` and SIGKILLs every tracked child if the parent is hard-killed. The sidecar is a re-dispatched copy of the host binary itself; embedding hosts call `psy_core::dispatch_macos_cleanup_if_invoked()` at the top of `main()` to recognize sidecar invocations.
 - **Windows** — Job Object with `KILL_ON_JOB_CLOSE` terminates all descendants
 
 **Signal handling:** SIGTERM and SIGINT on the root trigger graceful teardown of all children before exit.

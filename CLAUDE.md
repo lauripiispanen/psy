@@ -1,36 +1,49 @@
-# psy — Cross-Platform Process Lifecycle Manager
+# psy — Cross-Platform Process Lifecycle Manager + Embeddable Library
 
 ## Build & Run
 
 ```bash
-cargo build                    # debug build
-cargo build --release          # release build
-cargo test                     # unit tests
-cargo test -- --ignored        # integration tests (require built binary)
-cargo build && cargo test -- --ignored  # full test run
+cargo build --workspace                    # debug build, all crates
+cargo build --workspace --release          # release build
+cargo test --workspace                     # unit tests
+cargo test --workspace -- --ignored        # integration tests (require built binary + examples)
+cargo build --workspace --examples && cargo test --workspace -- --ignored  # full test run
 ```
 
 ## Project Structure
 
+v2.0 split psy into a workspace:
+
 ```
 psy/
-├── Cargo.toml
-├── src/
-│   ├── main.rs              # CLI entry point, argument parsing (clap)
-│   ├── root.rs              # psy root: socket server, process table, lifecycle
-│   ├── client.rs            # CLI client: connect to root via PSY_SOCK
-│   ├── process.rs           # child process management, stdio capture, restart logic
-│   ├── ring_buffer.rs       # log ring buffer (line-oriented, bounded)
-│   ├── protocol.rs          # NDJSON request/response types, serde
-│   ├── psyfile.rs           # Psyfile TOML parsing, validation, interpolation, deps
-│   ├── mcp.rs               # MCP server implementation
-│   ├── probe.rs             # readiness + healthcheck probe execution engine
-│   └── platform/
-│       ├── mod.rs           # platform trait + conditional re-exports
-│       ├── unix.rs          # pipe trick, subreaper (Linux), signal handling
-│       └── windows.rs       # Job Objects, named pipes, console ctrl
-├── tests/
-│   └── integration.rs       # cross-platform integration tests
+├── Cargo.toml                           # [workspace] root with shared package metadata
+└── crates/
+    ├── psy-core/                        # supervisor library (the thing)
+    │   ├── src/
+    │   │   ├── lib.rs                   # public API re-exports + module decls
+    │   │   ├── api.rs                   # curated public API: PsyRoot::start, RootHandle, Spawn, ...
+    │   │   ├── root.rs                  # socket server, process table, lifecycle
+    │   │   ├── process.rs               # child spawn + stdio capture + restart logic
+    │   │   ├── ring_buffer.rs           # log ring buffer (line-oriented, bounded)
+    │   │   ├── protocol.rs              # NDJSON request/response types, serde
+    │   │   ├── psyfile.rs               # Psyfile TOML parsing, validation, interpolation, deps
+    │   │   ├── probe.rs                 # readiness + healthcheck probe execution engine
+    │   │   ├── macos_cleanup.rs         # macOS cleanup sidecar + SidecarStrategy + dispatch
+    │   │   └── platform/
+    │   │       ├── mod.rs
+    │   │       ├── unix.rs              # subreaper (Linux), pipe trick, signal handling
+    │   │       └── windows.rs           # Job Objects, named pipes, console ctrl
+    │   ├── examples/
+    │   │   └── embedded_fixture.rs      # binary that uses psy-core as a library
+    │   └── tests/
+    │       └── embedded.rs              # public-API integration tests
+    ├── psy-client/                      # NDJSON wire-protocol client (depends on psy-core for types)
+    │   └── src/lib.rs                   # send_command / follow_logs / run_attached
+    ├── psy-mcp/                         # MCP JSON-RPC server (depends on psy-core + psy-client)
+    │   └── src/lib.rs
+    ├── psy/                             # thin clap CLI binary
+    │   ├── src/main.rs                  # subcommand parsing + routing into psy-core
+    │   └── tests/integration.rs         # cross-platform CLI integration tests
 └── .github/
     └── workflows/
         └── ci.yml           # GitHub Actions: Linux, macOS, Windows
@@ -38,10 +51,23 @@ psy/
 
 ## Implementation Status
 
+### v2.0 — Workspace + Library API
+
+- [x] Workspace split: `psy-core` / `psy-client` / `psy-mcp` / `psy` (CLI). Lockstep version 2.0.0; `[workspace.package]` shared metadata.
+- [x] `psy-core::api` curated public API: `PsyRoot::start(RootOptions) -> RootHandle`, `RootHandle` with spawn/run_unit/list/status/history/logs/stop/restart/clean/shutdown/sub_root.
+- [x] `Spawn` programmatic spawn config (builder-style, all-fields-public + `with_*` setters).
+- [x] `SocketBinding` (None/Auto/Path), `PsyfileSource` (Auto/Path), `WaitFor` (Ready/Exit/Log).
+- [x] `PsyError` typed enum with `#[non_exhaustive]` + `Other` fallback. All public types `#[non_exhaustive]`.
+- [x] `SidecarStrategy` (HostReDispatch/ExternalBinary/Disabled) for embedded macOS cleanup. Default `HostReDispatch` with sentinel `__psy_macos_cleanup_sidecar__`.
+- [x] `dispatch_macos_cleanup_if_invoked()` library entry point — host calls at top of `main()`. Sentinel parsing + proc-title beautification (`psy-cleanup-sidecar [parent=N]` via `_NSGetArgv`).
+- [x] In-process sub-roots: `RootHandle::sub_root(SubRootOptions)` with `SubRootKind::InProcess`. Shares parent's macOS sidecar; isolated process tables; cheap (no extra process). `OutOfProcess` returns "not yet implemented" error in v2.0.
+- [x] CLI binary now calls `psy_core::dispatch_macos_cleanup_if_invoked()` at the top of `main()` (replaces the old hidden `Commands::MacosCleanup` clap variant).
+- [x] `embedded_fixture` example + `tests/embedded.rs` integration tests (5 tests covering smoke, runtime injection, in-process sub-root isolation, OutOfProcess rejection, host-SIGKILL-cleans-up-grandchild).
+
 ### Core Infrastructure
-- [x] `Cargo.toml` — dependencies, profile settings
-- [x] `src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, send, mcp, psyfile, version)
-- [x] `src/protocol.rs` — NDJSON request/response types (Request, Response, serde)
+- [x] `Cargo.toml` (workspace root + per-crate manifests with `version.workspace = true`)
+- [x] `crates/psy/src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, send, mcp, psyfile, version)
+- [x] `crates/psy-core/src/protocol.rs` — NDJSON request/response types (Request, Response, serde)
 
 ### Process Management
 - [x] `src/ring_buffer.rs` — line-oriented ring buffer (10k lines / 2MB cap, eviction)
@@ -445,12 +471,12 @@ All integration tests pass on macOS. Must also pass on Linux and Windows via Git
 Before tagging a release:
 
 1. **Check for uncommitted changes:** `git status` — everything that should be committed must be committed before pushing/tagging
-2. **Version bump:** Update `version` in `Cargo.toml` to match the release tag
+2. **Version bump:** Update `version` in `[workspace.package]` of the root `Cargo.toml` to match the release tag (all in-tree crates inherit via `version.workspace = true`)
 3. **Formatting:** `cargo fmt -- --check` — must pass with no diffs
-4. **Linting:** `cargo clippy -- -D warnings` — must pass with no warnings
-5. **Unit tests:** `cargo test` — all must pass
-6. **Integration tests:** `cargo build && cargo test -- --ignored` — all must pass
-7. **README.md:** Must document all user-facing features for the release. Check new CLI commands, Psyfile fields, MCP tools, and behavioral changes are covered
+4. **Linting:** `cargo clippy --workspace --all-targets -- -D warnings` — must pass with no warnings
+5. **Unit tests:** `cargo test --workspace` — all must pass
+6. **Integration tests:** `cargo build --workspace --examples && cargo test --workspace -- --ignored` — all must pass
+7. **README.md:** Must document all user-facing features for the release. Check new CLI commands, Psyfile fields, MCP tools, library API additions, and behavioral changes are covered
 8. **CLAUDE.md:** Implementation status checkboxes must be up-to-date
 9. **CI:** Push to main first, verify GitHub Actions pass on all platforms (Linux, macOS, Windows) before tagging
 10. **Tag:** `git tag vX.Y.Z && git push origin vX.Y.Z`
@@ -462,7 +488,8 @@ Before tagging a release:
 - Async runtime: tokio
 - Serialization: serde + serde_json, NDJSON over sockets
 - CLI parsing: clap derive API
-- Error handling: Box<dyn Error> / Result types (no anyhow)
-- Platform code: `src/platform/unix.rs` (shared Linux+macOS with cfg), `src/platform/windows.rs`
-- Socket path: `/tmp/psy-<uid>/<pid>.sock` on macOS, `$XDG_RUNTIME_DIR/psy/<pid>.sock` on Linux (fallback `/tmp/...`)
+- Error handling: `Box<dyn Error>` for internal flows; `PsyError` typed enum on the public library API
+- Platform code: `crates/psy-core/src/platform/unix.rs` (shared Linux+macOS with cfg), `windows.rs`; macOS cleanup sidecar in `crates/psy-core/src/macos_cleanup.rs`
+- Socket path: `/tmp/psy-<uid>/<pid>.sock` on macOS, `$XDG_RUNTIME_DIR/psy/<pid>.sock` on Linux (fallback `/tmp/...`); in-process sub-root sockets at `<roots_dir>/inproc-<host_pid>-<name>.sock`
 - Windows IPC: named pipe `\\.\pipe\psy-<pid>` (tokio named pipe server)
+- Public API stability: every type in `psy_core::api` is `#[non_exhaustive]` so additive evolution is non-breaking. External code must use constructors / `..Default::default()` rather than struct literals.

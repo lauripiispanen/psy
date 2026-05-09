@@ -128,6 +128,106 @@ impl PsyRoot {
         self.shared.main_exit_tx.clone()
     }
 
+    /// Build an in-process sub-root: a fresh `SharedRoot` that shares the
+    /// parent's macOS cleanup sidecar (so the parent's hard-kill cleanup
+    /// covers the sub-root's children automatically) and platform setup
+    /// (subreaper / Job Object are global per-process; not redone). The
+    /// sub-root has its own process table, port allocations, template
+    /// counters, and socket path.
+    ///
+    /// `socket_path_override`: if `Some(path)`, the sub-root listener
+    /// binds there. If `None`, the sub-root binds at a derived path
+    /// `<roots_dir>/inproc-<host_pid>-<name>.sock` (or `.pipe` on Windows).
+    pub fn build_inprocess_subroot(
+        parent: &Arc<SharedRoot>,
+        name: String,
+        psyfile_path: Option<PathBuf>,
+        socket_path_override: Option<PathBuf>,
+    ) -> RootResult<(Arc<SharedRoot>, watch::Receiver<Option<i32>>)> {
+        // Sub-root's socket path. We don't use the PID-keyed
+        // `platform::anchor_socket_path` because the host's PID is shared
+        // and would collide. Use a `inproc-<pid>-<name>` form.
+        let host_pid = parent.psy_root_pid;
+        let (socket_path, anchor_path): (String, Option<PathBuf>) = match socket_path_override {
+            Some(p) => (p.to_string_lossy().to_string(), None),
+            None => {
+                let roots = platform::roots_dir();
+                let _ = std::fs::create_dir_all(&roots);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&roots, std::fs::Permissions::from_mode(0o700));
+                }
+                let safe_name: String = name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                #[cfg(unix)]
+                let path = roots.join(format!("inproc-{host_pid}-{safe_name}.sock"));
+                #[cfg(windows)]
+                let path = std::path::PathBuf::from(format!(
+                    r"\\.\pipe\psy-inproc-{host_pid}-{safe_name}"
+                ));
+                let s = path.to_string_lossy().to_string();
+                #[cfg(unix)]
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+                (s, None)
+            }
+        };
+
+        // Death pipe is platform-specific; create a fresh one so children
+        // of the sub-root inherit it the same way as the host's children.
+        // (Cheap — two FDs.)
+        let death_pipe = platform::create_death_pipe()?;
+
+        let (main_exit_tx, main_exit_rx) = watch::channel(None);
+
+        // Share the parent's macOS sidecar. PIDs spawned under the
+        // sub-root are announced to the same sidecar process; one sidecar
+        // covers the whole host tree.
+        #[cfg(target_os = "macos")]
+        let macos_sidecar = {
+            let parent_handle = parent
+                .macos_sidecar
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(Arc::clone));
+            std::sync::Mutex::new(parent_handle)
+        };
+
+        let psy_sock = socket_path.clone();
+        let shared = Arc::new(SharedRoot {
+            process_table: Arc::new(Mutex::new(HashMap::new())),
+            socket_path,
+            psy_sock,
+            psy_root_pid: host_pid,
+            death_pipe,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            main_exit_tx,
+            psyfile_path,
+            cwd: std::env::current_dir().unwrap_or_default(),
+            template_counters: Mutex::new(HashMap::new()),
+            logs_markers: Mutex::new(HashMap::new()),
+            anchor_path,
+            port_allocations: Mutex::new(HashMap::new()),
+            root_name: name,
+            sidecar_strategy: parent.sidecar_strategy.clone(),
+            #[cfg(target_os = "macos")]
+            macos_sidecar,
+        });
+
+        Ok((shared, main_exit_rx))
+    }
+
     pub fn new(name: String, psyfile_path: Option<PathBuf>) -> RootResult<Self> {
         Self::new_with_strategy(
             name,

@@ -44,7 +44,8 @@ pub mod root;
 // Curated public surface.
 pub use api::{
     LogLine, LogPage, LogsQuery, ProcessInfo, PsyError, PsyRoot, PsyfileSource, RestartPolicy,
-    RootHandle, RootOptions, RunInfo, SocketBinding, Spawn, SpawnHandle, StreamKind, WaitFor,
+    RootHandle, RootOptions, RunInfo, SocketBinding, Spawn, SpawnHandle, StreamKind, SubRootKind,
+    SubRootOptions, WaitFor,
 };
 pub use macos_cleanup::{
     dispatch_macos_cleanup_if_invoked, dispatch_macos_cleanup_if_invoked_with_sentinel,

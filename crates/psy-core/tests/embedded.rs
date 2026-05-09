@@ -114,6 +114,83 @@ async fn test_embedded_runtime_injection_current_thread() {
     root.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_inprocess_subroot_isolation() {
+    use psy_core::{PsyRoot, RootOptions, Spawn, SubRootKind, SubRootOptions};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let host = PsyRoot::start(RootOptions::new("isolation-host"))
+        .await
+        .expect("host start");
+
+    // Spawn a child directly under the host.
+    host.spawn(Spawn::new("host-child", ["sleep", "30"]))
+        .await
+        .expect("host spawn");
+
+    // Spawn an in-process sub-root and a child inside it.
+    let sub = host
+        .sub_root(SubRootOptions::new("instance-a").with_kind(SubRootKind::InProcess))
+        .await
+        .expect("sub_root");
+    sub.spawn(Spawn::new("sub-child", ["sleep", "30"]))
+        .await
+        .expect("sub spawn");
+
+    // Host's list sees the host child but NOT the sub-root child.
+    let host_listing = host.list().await.expect("host list");
+    let host_names: Vec<_> = host_listing.iter().map(|p| p.name.as_str()).collect();
+    assert!(host_names.contains(&"host-child"), "got: {host_names:?}");
+    assert!(
+        !host_names.contains(&"sub-child"),
+        "host should not see sub-root child; got: {host_names:?}"
+    );
+
+    // Sub-root's list sees ITS child but NOT the host child.
+    let sub_listing = sub.list().await.expect("sub list");
+    let sub_names: Vec<_> = sub_listing.iter().map(|p| p.name.as_str()).collect();
+    assert!(sub_names.contains(&"sub-child"), "got: {sub_names:?}");
+    assert!(
+        !sub_names.contains(&"host-child"),
+        "sub-root should not see host child; got: {sub_names:?}"
+    );
+
+    sub.shutdown().await.expect("sub shutdown");
+    host.shutdown().await.expect("host shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_inprocess_subroot_outofprocess_not_implemented() {
+    use psy_core::{PsyRoot, RootOptions, SubRootKind, SubRootOptions};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let host = PsyRoot::start(RootOptions::new("oop-host"))
+        .await
+        .expect("host start");
+
+    let result = host
+        .sub_root(
+            SubRootOptions::new("instance-a").with_kind(SubRootKind::OutOfProcess { binary: None }),
+        )
+        .await;
+    match result {
+        Ok(_) => panic!("OutOfProcess should be rejected for now"),
+        Err(e) => {
+            let s = e.to_string();
+            assert!(
+                s.contains("OutOfProcess"),
+                "error should mention OutOfProcess; got: {s}"
+            );
+        }
+    }
+
+    host.shutdown().await.expect("host shutdown");
+}
+
 #[test]
 #[ignore]
 fn test_embedded_host_sigkill_cleans_up_grandchild() {

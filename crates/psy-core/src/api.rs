@@ -225,6 +225,90 @@ impl RootOptions {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sub-roots
+// ---------------------------------------------------------------------------
+
+/// Configuration for a sub-root spawned via [`RootHandle::sub_root`].
+#[non_exhaustive]
+pub struct SubRootOptions {
+    pub name: String,
+    pub kind: SubRootKind,
+    pub psyfile: Option<PsyfileSource>,
+    pub boot_units: Vec<String>,
+    pub boot_all: bool,
+    pub bind_socket: SocketBinding,
+}
+
+impl SubRootOptions {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: SubRootKind::default(),
+            psyfile: None,
+            boot_units: vec![],
+            boot_all: false,
+            bind_socket: SocketBinding::Auto,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: SubRootKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_psyfile(mut self, src: PsyfileSource) -> Self {
+        self.psyfile = Some(src);
+        self
+    }
+
+    pub fn with_boot_units(mut self, units: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.boot_units = units.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_boot_all(mut self, all: bool) -> Self {
+        self.boot_all = all;
+        self
+    }
+
+    pub fn with_bind_socket(mut self, b: SocketBinding) -> Self {
+        self.bind_socket = b;
+        self
+    }
+}
+
+/// Whether the sub-root runs inside the host's own process or as a
+/// separate `psy` invocation. See the libpsy proposal's "in-process vs
+/// out-of-process" discussion for the trade-offs.
+#[non_exhaustive]
+#[derive(Clone)]
+pub enum SubRootKind {
+    /// Sub-root supervised in the host's own process. Cheap (no extra
+    /// process), cheap IPC (none), shares the host's tokio runtime and
+    /// macOS cleanup sidecar. Crash isolation: address space is shared,
+    /// so a panic in one in-process sub-root may affect siblings. The
+    /// recommended default unless host-internal supervisor bugs
+    /// crossing sub-root boundaries are a real concern.
+    InProcess,
+    /// Sub-root is a separate `psy` process registered with the parent
+    /// via the `psy up --parent <sock>` mechanism (v1.9). Use when the
+    /// sub-root needs full address-space isolation. Costs one extra
+    /// process per sub-root and adds an IPC round-trip per spawn.
+    ///
+    /// Not yet implemented in v2.0; returns
+    /// `PsyError::Other("OutOfProcess sub-roots not yet implemented")`
+    /// from [`RootHandle::sub_root`]. Use the existing CLI flow for now
+    /// (`psy up --parent <sock>` from the host's `Spawn`).
+    OutOfProcess { binary: Option<PathBuf> },
+}
+
+impl Default for SubRootKind {
+    fn default() -> Self {
+        Self::InProcess
+    }
+}
+
 /// Whether to expose an IPC socket so out-of-process clients (`psy ps`,
 /// MCP relays, sibling shells) can find this root.
 #[non_exhaustive]
@@ -686,6 +770,81 @@ impl RootHandle {
     /// binary does today). Most hosts should use the typed API above.
     pub fn shared(&self) -> Arc<crate::root::SharedRoot> {
         Arc::clone(&self.shared)
+    }
+
+    /// Construct a sub-root: a fresh `RootHandle` that supervises its own
+    /// independent process table. In-process sub-roots share the host's
+    /// runtime and macOS cleanup sidecar; out-of-process sub-roots spawn
+    /// a separate `psy` process registered with the host (not yet
+    /// implemented in v2.0).
+    pub async fn sub_root(&self, opts: SubRootOptions) -> Result<RootHandle, PsyError> {
+        match opts.kind {
+            SubRootKind::InProcess => self.inprocess_subroot(opts).await,
+            SubRootKind::OutOfProcess { .. } => Err(PsyError::Other(
+                "OutOfProcess sub-roots are not yet implemented in v2.0; \
+                 use SubRootKind::InProcess or shell out to `psy up --parent`"
+                    .into(),
+            )),
+        }
+    }
+
+    async fn inprocess_subroot(&self, opts: SubRootOptions) -> Result<RootHandle, PsyError> {
+        if opts.name.is_empty() {
+            return Err(PsyError::InvalidName { name: opts.name });
+        }
+        if !crate::process::validate_name(&opts.name) {
+            return Err(PsyError::InvalidName { name: opts.name });
+        }
+
+        let psyfile_path: Option<PathBuf> = match opts.psyfile {
+            None => None,
+            Some(PsyfileSource::Path(p)) => Some(p),
+            Some(PsyfileSource::Auto) => {
+                crate::psyfile::discover(&std::env::current_dir().unwrap_or_default())
+            }
+        };
+
+        let socket_override: Option<PathBuf> = match opts.bind_socket {
+            SocketBinding::None => None, // path is auto-derived (see below)
+            SocketBinding::Auto => None, // ditto
+            SocketBinding::Path(p) => Some(p),
+        };
+
+        let (shared, _exit_rx) = crate::root::PsyRoot::build_inprocess_subroot(
+            &self.shared,
+            opts.name.clone(),
+            psyfile_path,
+            socket_override,
+        )
+        .map_err(|e| PsyError::Other(e.to_string()))?;
+
+        let main_exit_tx = shared.main_exit_tx.clone();
+
+        // Resolve boot_all → boot_units by inspecting the sub-root's Psyfile.
+        let boot_units_resolved = if opts.boot_all {
+            match shared.load_psyfile() {
+                Ok(Some(pf)) => pf.units.keys().cloned().collect(),
+                Ok(None) => {
+                    return Err(PsyError::PsyfileError(
+                        "no Psyfile to boot --all in sub-root".into(),
+                    ))
+                }
+                Err(e) => return Err(PsyError::PsyfileError(e)),
+            }
+        } else {
+            opts.boot_units
+        };
+
+        // Wire up the listener / boot units. No parent_sock — this is an
+        // in-process sub-root; it doesn't register with anything.
+        crate::root::prepare_root_runtime(Arc::clone(&shared), boot_units_resolved, None)
+            .await
+            .map_err(|e| PsyError::Other(e.to_string()))?;
+
+        Ok(RootHandle {
+            shared,
+            main_exit_tx,
+        })
     }
 
     async fn dispatch(&self, req: Request) -> Result<protocol::Response, PsyError> {
