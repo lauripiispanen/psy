@@ -19,10 +19,11 @@ use std::time::Duration;
 use crate::macos_cleanup::SidecarStrategy;
 use crate::process::ProcessState;
 use crate::protocol::{
-    self, HistoryArgs, HistoryResponse, LogsArgs, PortDefArg, PsResponse, Request, RestartArgs,
-    RunArgs, StopArgs, StreamFilter, WaitFor as ProtoWaitFor,
+    self, DependencyArg, HistoryArgs, HistoryResponse, LogsArgs, PortDefArg, ProbeArg,
+    ProbeKindArg, PsResponse, Request, RestartArgs, RunArgs, StopArgs, StreamFilter,
+    WaitFor as ProtoWaitFor,
 };
-pub use crate::protocol::{ProcessInfo, RestartPolicy, RunInfo, StreamKind};
+pub use crate::protocol::{ErrorCode, ProcessInfo, RestartPolicy, RunInfo, StreamKind};
 use crate::root::{
     handle_request, prepare_root_runtime, teardown, HandleResult, PsyRoot as _Inner,
 };
@@ -100,51 +101,63 @@ impl From<std::io::Error> for PsyError {
 }
 
 impl PsyError {
-    /// Best-effort classification of an error message returned via the
-    /// internal wire protocol. The protocol uses string errors today; the
-    /// library API translates the common cases into typed variants and
-    /// falls back to `Other` for anything unrecognized.
-    fn classify(message: String) -> Self {
-        if message == "server is shutting down" {
-            return PsyError::ShuttingDown;
+    /// Construct a `PsyError` from a protocol response's error fields.
+    ///
+    /// The wire protocol carries both a typed `ErrorCode` and a human-
+    /// readable message; we use the code as the source of truth and the
+    /// message for context (e.g. extracting the unit name). Hosts can
+    /// match on typed `PsyError` variants stably across psy-core
+    /// releases — wire-protocol message wording can change without
+    /// affecting which variant fires.
+    fn from_response(code: Option<ErrorCode>, message: String) -> Self {
+        match code.unwrap_or(ErrorCode::Other) {
+            ErrorCode::AlreadyExists => PsyError::AlreadyExists {
+                name: extract_name(&message),
+            },
+            ErrorCode::NotFound => PsyError::NotFound {
+                name: extract_name(&message),
+            },
+            ErrorCode::InvalidName => PsyError::InvalidName {
+                name: extract_quoted(&message).unwrap_or_default(),
+            },
+            ErrorCode::PsyfileError => PsyError::PsyfileError(message),
+            ErrorCode::SpawnFailed => PsyError::SpawnFailed {
+                name: extract_quoted(&message).unwrap_or_default(),
+                message,
+            },
+            ErrorCode::PortAllocationFailed => PsyError::PortAllocationFailed {
+                port_name: extract_quoted(&message).unwrap_or_default(),
+            },
+            ErrorCode::ShuttingDown => PsyError::ShuttingDown,
+            // Codes without a dedicated typed variant fall through as
+            // `Other` for now; the message preserves context.
+            ErrorCode::InvalidArgs
+            | ErrorCode::NotRunning
+            | ErrorCode::NotInteractive
+            | ErrorCode::StdinClosed
+            | ErrorCode::AttachedSessionConflict
+            | ErrorCode::NoHistory
+            | ErrorCode::NotASubroot
+            | ErrorCode::SubrootUnauthorized
+            | ErrorCode::Other => PsyError::Other(message),
         }
-        if let Some(rest) = message.strip_prefix("process '") {
-            if let Some((name, suffix)) = rest.split_once('\'') {
-                if suffix.starts_with(" is already running")
-                    || suffix.contains("is already running")
-                {
-                    return PsyError::AlreadyExists {
-                        name: name.to_string(),
-                    };
-                }
-                if suffix.starts_with(" not found") {
-                    return PsyError::NotFound {
-                        name: name.to_string(),
-                    };
-                }
-            }
-        }
-        if let Some(name) = message
-            .strip_prefix("invalid name: ")
-            .map(|s| s.to_string())
-        {
-            return PsyError::InvalidName { name };
-        }
-        if let Some(rest) = message.strip_prefix("spawn failed: ") {
-            return PsyError::SpawnFailed {
-                name: String::new(),
-                message: rest.to_string(),
-            };
-        }
-        if let Some(rest) = message.strip_prefix("failed to allocate port '") {
-            if let Some((name, _)) = rest.split_once('\'') {
-                return PsyError::PortAllocationFailed {
-                    port_name: name.to_string(),
-                };
-            }
-        }
-        PsyError::Other(message)
     }
+}
+
+/// Pull a name from `process 'name' …` style messages. Returns "" if
+/// the message doesn't have the expected shape; caller falls back to
+/// the verbatim message via the `name` field being empty.
+fn extract_name(message: &str) -> String {
+    extract_quoted(message).unwrap_or_default()
+}
+
+/// Pull the first single-quoted substring from a message. Used to
+/// recover unit / process / port names embedded in human-readable
+/// messages without re-encoding them on the wire.
+fn extract_quoted(message: &str) -> Option<String> {
+    let start = message.find('\'')? + 1;
+    let end = message[start..].find('\'')? + start;
+    Some(message[start..end].to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -297,10 +310,14 @@ pub enum SubRootKind {
     /// sub-root needs full address-space isolation. Costs one extra
     /// process per sub-root and adds an IPC round-trip per spawn.
     ///
-    /// Not yet implemented in v2.0; returns
-    /// `PsyError::Other("OutOfProcess sub-roots not yet implemented")`
-    /// from [`RootHandle::sub_root`]. Use the existing CLI flow for now
-    /// (`psy up --parent <sock>` from the host's `Spawn`).
+    /// **Targeted for v2.1.** v2.0 returns a typed error from
+    /// [`RootHandle::sub_root`] when this variant is used; until v2.1
+    /// ships, hosts that genuinely need address-space isolation can
+    /// shell out via `Spawn::new("instance", ["psy", "up", "--parent",
+    /// &parent_sock, "--", ...])` from a [`Spawn`] on the host. The
+    /// switch to the typed API in v2.1 will be source-compatible —
+    /// just remove the `with_kind(SubRootKind::OutOfProcess { … })`
+    /// hint when it lands.
     OutOfProcess { binary: Option<PathBuf> },
 }
 
@@ -347,11 +364,110 @@ pub struct Spawn {
     /// Named ports to allocate. `(name, default_port)`; `default_port` is
     /// the preferred number, with fallback to OS-assigned.
     pub ports: Vec<(String, Option<u16>)>,
+    /// Working directory for the child. `None` inherits the host's cwd.
+    pub cwd: Option<PathBuf>,
+    /// One-shot readiness probe. Dependents wait for this to pass.
+    pub ready: Option<ReadyProbe>,
+    /// Continuous health check. Failure triggers restart per
+    /// [`Spawn::restart`].
+    pub healthcheck: Option<HealthCheck>,
+    /// Other supervised processes this one depends on. They must be
+    /// already spawned (running or ready); psy waits for each to pass
+    /// its `ready` probe before starting this one.
+    pub depends_on: Vec<DependencyRef>,
+    /// Caller-supplied tags for declarative reconciliation. Stored on
+    /// the process entry; psy-core doesn't interpret them.
+    pub metadata: HashMap<String, String>,
     /// If set, wait until this condition is met before returning the
     /// `SpawnHandle`. Mirrors `psy run --wait-for`.
     pub wait_for: Option<WaitFor>,
     /// Timeout applied to `wait_for`. Default: 120 seconds.
     pub wait_timeout: Option<Duration>,
+}
+
+/// One-shot readiness probe. The supervisor runs this after spawning
+/// the process; dependents wait for it to pass before starting.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum ReadyProbe {
+    /// Connect to a TCP address. `addr` accepts `"host:port"` or just
+    /// `"<port>"` (interpreted as `localhost:<port>`).
+    Tcp {
+        addr: String,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+        retries: Option<u32>,
+    },
+    /// HTTP GET. Ready when the response status is 2xx.
+    Http {
+        url: String,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+        retries: Option<u32>,
+    },
+    /// Run a shell command. Ready when it exits with code 0.
+    Exec {
+        command: String,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+        retries: Option<u32>,
+    },
+    /// The supervised process itself exits with `code`. Useful for
+    /// build-step / migration units.
+    Exit {
+        code: i32,
+        timeout: Option<Duration>,
+    },
+}
+
+/// Continuous health check. Runs after the process is ready; on
+/// `retries` consecutive failures the process is killed and restarted
+/// per its [`RestartPolicy`].
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum HealthCheck {
+    Tcp {
+        addr: String,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+        retries: Option<u32>,
+    },
+    Http {
+        url: String,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+        retries: Option<u32>,
+    },
+    Exec {
+        command: String,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+        retries: Option<u32>,
+    },
+}
+
+/// Reference to a dependency. The dependency's name must match an
+/// already-supervised process.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct DependencyRef {
+    pub name: String,
+    /// If true, when the dependency restarts this process restarts too.
+    pub restart: bool,
+}
+
+impl DependencyRef {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            restart: false,
+        }
+    }
+
+    pub fn with_restart(mut self, restart: bool) -> Self {
+        self.restart = restart;
+        self
+    }
 }
 
 impl Spawn {
@@ -364,9 +480,45 @@ impl Spawn {
             restart: RestartPolicy::No,
             interactive: false,
             ports: vec![],
+            cwd: None,
+            ready: None,
+            healthcheck: None,
+            depends_on: vec![],
+            metadata: HashMap::new(),
             wait_for: None,
             wait_timeout: None,
         }
+    }
+
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_ready(mut self, ready: ReadyProbe) -> Self {
+        self.ready = Some(ready);
+        self
+    }
+
+    pub fn with_healthcheck(mut self, hc: HealthCheck) -> Self {
+        self.healthcheck = Some(hc);
+        self
+    }
+
+    pub fn with_depends_on(mut self, deps: impl IntoIterator<Item = DependencyRef>) -> Self {
+        self.depends_on = deps.into_iter().collect();
+        self
+    }
+
+    pub fn with_metadata(
+        mut self,
+        meta: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.metadata = meta
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
     }
 
     pub fn with_env(
@@ -418,17 +570,163 @@ pub enum WaitFor {
     Log { pattern: String },
 }
 
-/// Returned by [`RootHandle::spawn`] on success. Records the unit name
-/// and the PID at spawn time. Once a process restarts, its PID changes —
-/// query [`RootHandle::status`] to get the current value.
-#[derive(Debug, Clone)]
+/// Returned by [`RootHandle::spawn`] on success.
+///
+/// Public fields snapshot the spawn outcome. Streaming methods
+/// ([`SpawnHandle::stdout`], [`SpawnHandle::stderr`]) and lifecycle
+/// methods ([`SpawnHandle::wait`], [`SpawnHandle::stop`],
+/// [`SpawnHandle::kill`]) reach back into the supervisor for live data.
 #[non_exhaustive]
 pub struct SpawnHandle {
     pub name: String,
+    /// PID at spawn time. Across restarts the live PID changes; query
+    /// `status()` on the parent `RootHandle` for the current value, or
+    /// stream lifecycle changes via `events()` (Phase v2.1).
     pub pid: Option<u32>,
-    /// Allocated ports keyed by port name. Empty unless the spawn declared
-    /// `ports`.
+    /// Allocated ports keyed by port name. Empty unless the spawn
+    /// declared `ports`.
     pub ports: HashMap<String, u16>,
+    /// Reference to the supervisor — used by streaming/lifecycle methods.
+    pub(crate) shared: Arc<crate::root::SharedRoot>,
+}
+
+impl SpawnHandle {
+    /// Subscribe to this process's stdout. Returns a `Stream` of
+    /// `LogLine`s; each item is a captured stdout line with timestamp.
+    /// The stream closes when the process exits and the buffer is
+    /// dropped (during `RootHandle::clean` or root shutdown).
+    pub async fn stdout(
+        &self,
+    ) -> Result<impl futures_core::Stream<Item = LogLine> + Send, PsyError> {
+        self.subscribe_stream(crate::ring_buffer::Stream::Stdout)
+            .await
+    }
+
+    /// Subscribe to this process's stderr.
+    pub async fn stderr(
+        &self,
+    ) -> Result<impl futures_core::Stream<Item = LogLine> + Send, PsyError> {
+        self.subscribe_stream(crate::ring_buffer::Stream::Stderr)
+            .await
+    }
+
+    /// Wait for the process to exit. Returns once the supervisor records
+    /// the exit; survives across restarts (waits for the *current* run
+    /// to exit, then the next, etc. — call once per run).
+    pub async fn wait(&self) -> Result<ExitStatus, PsyError> {
+        let notify = {
+            let table = self.shared.process_table.lock().await;
+            let entry = table.get(&self.name).ok_or_else(|| PsyError::NotFound {
+                name: self.name.clone(),
+            })?;
+            if entry.state != crate::process::ProcessState::Running {
+                // Already exited; return immediately with what we know.
+                return Ok(ExitStatus {
+                    exit_code: entry.exit_status,
+                    signal: entry.signal.clone(),
+                });
+            }
+            Arc::clone(&entry.exit_notify)
+        };
+        notify.notified().await;
+        let table = self.shared.process_table.lock().await;
+        let entry = table.get(&self.name).ok_or_else(|| PsyError::NotFound {
+            name: self.name.clone(),
+        })?;
+        Ok(ExitStatus {
+            exit_code: entry.exit_status,
+            signal: entry.signal.clone(),
+        })
+    }
+
+    /// Send SIGTERM (with the supervisor's standard 10s grace before
+    /// SIGKILL). Equivalent to `RootHandle::stop(name)`.
+    pub async fn stop(&self) -> Result<(), PsyError> {
+        let req = Request::stop(crate::protocol::StopArgs {
+            name: self.name.clone(),
+        });
+        match crate::root::handle_request(&self.shared, req).await {
+            crate::root::HandleResult::Response(r) => {
+                if r.ok {
+                    Ok(())
+                } else {
+                    Err(PsyError::from_response(
+                        r.error_code,
+                        r.error.unwrap_or_default(),
+                    ))
+                }
+            }
+            crate::root::HandleResult::AttachSession { .. } => Err(PsyError::Other(
+                "unexpected attach response from stop".into(),
+            )),
+        }
+    }
+
+    /// Send SIGKILL immediately, bypassing the SIGTERM grace period.
+    /// Use only when graceful stop is inappropriate (process is wedged,
+    /// host is crashing, etc.).
+    pub async fn kill(&self) -> Result<(), PsyError> {
+        let pid = {
+            let table = self.shared.process_table.lock().await;
+            table.get(&self.name).and_then(|e| e.pid)
+        };
+        let pid = pid.ok_or_else(|| PsyError::NotFound {
+            name: self.name.clone(),
+        })?;
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            // On Windows there's no per-PID SIGKILL; route through stop()
+            // which uses TerminateProcess as the SIGTERM-grace fallback.
+            let _ = pid;
+            return self.stop().await;
+        }
+        #[cfg(unix)]
+        Ok(())
+    }
+
+    async fn subscribe_stream(
+        &self,
+        which: crate::ring_buffer::Stream,
+    ) -> Result<impl futures_core::Stream<Item = LogLine> + Send, PsyError> {
+        let buf = {
+            let table = self.shared.process_table.lock().await;
+            let entry = table.get(&self.name).ok_or_else(|| PsyError::NotFound {
+                name: self.name.clone(),
+            })?;
+            match which {
+                crate::ring_buffer::Stream::Stdout => Arc::clone(&entry.stdout_buf),
+                crate::ring_buffer::Stream::Stderr => Arc::clone(&entry.stderr_buf),
+                _ => return Err(PsyError::Other("invalid stream selector".into())),
+            }
+        };
+        let rx = buf.subscribe();
+        Ok(async_stream::stream! {
+            let mut rx = rx;
+            loop {
+                match rx.recv().await {
+                    Ok(line) => yield LogLine {
+                        timestamp: line.timestamp,
+                        stream: line.stream.into(),
+                        content: line.content,
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    }
+}
+
+/// What the supervisor recorded when a process exited.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ExitStatus {
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +807,7 @@ impl PsyRoot {
 
         // Resolve `boot_all`: if requested, expand to all unit names.
         let boot_units_resolved = if boot_all {
-            let pf = inner.shared_for_test().load_psyfile();
+            let pf = inner.shared().load_psyfile();
             match pf {
                 Ok(Some(pf)) => pf.units.keys().cloned().collect(),
                 Ok(None) => return Err(PsyError::PsyfileError("no Psyfile to boot --all".into())),
@@ -519,14 +817,14 @@ impl PsyRoot {
             boot_units
         };
 
-        let shared = inner.shared_for_test();
+        let shared = inner.shared();
         prepare_root_runtime(Arc::clone(&shared), boot_units_resolved, None)
             .await
             .map_err(|e| PsyError::Other(e.to_string()))?;
 
         Ok(RootHandle {
             shared,
-            main_exit_tx: inner.main_exit_tx_for_test(),
+            main_exit_tx: inner.main_exit_tx(),
         })
     }
 }
@@ -572,6 +870,18 @@ impl RootHandle {
             wait_for,
             wait_timeout,
             ports,
+            cwd: spawn.cwd.map(|p| p.to_string_lossy().to_string()),
+            ready: spawn.ready.map(ready_probe_to_arg),
+            healthcheck: spawn.healthcheck.map(healthcheck_to_arg),
+            depends_on: spawn
+                .depends_on
+                .into_iter()
+                .map(|d| DependencyArg {
+                    name: d.name,
+                    restart: d.restart,
+                })
+                .collect(),
+            metadata: spawn.metadata,
         });
         let resp = self.dispatch(req).await?;
         let pid = resp
@@ -604,6 +914,7 @@ impl RootHandle {
             name: spawn.name,
             pid,
             ports: allocated_ports,
+            shared: Arc::clone(&self.shared),
         })
     }
 
@@ -621,6 +932,11 @@ impl RootHandle {
             wait_for: None,
             wait_timeout: None,
             ports: vec![],
+            cwd: None,
+            ready: None,
+            healthcheck: None,
+            depends_on: vec![],
+            metadata: HashMap::new(),
         });
         let _resp = self.dispatch(req).await?;
         let table = self.shared.process_table.lock().await;
@@ -631,6 +947,7 @@ impl RootHandle {
             name: name.to_string(),
             pid,
             ports,
+            shared: Arc::clone(&self.shared),
         })
     }
 
@@ -776,8 +1093,9 @@ impl RootHandle {
         match opts.kind {
             SubRootKind::InProcess => self.inprocess_subroot(opts).await,
             SubRootKind::OutOfProcess { .. } => Err(PsyError::Other(
-                "OutOfProcess sub-roots are not yet implemented in v2.0; \
-                 use SubRootKind::InProcess or shell out to `psy up --parent`"
+                "OutOfProcess sub-roots are targeted for v2.1; \
+                 use SubRootKind::InProcess in v2.0, or shell out via \
+                 `Spawn::new(\"instance\", [\"psy\", \"up\", \"--parent\", parent_sock, \"--\", ...])`"
                     .into(),
             )),
         }
@@ -848,7 +1166,8 @@ impl RootHandle {
                 if r.ok {
                     Ok(r)
                 } else {
-                    Err(PsyError::classify(
+                    Err(PsyError::from_response(
+                        r.error_code,
                         r.error.unwrap_or_else(|| "unknown".into()),
                     ))
                 }
@@ -883,6 +1202,88 @@ fn format_duration(d: Duration) -> String {
     format!("{total_ms}ms")
 }
 
+fn ready_probe_to_arg(p: ReadyProbe) -> ProbeArg {
+    match p {
+        ReadyProbe::Tcp {
+            addr,
+            interval,
+            timeout,
+            retries,
+        } => ProbeArg {
+            kind: ProbeKindArg::Tcp { addr },
+            interval: interval.map(format_duration),
+            timeout: timeout.map(format_duration),
+            retries,
+        },
+        ReadyProbe::Http {
+            url,
+            interval,
+            timeout,
+            retries,
+        } => ProbeArg {
+            kind: ProbeKindArg::Http { url },
+            interval: interval.map(format_duration),
+            timeout: timeout.map(format_duration),
+            retries,
+        },
+        ReadyProbe::Exec {
+            command,
+            interval,
+            timeout,
+            retries,
+        } => ProbeArg {
+            kind: ProbeKindArg::Exec { command },
+            interval: interval.map(format_duration),
+            timeout: timeout.map(format_duration),
+            retries,
+        },
+        ReadyProbe::Exit { code, timeout } => ProbeArg {
+            kind: ProbeKindArg::Exit { code },
+            interval: None,
+            timeout: timeout.map(format_duration),
+            retries: None,
+        },
+    }
+}
+
+fn healthcheck_to_arg(p: HealthCheck) -> ProbeArg {
+    match p {
+        HealthCheck::Tcp {
+            addr,
+            interval,
+            timeout,
+            retries,
+        } => ProbeArg {
+            kind: ProbeKindArg::Tcp { addr },
+            interval: interval.map(format_duration),
+            timeout: timeout.map(format_duration),
+            retries,
+        },
+        HealthCheck::Http {
+            url,
+            interval,
+            timeout,
+            retries,
+        } => ProbeArg {
+            kind: ProbeKindArg::Http { url },
+            interval: interval.map(format_duration),
+            timeout: timeout.map(format_duration),
+            retries,
+        },
+        HealthCheck::Exec {
+            command,
+            interval,
+            timeout,
+            retries,
+        } => ProbeArg {
+            kind: ProbeKindArg::Exec { command },
+            interval: interval.map(format_duration),
+            timeout: timeout.map(format_duration),
+            retries,
+        },
+    }
+}
+
 fn stream_kind_from_str(s: &str) -> Option<StreamKind> {
     match s {
         "stdout" => Some(StreamKind::Stdout),
@@ -894,7 +1295,7 @@ fn stream_kind_from_str(s: &str) -> Option<StreamKind> {
 }
 
 // ---------------------------------------------------------------------------
-// Internal accessor — see `shared_for_test` and `main_exit_tx_for_test`
+// Internal accessor — see `shared` and `main_exit_tx`
 // declared on `crate::root::PsyRoot`. Kept module-private so the public
 // API stays clean.
 // ---------------------------------------------------------------------------

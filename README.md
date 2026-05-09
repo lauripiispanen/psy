@@ -281,7 +281,9 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use psy_core::{PsyRoot, RestartPolicy, RootOptions, Spawn};
+use psy_core::{
+    DependencyRef, PsyRoot, ReadyProbe, RestartPolicy, RootOptions, Spawn,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -292,14 +294,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let root = PsyRoot::start(RootOptions::new("my-host")).await?;
 
-    let _h = root
+    // Programmatic dependency graph — equivalent of a Psyfile, in code.
+    root.spawn(
+        Spawn::new("postgres", ["postgres", "-D", "/var/lib/pg"])
+            .with_ready(ReadyProbe::Tcp {
+                addr: "localhost:5432".into(),
+                interval: None,
+                timeout: None,
+                retries: None,
+            })
+            .with_restart(RestartPolicy::Always),
+    )
+    .await?;
+
+    let api = root
         .spawn(
-            Spawn::new("worker", ["my-program", "--flag"])
+            Spawn::new("api", ["./api-server"])
+                .with_depends_on(vec![
+                    DependencyRef::new("postgres").with_restart(true),
+                ])
                 .with_restart(RestartPolicy::OnFailure),
         )
         .await?;
 
-    // ... do host work; supervised processes run alongside ...
+    // Stream stdout / wait for exit / stop directly via SpawnHandle.
+    use futures_util::StreamExt;
+    let mut api_stdout = Box::pin(api.stdout().await?);
+    while let Some(line) = api_stdout.next().await {
+        println!("[api] {}", line.content);
+    }
 
     root.shutdown().await?;
     Ok(())
@@ -309,7 +332,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 What you get embedded:
 
 - **Same cleanup guarantees as the CLI.** Linux uses `PR_SET_CHILD_SUBREAPER` + `PR_SET_PDEATHSIG=SIGKILL`; macOS uses a per-root cleanup sidecar (kqueue `NOTE_EXIT`); Windows uses Job Objects with `KILL_ON_JOB_CLOSE`. All applied to the **host process** — your Tauri/Axum/CLI binary becomes the supervisor.
-- **Programmatic `Spawn` API** with the full feature set: restart policies, ready/health probes (Phase B+: WaitFor today, full probe API in Phase C), dependency cascades, port allocation, environment overrides, working directories.
+- **Programmatic `Spawn` API** with full Psyfile-equivalent surface: `argv`, `env`, `cwd`, `restart`, `interactive`, `ports`, `ready` (TCP / HTTP / Exec / Exit probes), `healthcheck` (continuous), `depends_on` (with restart cascades), `metadata` tags, `wait_for` blocking conditions. Hosts that build supervision graphs at runtime never need to touch TOML.
+- **Streaming `SpawnHandle`** — `stdout()` / `stderr()` return `Stream<LogLine>`, `wait()` returns `ExitStatus`, `stop()` and `kill()` are direct methods on the handle. No polling required for reactive UIs.
+- **Typed error contract** — `PsyError` variants (e.g. `AlreadyExists { name }`, `NotFound { name }`, `PortAllocationFailed { port_name }`) are backed by a wire-protocol `error_code: ErrorCode` so the typed surface stays SemVer-stable across psy-core releases regardless of how human-readable error strings evolve.
 - **In-process sub-roots** for per-tenant isolation: `RootHandle::sub_root(SubRootOptions::new("instance-a"))` returns a fresh `RootHandle` with its own process table, sharing the host's runtime and cleanup sidecar. One sub-root's children are invisible to siblings.
 - **Optional IPC socket.** `SocketBinding::None` (default for embedded hosts) means the host's API surface is the only way in. `SocketBinding::Auto` exposes a discoverable socket so an operator running `psy ps` in another shell can introspect.
 - **Workspace crates** if you only want a piece: `psy-client` (NDJSON wire-protocol client without the supervisor), `psy-mcp` (MCP JSON-RPC server).
@@ -317,7 +342,7 @@ What you get embedded:
 ### Embedded-mode caveats
 
 - **Linux subreaper is process-wide.** Once `install_host_cleanup = true` (the default), your host adopts every orphaned descendant — not just psy-spawned ones. Tauri webview helpers, native messaging hosts, anything any dependency forks internally. Either tolerate them as zombies until host exit (fine for a desktop app) or wire your own reaper. Set `install_host_cleanup = false` to opt out.
-- **In-process sub-roots share address space.** A panic mid-mutation of a shared `Mutex` poisons it; a blocking task in one sub-root starves the shared runtime; OOM kills everyone. The recommended default for hosts that don't need full crash isolation; switch individual sub-roots to `SubRootKind::OutOfProcess` if you need address-space isolation. (`OutOfProcess` ships in a future version; v2.0 supports `InProcess` only.)
+- **In-process sub-roots share address space.** A panic mid-mutation of a shared `Mutex` poisons it; a blocking task in one sub-root starves the shared runtime; OOM kills everyone. The recommended default for hosts that don't need full crash isolation; switch individual sub-roots to `SubRootKind::OutOfProcess` if you need address-space isolation. (`OutOfProcess` is **targeted for v2.1**; until then, hosts that need it can shell out via a `Spawn` that runs `psy up --parent <parent_sock>`.)
 - **macOS sidecar requires host cooperation.** Calling `dispatch_macos_cleanup_if_invoked()` at the top of `main()` is mandatory on macOS embedded hosts. If your binary is re-spawned as a sidecar (which psy does to cover hard-kill cleanup), that call is what runs the sidecar logic.
 
 ## MCP Integration

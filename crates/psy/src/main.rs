@@ -525,6 +525,11 @@ command = "echo 'hello world'"
                     wait_for: wait_for_value,
                     wait_timeout: wait_timeout_value,
                     ports: port_defs,
+                    cwd: None,
+                    ready: None,
+                    healthcheck: None,
+                    depends_on: vec![],
+                    metadata: HashMap::new(),
                 });
                 send_and_print(req);
             }

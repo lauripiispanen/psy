@@ -111,16 +111,19 @@ pub struct PsyRoot {
 }
 
 impl PsyRoot {
-    /// Read-only access to the shared root state. Useful for embedded-mode
-    /// observers that want to inspect the process table directly. Most
-    /// callers should go through the `RootHandle` API instead (Phase B).
-    pub fn shared_for_test(&self) -> Arc<SharedRoot> {
+    /// Read-only access to the shared root state. Used by the curated
+    /// `RootHandle` API in `crate::api` to construct handles around an
+    /// already-built `PsyRoot`, and by the embedded-mode fixture for
+    /// process-table inspection. Returns a fresh `Arc` clone; the
+    /// underlying state is shared.
+    pub fn shared(&self) -> Arc<SharedRoot> {
         Arc::clone(&self.shared)
     }
 
-    /// Clone of the main-exit watch sender. Used by the public
-    /// `RootHandle::shutdown` to signal teardown completion.
-    pub fn main_exit_tx_for_test(&self) -> watch::Sender<Option<i32>> {
+    /// Clone of the main-exit watch sender. Used by `RootHandle::shutdown`
+    /// to signal teardown completion to anything `await`ing the
+    /// corresponding receiver.
+    pub fn main_exit_tx(&self) -> watch::Sender<Option<i32>> {
         self.shared.main_exit_tx.clone()
     }
 
@@ -498,6 +501,11 @@ pub(crate) async fn prepare_root_runtime(
                     wait_for: None,
                     wait_timeout: None,
                     ports: vec![],
+                    cwd: None,
+                    ready: None,
+                    healthcheck: None,
+                    depends_on: vec![],
+                    metadata: HashMap::new(),
                 });
                 let result = handle_request(&shared, req).await;
                 if let HandleResult::Response(resp) = result {
@@ -894,6 +902,11 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
                         wait_for: None,
                         wait_timeout: None,
                         ports: vec![],
+                        cwd: None,
+                        ready: None,
+                        healthcheck: None,
+                        depends_on: vec![],
+                        metadata: HashMap::new(),
                     });
                     let result = handle_run(root, &dep_req).await;
                     if let HandleResult::Response(ref resp) = result {
@@ -1119,12 +1132,57 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         .await;
     }
 
-    // --- Ad-hoc mode (existing behavior) ---
+    // --- Ad-hoc mode (existing behavior, plus programmatic graph fields
+    //     from RunArgs::cwd / ready / healthcheck / depends_on / metadata) ---
     if args.command.is_empty() {
         return HandleResult::Response(Response::err(
             &req.id,
             format!("no command provided for ad-hoc process '{}'", args.name),
         ));
+    }
+
+    // Wait for declared dependencies (must be already running). For
+    // programmatic Spawns this is the equivalent of Psyfile depends_on.
+    for dep in &args.depends_on {
+        let wait_info = {
+            let table = root.process_table.lock().await;
+            match table.get(&dep.name) {
+                Some(entry) if entry.state == ProcessState::Running => {
+                    if entry.ready {
+                        None // already ready
+                    } else if entry.ready_config.is_some() {
+                        let timeout = entry
+                            .ready_config
+                            .as_ref()
+                            .map(|c| c.timeout)
+                            .unwrap_or(Duration::from_secs(30));
+                        Some((Arc::clone(&entry.ready_notify), timeout))
+                    } else {
+                        None // no probe = considered ready
+                    }
+                }
+                Some(_) | None => {
+                    return HandleResult::Response(Response::err(
+                        &req.id,
+                        format!(
+                            "process '{}' not found (declared as dependency of '{}')",
+                            dep.name, args.name
+                        ),
+                    ));
+                }
+            }
+        };
+        if let Some((notify, timeout)) = wait_info {
+            if tokio::time::timeout(timeout, notify.notified())
+                .await
+                .is_err()
+            {
+                return HandleResult::Response(Response::err(
+                    &req.id,
+                    format!("dependency '{}' readiness probe timed out", dep.name),
+                ));
+            }
+        }
     }
 
     // Allocate ports for ad-hoc processes if requested
@@ -1152,6 +1210,43 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         port_allocs.insert(args.name.clone(), allocated);
     }
 
+    // Convert wire probe args to internal ProbeConfig.
+    let ready_cfg = match &args.ready {
+        Some(p) => match probe_arg_to_config(p, Duration::from_secs(1)) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return HandleResult::Response(Response::err(
+                    &req.id,
+                    format!("invalid ready probe: {e}"),
+                ));
+            }
+        },
+        None => None,
+    };
+    let healthcheck_cfg = match &args.healthcheck {
+        Some(p) => {
+            // Healthchecks can't use exit-style probes.
+            if matches!(p.kind, crate::protocol::ProbeKindArg::Exit { .. }) {
+                return HandleResult::Response(Response::err(
+                    &req.id,
+                    "healthcheck cannot use 'exit' probe type".to_string(),
+                ));
+            }
+            match probe_arg_to_config(p, Duration::from_secs(10)) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    return HandleResult::Response(Response::err(
+                        &req.id,
+                        format!("invalid healthcheck: {e}"),
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
+    let cwd = args.cwd.as_ref().map(std::path::PathBuf::from);
+
     let process_name = args.name.clone();
     let wait_for = args.wait_for.clone();
     let wait_timeout = args.wait_timeout.clone();
@@ -1164,13 +1259,45 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         args.restart,
         args.attach,
         args.interactive,
-        None,
-        None,
-        None,
+        cwd,
+        ready_cfg,
+        healthcheck_cfg,
         false,
     )
     .await;
     apply_wait_for(root, &req.id, &process_name, wait_for, wait_timeout, result).await
+}
+
+/// Convert a wire-protocol `ProbeArg` to an internal `psyfile::ProbeConfig`.
+fn probe_arg_to_config(
+    arg: &crate::protocol::ProbeArg,
+    default_interval: Duration,
+) -> Result<crate::psyfile::ProbeConfig, String> {
+    use crate::protocol::ProbeKindArg;
+    let probe = match &arg.kind {
+        ProbeKindArg::Tcp { addr } => crate::psyfile::ProbeKind::Tcp(addr.clone()),
+        ProbeKindArg::Http { url } => crate::psyfile::ProbeKind::Http(url.clone()),
+        ProbeKindArg::Exec { command } => crate::psyfile::ProbeKind::Exec(command.clone()),
+        ProbeKindArg::Exit { code } => crate::psyfile::ProbeKind::Exit(*code),
+    };
+    let interval = arg
+        .interval
+        .as_deref()
+        .map(crate::psyfile::parse_duration)
+        .transpose()?
+        .unwrap_or(default_interval);
+    let timeout = arg
+        .timeout
+        .as_deref()
+        .map(crate::psyfile::parse_duration)
+        .transpose()?
+        .unwrap_or(Duration::from_secs(30));
+    Ok(crate::psyfile::ProbeConfig {
+        probe,
+        interval,
+        timeout,
+        retries: arg.retries,
+    })
 }
 
 /// Apply wait_for logic after a successful spawn. If wait_for is None, returns

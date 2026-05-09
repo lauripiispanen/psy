@@ -434,6 +434,11 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 wait_for,
                 wait_timeout,
                 ports,
+                cwd: None,
+                ready: None,
+                healthcheck: None,
+                depends_on: vec![],
+                metadata: HashMap::new(),
             });
             let resp = client::send_command(req).map_err(|e| e.to_string())?;
             if resp.ok {

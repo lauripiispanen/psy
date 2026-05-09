@@ -292,6 +292,11 @@ pub fn run_attached(
         wait_for: None,
         wait_timeout: None,
         ports: vec![],
+        cwd: None,
+        ready: None,
+        healthcheck: None,
+        depends_on: vec![],
+        metadata: HashMap::new(),
     });
     let mut payload =
         serde_json::to_string(&request).map_err(|e| format!("serialize error: {e}"))?;

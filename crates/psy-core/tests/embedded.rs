@@ -164,6 +164,154 @@ async fn test_embedded_inprocess_subroot_isolation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 #[allow(clippy::await_holding_lock)]
+async fn test_embedded_programmatic_graph_with_dependency() {
+    // Build a programmatic graph: a "ready" listener (TCP probe on
+    // localhost:0 won't work — use exec=true which exits 0 immediately)
+    // and a dependent that waits for the listener's ready probe.
+    use psy_core::{DependencyRef, PsyRoot, ReadyProbe, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let host = PsyRoot::start(RootOptions::new("graph-host"))
+        .await
+        .expect("host start");
+
+    // Spawn a "service" with an exec-based readiness probe (true exits 0,
+    // so the probe passes immediately).
+    host.spawn(
+        Spawn::new("service", ["sleep", "30"]).with_ready(ReadyProbe::Exec {
+            command: "true".into(),
+            interval: None,
+            timeout: Some(Duration::from_secs(5)),
+            retries: None,
+        }),
+    )
+    .await
+    .expect("service spawn");
+
+    // Spawn a "client" that depends on service.
+    host.spawn(
+        Spawn::new("client", ["sleep", "30"]).with_depends_on(vec![DependencyRef::new("service")]),
+    )
+    .await
+    .expect("client spawn");
+
+    // Both should be running.
+    let listing = host.list().await.expect("list");
+    let names: Vec<_> = listing.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"service"));
+    assert!(names.contains(&"client"));
+
+    host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_dependency_not_running_errors() {
+    use psy_core::{DependencyRef, PsyError, PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let host = PsyRoot::start(RootOptions::new("dep-err-host"))
+        .await
+        .expect("host start");
+
+    let result = host
+        .spawn(
+            Spawn::new("dependent", ["sleep", "30"])
+                .with_depends_on(vec![DependencyRef::new("never-spawned")]),
+        )
+        .await;
+    match result {
+        Ok(_) => panic!("spawn should fail when dep doesn't exist"),
+        Err(PsyError::NotFound { name }) => assert_eq!(name, "never-spawned"),
+        Err(other) => panic!("expected NotFound, got: {other}"),
+    }
+
+    host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_spawnhandle_streaming_and_wait() {
+    // Spawn a process, subscribe to its stdout, then stop it via
+    // SpawnHandle::stop(). Verify wait() returns the exit status.
+    use futures_util::StreamExt;
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let host = PsyRoot::start(RootOptions::new("stream-host"))
+        .await
+        .expect("host start");
+
+    // Spawn a process that prints a line then sleeps. The SpawnHandle's
+    // stdout stream should yield the line.
+    let h = host
+        .spawn(Spawn::new(
+            "talker",
+            ["sh", "-c", "echo hello-from-talker && sleep 30"],
+        ))
+        .await
+        .expect("spawn");
+
+    let mut stdout = Box::pin(h.stdout().await.expect("stdout"));
+    // Read one line with a timeout (probe should appear within ~1s).
+    let line = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+        .await
+        .expect("stream timeout")
+        .expect("stream closed early");
+    assert!(
+        line.content.contains("hello-from-talker"),
+        "expected greeting; got: {}",
+        line.content
+    );
+
+    // Stop via SpawnHandle.
+    h.stop().await.expect("stop");
+
+    // wait() should now return promptly with exit info.
+    let status = tokio::time::timeout(Duration::from_secs(5), h.wait())
+        .await
+        .expect("wait timeout")
+        .expect("wait err");
+    // SIGTERM usually leaves exit_code None and signal Some("SIG15") on
+    // Unix; assert at least one of them is set.
+    assert!(
+        status.exit_code.is_some() || status.signal.is_some(),
+        "should have exit_code or signal: {status:?}"
+    );
+
+    host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_typed_error_already_exists() {
+    use psy_core::{PsyError, PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap();
+    let host = PsyRoot::start(RootOptions::new("dup-host"))
+        .await
+        .expect("host start");
+
+    host.spawn(Spawn::new("dup", ["sleep", "30"]))
+        .await
+        .expect("first spawn");
+
+    let result = host.spawn(Spawn::new("dup", ["sleep", "30"])).await;
+    match result {
+        Ok(_) => panic!("duplicate spawn should fail"),
+        Err(PsyError::AlreadyExists { name }) => assert_eq!(name, "dup"),
+        Err(other) => panic!("expected AlreadyExists, got: {other}"),
+    }
+
+    host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
 async fn test_embedded_inprocess_subroot_outofprocess_not_implemented() {
     use psy_core::{PsyRoot, RootOptions, SubRootKind, SubRootOptions};
 
