@@ -5,10 +5,11 @@ members = [
     "crates/psy-core",
     "crates/psy-client",
     "crates/psy-mcp",
+    "crates/psy-macos-cleanup-sidecar",
 ]
 
 [workspace.package]
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "Cross-platform process lifecycle manager"
 license = "MIT"
@@ -25,6 +26,8 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 regex = "1"
 libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [profile.release]
 strip = true

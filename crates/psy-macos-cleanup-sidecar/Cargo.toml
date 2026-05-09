@@ -1,14 +1,15 @@
 [package]
-name = "psy-mcp"
+name = "psy-macos-cleanup-sidecar"
 version.workspace = true
 edition.workspace = true
-description = "MCP JSON-RPC server for psy"
+description = "Standalone macOS cleanup sidecar for psy embedded hosts"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "psy-macos-cleanup-sidecar"
+path = "src/main.rs"
+
 [dependencies]
 psy-core = { path = "../psy-core", version = "2.1.0" }
-psy-client = { path = "../psy-client", version = "2.1.0" }
-serde = { workspace = true }
-serde_json = { workspace = true }

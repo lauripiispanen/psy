@@ -14,17 +14,28 @@ fn main() {
         std::process::exit(2);
     }
 
+    // Optional ExternalBinary mode: if PSY_SIDECAR_BIN is set, use the
+    // standalone `psy-macos-cleanup-sidecar` shim instead of host
+    // re-dispatch. This lets the integration test exercise the
+    // ExternalBinary path with the real shim binary.
+    let mut opts = psy_core::RootOptions::new("embedded-fixture");
+    if let Ok(sidecar_bin) = std::env::var("PSY_SIDECAR_BIN") {
+        opts = opts.with_sidecar_strategy(psy_core::SidecarStrategy::ExternalBinary {
+            path: std::path::PathBuf::from(sidecar_bin),
+            sentinel: vec![psy_core::DEFAULT_SENTINEL.to_string()],
+        });
+    }
+
     let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
     let exit_code = runtime.block_on(async move {
         // 2. Construct the root via the public library API.
-        let root =
-            match psy_core::PsyRoot::start(psy_core::RootOptions::new("embedded-fixture")).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("embedded_fixture: PsyRoot::start failed: {e}");
-                    return 1;
-                }
-            };
+        let root = match psy_core::PsyRoot::start(opts).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("embedded_fixture: PsyRoot::start failed: {e}");
+                return 1;
+            }
+        };
 
         // 3. Spawn the supervised process.
         let spawn = psy_core::Spawn::new("main", argv);

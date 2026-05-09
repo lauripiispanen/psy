@@ -22,6 +22,17 @@ use crate::ring_buffer::Stream as RBStream;
 
 pub type RootResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Internal options bundle for [`PsyRoot::new_with_options`]. Used by the
+/// curated `api::PsyRoot::start` to thread observability hooks through.
+pub struct NewRootOptions {
+    pub name: String,
+    pub psyfile_path: Option<PathBuf>,
+    pub sidecar_strategy: crate::macos_cleanup::SidecarStrategy,
+    pub log_sink: Option<Arc<dyn crate::api::LogSink>>,
+    pub on_event: Option<Arc<dyn Fn(crate::api::RootEvent) + Send + Sync>>,
+    pub runtime: Option<tokio::runtime::Handle>,
+}
+
 /// What runs as the "main" of a psy root.
 ///
 /// `Default` spawns a normal child process (a shell, a user-supplied command,
@@ -68,6 +79,16 @@ pub struct SharedRoot {
     /// How the macOS cleanup sidecar should be spawned. Cross-platform: on
     /// Linux/Windows this is accepted but ignored.
     pub sidecar_strategy: crate::macos_cleanup::SidecarStrategy,
+    /// Optional sink for child stdout/stderr lines (in addition to the
+    /// per-process ring buffer). Wired in by [`crate::api::PsyRoot::start`].
+    pub log_sink: Option<Arc<dyn crate::api::LogSink>>,
+    /// Optional lifecycle-event callback. Fires synchronously on the
+    /// supervisor's task; callbacks must not block.
+    pub on_event: Option<Arc<dyn Fn(crate::api::RootEvent) + Send + Sync>>,
+    /// Optional explicit tokio runtime handle. When set, [`Self::spawn`]
+    /// routes background tasks here instead of using the ambient
+    /// `tokio::spawn`. None = inherit ambient.
+    pub runtime: Option<tokio::runtime::Handle>,
     /// macOS cleanup sidecar handle. The supervisor may swap this in/out on
     /// respawn, so it's wrapped in a sync `Mutex` (writes are infrequent and
     /// don't need to be async).
@@ -97,6 +118,21 @@ impl SharedRoot {
                 Ok(Some(pf))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Spawn a future onto the configured runtime if `runtime` is set,
+    /// otherwise fall back to the ambient `tokio::spawn`. Use this
+    /// instead of bare `tokio::spawn` for any background task whose
+    /// runtime placement should follow `RootOptions::with_runtime`.
+    pub(crate) fn spawn<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match &self.runtime {
+            Some(h) => h.spawn(fut),
+            None => tokio::spawn(fut),
         }
     }
 }
@@ -220,6 +256,9 @@ impl PsyRoot {
             port_allocations: Mutex::new(HashMap::new()),
             root_name: name,
             sidecar_strategy: parent.sidecar_strategy.clone(),
+            log_sink: parent.log_sink.clone(),
+            on_event: parent.on_event.clone(),
+            runtime: parent.runtime.clone(),
             #[cfg(target_os = "macos")]
             macos_sidecar,
         });
@@ -240,6 +279,29 @@ impl PsyRoot {
         psyfile_path: Option<PathBuf>,
         sidecar_strategy: crate::macos_cleanup::SidecarStrategy,
     ) -> RootResult<Self> {
+        Self::new_with_options(NewRootOptions {
+            name,
+            psyfile_path,
+            sidecar_strategy,
+            log_sink: None,
+            on_event: None,
+            runtime: None,
+        })
+    }
+
+    /// Internal constructor used by the curated `crate::api::PsyRoot::start`
+    /// when callers supply observability hooks (`log_sink` / `on_event`).
+    /// Not part of the public surface but exposed `pub` because the api
+    /// module is a sibling.
+    pub fn new_with_options(opts: NewRootOptions) -> RootResult<Self> {
+        let NewRootOptions {
+            name,
+            psyfile_path,
+            sidecar_strategy,
+            log_sink,
+            on_event,
+            runtime,
+        } = opts;
         // Platform-specific root setup (setsid / subreaper / Job Object)
         platform::setup_root();
 
@@ -298,7 +360,7 @@ impl PsyRoot {
             Ok(Some(handle)) => std::sync::Mutex::new(Some(Arc::new(handle))),
             Ok(None) => std::sync::Mutex::new(None), // SidecarStrategy::Disabled
             Err(e) => {
-                eprintln!("psy: macOS cleanup sidecar failed to start: {e}");
+                tracing::warn!(target: "psy", "macOS cleanup sidecar failed to start: {e}");
                 std::sync::Mutex::new(None)
             }
         };
@@ -319,6 +381,9 @@ impl PsyRoot {
             port_allocations: Mutex::new(HashMap::new()),
             root_name: name,
             sidecar_strategy,
+            log_sink,
+            on_event,
+            runtime,
             #[cfg(target_os = "macos")]
             macos_sidecar,
         });
@@ -433,22 +498,35 @@ pub(crate) async fn prepare_root_runtime(
     boot_units: Vec<String>,
     parent_sock: Option<String>,
 ) -> RootResult<()> {
-    #[cfg(unix)]
-    let listener = tokio::net::UnixListener::bind(&shared.socket_path)?;
+    prepare_root_runtime_with_bind(shared, boot_units, parent_sock, true).await
+}
 
-    #[cfg(windows)]
-    let listener = {
-        use tokio::net::windows::named_pipe::ServerOptions;
-        ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&shared.socket_path)?
-    };
+/// Variant that lets the caller skip the IPC socket bind. Used by the
+/// embedded API when `SocketBinding::None` is requested — the host's
+/// supervision is purely in-process and no out-of-process clients need
+/// to connect.
+pub(crate) async fn prepare_root_runtime_with_bind(
+    shared: Arc<SharedRoot>,
+    boot_units: Vec<String>,
+    parent_sock: Option<String>,
+    bind_listener: bool,
+) -> RootResult<()> {
+    if bind_listener {
+        #[cfg(unix)]
+        let listener = tokio::net::UnixListener::bind(&shared.socket_path)?;
 
-    {
+        #[cfg(windows)]
+        let listener = {
+            use tokio::net::windows::named_pipe::ServerOptions;
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&shared.socket_path)?
+        };
+
         let root = Arc::clone(&shared);
-        tokio::spawn(async move {
+        shared.spawn(async move {
             if let Err(e) = run_socket_listener(root, listener).await {
-                eprintln!("psy: socket listener error: {e}");
+                tracing::warn!(target: "psy", "socket listener error: {e}");
             }
         });
     }
@@ -456,14 +534,16 @@ pub(crate) async fn prepare_root_runtime(
     #[cfg(target_os = "macos")]
     {
         let root = Arc::clone(&shared);
-        tokio::spawn(supervise_macos_sidecar(root));
+        shared.spawn(supervise_macos_sidecar(root));
     }
 
-    if let Some(ref anchor) = shared.anchor_path {
-        let anchor_str = anchor.to_string_lossy();
-        if anchor_str != shared.socket_path {
-            if let Err(e) = std::fs::write(anchor, &shared.socket_path) {
-                eprintln!("psy: failed to write anchor file: {e}");
+    if bind_listener {
+        if let Some(ref anchor) = shared.anchor_path {
+            let anchor_str = anchor.to_string_lossy();
+            if anchor_str != shared.socket_path {
+                if let Err(e) = std::fs::write(anchor, &shared.socket_path) {
+                    tracing::warn!(target: "psy", "failed to write anchor file: {e}");
+                }
             }
         }
     }
@@ -510,8 +590,9 @@ pub(crate) async fn prepare_root_runtime(
                 let result = handle_request(&shared, req).await;
                 if let HandleResult::Response(resp) = result {
                     if !resp.ok {
-                        eprintln!(
-                            "psy: failed to start unit '{unit_name}': {}",
+                        tracing::warn!(
+                            target: "psy",
+                            "failed to start unit '{unit_name}': {}",
                             resp.error.unwrap_or_default()
                         );
                     }
@@ -611,6 +692,51 @@ async fn register_with_parent(
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle event emission (for `RootOptions::on_event`)
+// ---------------------------------------------------------------------------
+
+/// Fire an event to the configured `on_event` callback (root-level)
+/// AND to the per-process broadcast if the event names a process.
+///
+/// **Do not call from within `process_table.lock()`** — this attempts
+/// its own table lock to find the per-entry broadcast. From a locked
+/// context, use [`fire_event_to_entry`] + [`fire_global_event`].
+pub(crate) fn emit_event(root: &SharedRoot, ev: crate::api::RootEvent) {
+    let proc_name = match &ev {
+        crate::api::RootEvent::SpawnStarted { name, .. }
+        | crate::api::RootEvent::SpawnReady { name }
+        | crate::api::RootEvent::SpawnExited { name, .. }
+        | crate::api::RootEvent::SpawnRestarted { name, .. }
+        | crate::api::RootEvent::ProbeFailed { name, .. }
+        | crate::api::RootEvent::SubRootStarted { name }
+        | crate::api::RootEvent::SubRootExited { name } => Some(name.clone()),
+        crate::api::RootEvent::Shutdown => None,
+    };
+    if let Some(name) = proc_name {
+        if let Ok(table) = root.process_table.try_lock() {
+            if let Some(entry) = table.get(&name) {
+                let _ = entry.events_tx.send(ev.clone());
+            }
+        }
+    }
+    fire_global_event(root, ev);
+}
+
+/// Send a per-entry event when the caller already holds the table lock
+/// (the broadcast send doesn't need the lock — we just need the entry's
+/// `events_tx`).
+pub(crate) fn fire_event_to_entry(entry: &crate::process::ProcessEntry, ev: crate::api::RootEvent) {
+    let _ = entry.events_tx.send(ev);
+}
+
+/// Fire only the global `on_event` callback, no broadcast.
+pub(crate) fn fire_global_event(root: &SharedRoot, ev: crate::api::RootEvent) {
+    if let Some(ref cb) = root.on_event {
+        cb(ev);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // macOS cleanup sidecar integration
 // ---------------------------------------------------------------------------
 
@@ -661,7 +787,7 @@ async fn supervise_macos_sidecar(root: Arc<SharedRoot>) {
         }
 
         // Sidecar died unexpectedly — respawn.
-        eprintln!("psy: macOS cleanup sidecar exited unexpectedly; respawning");
+        tracing::warn!(target: "psy", "macOS cleanup sidecar exited unexpectedly; respawning");
         let new_handle =
             match crate::macos_cleanup::spawn_sidecar(root.psy_root_pid, &root.sidecar_strategy) {
                 Ok(Some(h)) => Arc::new(h),
@@ -673,7 +799,7 @@ async fn supervise_macos_sidecar(root: Arc<SharedRoot>) {
                     return;
                 }
                 Err(e) => {
-                    eprintln!("psy: failed to respawn macOS cleanup sidecar: {e}");
+                    tracing::error!(target: "psy", "failed to respawn macOS cleanup sidecar: {e}");
                     if let Ok(mut g) = root.macos_sidecar.lock() {
                         *g = None;
                     }
@@ -1578,6 +1704,7 @@ async fn spawn_process(
     let mut entry = ProcessEntry::new(name.clone(), command, env, restart, false);
     entry.working_dir = working_dir;
     entry.is_subroot = is_subroot;
+    entry.log_sink = root.log_sink.clone();
 
     // Configure readiness probes
     let is_exit_probe = matches!(
@@ -1621,6 +1748,25 @@ async fn spawn_process(
     entry.child = Some(child);
     if let Some(pid) = entry.pid {
         notify_macos_sidecar(root, pid);
+        // `send_replace` instead of `send`: the watch channel may have
+        // no live receivers at this point (host hasn't subscribed yet),
+        // and `send` returns Err + drops the value in that case while
+        // `send_replace` always stores the new value so a later
+        // subscriber sees the current pid.
+        entry.pid_tx.send_replace(Some(pid));
+        // Inside `table.lock()` here. SpawnStarted before insert: the
+        // entry's broadcast has no live subscribers yet (the host hasn't
+        // received its SpawnHandle), so only fire the global callback.
+        // Per-entry replays happen on subscribe via the latest watch
+        // value (pid) — events that fire before subscribe are dropped
+        // by design.
+        fire_global_event(
+            root,
+            crate::api::RootEvent::SpawnStarted {
+                name: name.clone(),
+                pid,
+            },
+        );
     }
 
     // Set up probe cancellation channel
@@ -1642,7 +1788,7 @@ async fn spawn_process(
             let probe_cancel = cancel_rx.clone();
             let probe_stdout = Arc::clone(&stdout_buf);
             let probe_stderr = Arc::clone(&stderr_buf);
-            tokio::spawn(async move {
+            root.spawn(async move {
                 crate::probe::run_ready_probe(
                     pt,
                     probe_name,
@@ -1664,7 +1810,7 @@ async fn spawn_process(
         let hc_cancel = cancel_rx.clone();
         let hc_stdout = Arc::clone(&stdout_buf);
         let hc_stderr = Arc::clone(&stderr_buf);
-        tokio::spawn(async move {
+        root.spawn(async move {
             crate::probe::run_healthcheck(pt, hc_name, hc_config, hc_stdout, hc_stderr, hc_cancel)
                 .await;
         });
@@ -1672,7 +1818,7 @@ async fn spawn_process(
 
     let root_clone = Arc::clone(root);
     let monitor_name = name.clone();
-    tokio::spawn(async move {
+    root.spawn(async move {
         monitor_child(root_clone, monitor_name).await;
     });
 
@@ -2229,6 +2375,23 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
         entry.child = Some(child);
         if let Some(pid) = entry.pid {
             notify_macos_sidecar(root, pid);
+            entry.pid_tx.send_replace(Some(pid));
+            let attempt = entry.restarts;
+            // Inside `table.lock()`. Send to entry broadcast directly
+            // (subscribers from the previous run are still attached to
+            // this same `events_tx`), fire global callback separately.
+            let started = crate::api::RootEvent::SpawnStarted {
+                name: args.name.clone(),
+                pid,
+            };
+            let restarted = crate::api::RootEvent::SpawnRestarted {
+                name: args.name.clone(),
+                attempt,
+            };
+            fire_event_to_entry(&entry, started.clone());
+            fire_global_event(root, started);
+            fire_event_to_entry(&entry, restarted.clone());
+            fire_global_event(root, restarted);
         }
 
         // Set up probe cancellation and launch probe tasks
@@ -2250,7 +2413,7 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
                 let probe_cancel = cancel_rx.clone();
                 let probe_stdout = Arc::clone(&stdout_buf);
                 let probe_stderr = Arc::clone(&stderr_buf);
-                tokio::spawn(async move {
+                root.spawn(async move {
                     crate::probe::run_ready_probe(
                         pt,
                         probe_name,
@@ -2272,7 +2435,7 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
             let hc_cancel = cancel_rx.clone();
             let hc_stdout = Arc::clone(&stdout_buf);
             let hc_stderr = Arc::clone(&stderr_buf);
-            tokio::spawn(async move {
+            root.spawn(async move {
                 crate::probe::run_healthcheck(
                     pt, hc_name, hc_config, hc_stdout, hc_stderr, hc_cancel,
                 )
@@ -2282,14 +2445,14 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
 
         let root_clone = Arc::clone(root);
         let monitor_name = name.clone();
-        tokio::spawn(async move {
+        root.spawn(async move {
             monitor_child(root_clone, monitor_name).await;
         });
 
         // Trigger restart cascades
         let root_clone = Arc::clone(root);
         let cascade_name = name.clone();
-        tokio::spawn(async move {
+        root.spawn(async move {
             cascade_restarts(&root_clone, &cascade_name).await;
         });
     }
@@ -2807,7 +2970,7 @@ pub(crate) async fn teardown(root: Arc<SharedRoot>) {
             })
             .await
             {
-                eprintln!("psy: failed to stop {name}: {e}");
+                tracing::warn!(target: "psy", "failed to stop {name}: {e}");
             }
         }
     }
@@ -2822,6 +2985,8 @@ pub(crate) async fn teardown(root: Arc<SharedRoot>) {
             let _ = std::fs::remove_file(anchor);
         }
     }
+
+    emit_event(&root, crate::api::RootEvent::Shutdown);
 }
 
 // ---------------------------------------------------------------------------
@@ -2919,6 +3084,7 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
             }
 
             entry.pid = None;
+            entry.pid_tx.send_replace(None);
 
             // Cancel any running probe tasks
             if let Some(ref cancel) = entry.probe_cancel {
@@ -2939,6 +3105,18 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
 
             // Notify waiters that the process has exited
             entry.exit_notify.notify_waiters();
+
+            // Emit exit event. We're inside the table lock here so we
+            // can't call emit_event (which try_locks the table); send
+            // directly to the entry's broadcast and fire the global
+            // callback separately.
+            let exit_event = crate::api::RootEvent::SpawnExited {
+                name: name.clone(),
+                exit_code: entry.exit_status,
+                signal: entry.signal.clone(),
+            };
+            fire_event_to_entry(entry, exit_event.clone());
+            fire_global_event(&root, exit_event);
 
             let do_restart =
                 !root.shutting_down.load(Ordering::Relaxed) && should_restart(entry, exit_code);
@@ -2980,6 +3158,20 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
                     entry.child = Some(child);
                     if let Some(pid) = entry.pid {
                         notify_macos_sidecar(&root, pid);
+                        entry.pid_tx.send_replace(Some(pid));
+                        let attempt = entry.restarts;
+                        let started = crate::api::RootEvent::SpawnStarted {
+                            name: name.clone(),
+                            pid,
+                        };
+                        let restarted = crate::api::RootEvent::SpawnRestarted {
+                            name: name.clone(),
+                            attempt,
+                        };
+                        fire_event_to_entry(entry, started.clone());
+                        fire_global_event(&root, started);
+                        fire_event_to_entry(entry, restarted.clone());
+                        fire_global_event(&root, restarted);
                     }
 
                     // Relaunch probe tasks
@@ -3033,7 +3225,7 @@ async fn monitor_child(root: Arc<SharedRoot>, name: String) {
                     // Continue the loop to monitor the new child
                 }
                 Err(e) => {
-                    eprintln!("psy: failed to restart {name}: {e}");
+                    tracing::error!(target: "psy", "failed to restart {name}: {e}");
                     entry.state = ProcessState::Failed;
                     return;
                 }
@@ -3063,7 +3255,7 @@ async fn run_socket_listener(
         let root_clone = Arc::clone(&root);
         tokio::spawn(async move {
             if let Err(e) = handle_unix_connection(root_clone, stream).await {
-                eprintln!("psy: connection error: {e}");
+                tracing::warn!(target: "psy", "connection error: {e}");
             }
         });
     }
@@ -3165,7 +3357,7 @@ async fn run_socket_listener(
         let root_clone = Arc::clone(&root);
         tokio::spawn(async move {
             if let Err(e) = handle_named_pipe_connection(root_clone, connected).await {
-                eprintln!("psy: connection error: {e}");
+                tracing::warn!(target: "psy", "connection error: {e}");
             }
         });
     }

@@ -219,6 +219,8 @@ fn main() {
     // non-macOS targets.
     psy_core::dispatch_macos_cleanup_if_invoked();
 
+    init_tracing();
+
     let cli = Cli::parse();
 
     // If --in <name> was supplied, resolve the named sub-root's socket via
@@ -826,6 +828,30 @@ command = "echo 'hello world'"
 
 /// Look up a sub-root unit's socket path via the current root's `ps` response.
 /// Used by `--in <name>` to redirect subsequent calls to the sub-root.
+/// Set up the CLI's tracing subscriber so `psy_core` diagnostics emitted
+/// via `tracing::warn!` / `tracing::error!` reach stderr the way they
+/// did when they were `eprintln!`. Honors `RUST_LOG` if set; otherwise
+/// shows `psy=warn`.
+///
+/// Embedded users (using `psy-core` as a library) install their own
+/// subscriber; if they don't, psy-core events become silent no-ops by
+/// design — the host owns its observability.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("psy=warn"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .without_time()
+                .with_target(false)
+                .with_level(false)
+                .compact(),
+        )
+        .try_init();
+}
+
 fn resolve_subroot_sock(name: &str) -> Result<String, String> {
     let resp = client::send_command(Request::ps())?;
     if !resp.ok {

@@ -24,9 +24,7 @@ use crate::protocol::{
     WaitFor as ProtoWaitFor,
 };
 pub use crate::protocol::{ErrorCode, ProcessInfo, RestartPolicy, RunInfo, StreamKind};
-use crate::root::{
-    handle_request, prepare_root_runtime, teardown, HandleResult, PsyRoot as _Inner,
-};
+use crate::root::{handle_request, teardown, HandleResult, PsyRoot as _Inner};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -191,6 +189,28 @@ pub struct RootOptions {
     /// sentinel; hosts must call
     /// [`crate::dispatch_macos_cleanup_if_invoked`] at the top of `main()`.
     pub sidecar_strategy: SidecarStrategy,
+    /// Optional sink for child stdout / stderr. Each captured line is
+    /// also forwarded here in addition to the per-process ring buffer,
+    /// so hosts can route process output to their own observability
+    /// stack (Tauri tracing layer, OpenTelemetry exporter, file logger,
+    /// etc.) without polling. `None` means no forwarding.
+    pub log_sink: Option<Arc<dyn LogSink>>,
+    /// Optional callback invoked for root-level lifecycle events
+    /// (spawn started/ready/exited/restarted, probe failed, sub-root
+    /// started/exited, root shutdown). Fires synchronously on the
+    /// supervisor's task; callbacks must not block. `None` = no events
+    /// observed.
+    pub on_event: Option<Arc<dyn Fn(RootEvent) + Send + Sync>>,
+    /// Optional explicit runtime handle. When set, every long-lived
+    /// background task psy-core spawns (socket listener, sidecar
+    /// supervisor, per-process monitors, probe loops) goes onto this
+    /// runtime instead of the ambient `tokio::spawn` runtime. Useful
+    /// when the host wants to keep psy-core's tasks on a known,
+    /// dedicated runtime — e.g. a Tauri host that runs its app
+    /// command-handlers on one runtime but wants supervision on another.
+    /// `None` (default) inherits whatever runtime `PsyRoot::start` is
+    /// awaited from, which is what most hosts want.
+    pub runtime: Option<tokio::runtime::Handle>,
 }
 
 impl RootOptions {
@@ -204,7 +224,27 @@ impl RootOptions {
             bind_socket: SocketBinding::None,
             install_host_cleanup: true,
             sidecar_strategy: SidecarStrategy::default(),
+            log_sink: None,
+            on_event: None,
+            runtime: None,
         }
+    }
+
+    pub fn with_log_sink(mut self, sink: Arc<dyn LogSink>) -> Self {
+        self.log_sink = Some(sink);
+        self
+    }
+
+    pub fn with_on_event(mut self, callback: impl Fn(RootEvent) + Send + Sync + 'static) -> Self {
+        self.on_event = Some(Arc::new(callback));
+        self
+    }
+
+    /// Pin psy-core's internal background tasks to a specific runtime.
+    /// See [`RootOptions::runtime`] for semantics.
+    pub fn with_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.runtime = Some(handle);
+        self
     }
 
     pub fn with_psyfile(mut self, src: PsyfileSource) -> Self {
@@ -239,6 +279,91 @@ impl RootOptions {
 }
 
 // ---------------------------------------------------------------------------
+// LogSink + RootEvent (observability hooks)
+// ---------------------------------------------------------------------------
+
+/// Receiver for child stdout / stderr lines. Implemented by the host;
+/// psy-core invokes [`LogSink::on_line`] for every captured line in
+/// addition to writing it to the per-process ring buffer.
+///
+/// Example: route to stderr (replace with `tracing::info!` /
+/// `tracing::warn!` in your own host if you've enabled `tracing`):
+///
+/// ```no_run
+/// use psy_core::{LogSink, StreamKind};
+///
+/// struct StderrSink;
+/// impl LogSink for StderrSink {
+///     fn on_line(
+///         &self,
+///         process: &str,
+///         _run_id: u32,
+///         stream: StreamKind,
+///         _ts: chrono::DateTime<chrono::Utc>,
+///         line: &str,
+///     ) {
+///         match stream {
+///             StreamKind::Stdout => eprintln!("[{process}] {line}"),
+///             StreamKind::Stderr => eprintln!("[{process} ERR] {line}"),
+///             _ => {}
+///         }
+///     }
+/// }
+/// ```
+pub trait LogSink: Send + Sync + 'static {
+    /// Called once per captured line. `process` is the unit/process
+    /// name; `run_id` is monotonically increasing per process (changes
+    /// on restart); `stream` is `Stdout` or `Stderr` (probe streams are
+    /// not forwarded — query via `RootHandle::logs(.., probe = true)`
+    /// if needed); `ts` is the capture time; `line` is UTF-8 text.
+    fn on_line(
+        &self,
+        process: &str,
+        run_id: u32,
+        stream: StreamKind,
+        ts: chrono::DateTime<chrono::Utc>,
+        line: &str,
+    );
+}
+
+/// Root-level lifecycle events. Delivered to
+/// [`RootOptions::on_event`] callbacks synchronously on the supervisor's
+/// task — callbacks must not block (offload to a channel if you need to
+/// do non-trivial work).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum RootEvent {
+    /// A spawn started. `pid` is the OS pid at spawn time; on macOS
+    /// this is also tracked by the cleanup sidecar.
+    SpawnStarted { name: String, pid: u32 },
+    /// The process passed its `ready` probe (or had no probe).
+    SpawnReady { name: String },
+    /// The process exited. `exit_code` is `None` if killed by signal;
+    /// `signal` is set on Unix when applicable.
+    SpawnExited {
+        name: String,
+        exit_code: Option<i32>,
+        signal: Option<String>,
+    },
+    /// The process was restarted (after backoff). `attempt` is the
+    /// restart count for this run.
+    SpawnRestarted { name: String, attempt: u32 },
+    /// A readiness or healthcheck probe failed. `kind` is one of
+    /// `"ready"` or `"healthcheck"`; `detail` is a short reason.
+    ProbeFailed {
+        name: String,
+        kind: String,
+        detail: String,
+    },
+    /// An in-process sub-root started.
+    SubRootStarted { name: String },
+    /// An in-process sub-root tore down.
+    SubRootExited { name: String },
+    /// `RootHandle::shutdown` finished tearing down.
+    Shutdown,
+}
+
+// ---------------------------------------------------------------------------
 // Sub-roots
 // ---------------------------------------------------------------------------
 
@@ -261,7 +386,10 @@ impl SubRootOptions {
             psyfile: None,
             boot_units: vec![],
             boot_all: false,
-            bind_socket: SocketBinding::Auto,
+            // Default `None`: matches the embedded-host pattern where the
+            // host owns its sub-roots via API. Hosts that want operator
+            // drill-in via `psy ps` set `Auto` or `Path` explicitly.
+            bind_socket: SocketBinding::None,
         }
     }
 
@@ -310,14 +438,16 @@ pub enum SubRootKind {
     /// sub-root needs full address-space isolation. Costs one extra
     /// process per sub-root and adds an IPC round-trip per spawn.
     ///
-    /// **Targeted for v2.1.** v2.0 returns a typed error from
-    /// [`RootHandle::sub_root`] when this variant is used; until v2.1
-    /// ships, hosts that genuinely need address-space isolation can
-    /// shell out via `Spawn::new("instance", ["psy", "up", "--parent",
-    /// &parent_sock, "--", ...])` from a [`Spawn`] on the host. The
-    /// switch to the typed API in v2.1 will be source-compatible —
-    /// just remove the `with_kind(SubRootKind::OutOfProcess { … })`
-    /// hint when it lands.
+    /// **Targeted for v2.2** (deferred from v2.1 to land typed-API
+    /// changes the right way once a `--bind-path` CLI option exists).
+    /// Until v2.2 ships, hosts that need address-space isolation can
+    /// use [`RootHandle::spawn_psy_subroot`] (v2.1+) which spawns a
+    /// `psy up` child via the regular [`Spawn`] mechanism — fully
+    /// supervised by the parent's lifecycle and macOS cleanup sidecar.
+    /// The host then talks to the child via psy's NDJSON wire protocol
+    /// (or `psy --in <name>` from a sibling shell). When `SubRootKind`
+    /// gains real `OutOfProcess` support in v2.2, the migration will
+    /// be source-compatible.
     OutOfProcess { binary: Option<PathBuf> },
 }
 
@@ -610,6 +740,44 @@ impl SpawnHandle {
             .await
     }
 
+    /// Subscribe to this process's lifecycle events. Yields `RootEvent`
+    /// values whose `name` matches this handle's process —
+    /// `SpawnStarted`, `SpawnReady`, `SpawnExited`, `SpawnRestarted`,
+    /// `ProbeFailed`. The stream closes when the process is removed from
+    /// the table (via `RootHandle::clean` or root shutdown).
+    pub async fn events(
+        &self,
+    ) -> Result<impl futures_core::Stream<Item = RootEvent> + Send, PsyError> {
+        let rx = {
+            let table = self.shared.process_table.lock().await;
+            let entry = table.get(&self.name).ok_or_else(|| PsyError::NotFound {
+                name: self.name.clone(),
+            })?;
+            entry.events_tx.subscribe()
+        };
+        Ok(async_stream::stream! {
+            let mut rx = rx;
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => yield ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    }
+
+    /// Watch the live PID. Updates on spawn, restart (new PID), and
+    /// exit (set to `None`). Hosts can `borrow()` the current value or
+    /// `await changed()` for updates.
+    pub async fn pid_watch(&self) -> Result<tokio::sync::watch::Receiver<Option<u32>>, PsyError> {
+        let table = self.shared.process_table.lock().await;
+        let entry = table.get(&self.name).ok_or_else(|| PsyError::NotFound {
+            name: self.name.clone(),
+        })?;
+        Ok(entry.pid_tx.subscribe())
+    }
+
     /// Wait for the process to exit. Returns once the supervisor records
     /// the exit; survives across restarts (waits for the *current* run
     /// to exit, then the next, etc. — call once per run).
@@ -787,9 +955,12 @@ impl PsyRoot {
             psyfile,
             boot_units,
             boot_all,
-            bind_socket: _bind_socket,
+            bind_socket,
             install_host_cleanup: _install_host_cleanup,
             sidecar_strategy,
+            log_sink,
+            on_event,
+            runtime,
         } = options;
 
         // Resolve the Psyfile path before constructing the root — the
@@ -802,8 +973,15 @@ impl PsyRoot {
             }
         };
 
-        let inner = _Inner::new_with_strategy(name, psyfile_path, sidecar_strategy)
-            .map_err(|e| PsyError::Other(e.to_string()))?;
+        let inner = _Inner::new_with_options(crate::root::NewRootOptions {
+            name,
+            psyfile_path,
+            sidecar_strategy,
+            log_sink,
+            on_event,
+            runtime,
+        })
+        .map_err(|e| PsyError::Other(e.to_string()))?;
 
         // Resolve `boot_all`: if requested, expand to all unit names.
         let boot_units_resolved = if boot_all {
@@ -818,9 +996,15 @@ impl PsyRoot {
         };
 
         let shared = inner.shared();
-        prepare_root_runtime(Arc::clone(&shared), boot_units_resolved, None)
-            .await
-            .map_err(|e| PsyError::Other(e.to_string()))?;
+        let bind_listener = !matches!(bind_socket, SocketBinding::None);
+        crate::root::prepare_root_runtime_with_bind(
+            Arc::clone(&shared),
+            boot_units_resolved,
+            None,
+            bind_listener,
+        )
+        .await
+        .map_err(|e| PsyError::Other(e.to_string()))?;
 
         Ok(RootHandle {
             shared,
@@ -1065,16 +1249,53 @@ impl RootHandle {
         Ok(n as usize)
     }
 
-    /// Tear down all supervised processes and the IPC socket. Consumes the
-    /// handle. Returns 0 today; future versions may surface a meaningful
-    /// exit code (e.g. propagated from a configured "main" unit).
+    /// Tear down all supervised processes and the IPC socket. Consumes
+    /// the handle.
+    ///
+    /// Returns an aggregate exit code derived from the supervised
+    /// children's last-known exit statuses, scanned just before the
+    /// teardown SIGKILLs everything still running:
+    ///
+    /// - `0` if every process is `Stopped` (clean exit) or was still
+    ///   `Running` (killed by shutdown — clean from psy's perspective).
+    /// - The first non-zero `exit_status` found among `Failed` entries
+    ///   (deterministic by iteration order) — useful for hosts that
+    ///   want to forward a child's failure as their own process exit.
+    /// - `1` for `Failed` entries with no recorded exit status (killed
+    ///   by signal before psy could record a code).
+    ///
+    /// Hosts that want per-process detail can iterate
+    /// [`Self::list`] before calling `shutdown` and synthesize their
+    /// own aggregate.
     pub async fn shutdown(self) -> Result<i32, PsyError> {
+        // Snapshot exit codes BEFORE setting shutting_down — once we
+        // mark the root as shutting down, subsequent SIGKILLs may
+        // overwrite `exit_status` with signal-based values that don't
+        // reflect the original failure.
+        let aggregate_code = {
+            let table = self.shared.process_table.lock().await;
+            let mut code: i32 = 0;
+            for (_, entry) in table.iter() {
+                match entry.state {
+                    crate::process::ProcessState::Failed => {
+                        let c = entry.exit_status.unwrap_or(1);
+                        if c != 0 && code == 0 {
+                            code = c;
+                        }
+                    }
+                    crate::process::ProcessState::Stopped
+                    | crate::process::ProcessState::Running => {}
+                }
+            }
+            code
+        };
+
         self.shared
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Relaxed);
         teardown(Arc::clone(&self.shared)).await;
-        let _ = self.main_exit_tx.send(Some(0));
-        Ok(0)
+        let _ = self.main_exit_tx.send(Some(aggregate_code));
+        Ok(aggregate_code)
     }
 
     /// Borrow the underlying `SharedRoot`. Escape hatch for advanced
@@ -1086,19 +1307,57 @@ impl RootHandle {
 
     /// Construct a sub-root: a fresh `RootHandle` that supervises its own
     /// independent process table. In-process sub-roots share the host's
-    /// runtime and macOS cleanup sidecar; out-of-process sub-roots spawn
-    /// a separate `psy` process registered with the host (not yet
-    /// implemented in v2.0).
+    /// runtime and macOS cleanup sidecar; out-of-process sub-roots are
+    /// targeted for v2.2 (see [`SubRootKind::OutOfProcess`] for the v2.1
+    /// workaround using [`RootHandle::spawn_psy_subroot`]).
     pub async fn sub_root(&self, opts: SubRootOptions) -> Result<RootHandle, PsyError> {
         match opts.kind {
             SubRootKind::InProcess => self.inprocess_subroot(opts).await,
             SubRootKind::OutOfProcess { .. } => Err(PsyError::Other(
-                "OutOfProcess sub-roots are targeted for v2.1; \
-                 use SubRootKind::InProcess in v2.0, or shell out via \
-                 `Spawn::new(\"instance\", [\"psy\", \"up\", \"--parent\", parent_sock, \"--\", ...])`"
+                "OutOfProcess sub-roots are targeted for v2.2 — until then use \
+                 RootHandle::spawn_psy_subroot(name, binary) which spawns a \
+                 supervised `psy up` child you can drive via the NDJSON wire \
+                 protocol."
                     .into(),
             )),
         }
+    }
+
+    /// Spawn a `psy up` child as a supervised sub-root process.
+    ///
+    /// This is a convenience wrapper around [`Self::spawn`] that sets
+    /// up an out-of-process psy instance for hosts that need
+    /// address-space isolation before the typed
+    /// [`SubRootKind::OutOfProcess`] support lands in v2.2. The child
+    /// is supervised by this root just like any other `Spawn` — its
+    /// lifecycle, restart policy, and macOS cleanup are all handled
+    /// the same way. Hosts can talk to the child via the NDJSON wire
+    /// protocol on the child's socket, or operators can drill in with
+    /// `psy --in <name> <subcommand>`.
+    ///
+    /// Arguments:
+    /// - `name`: identifier under this root's process table (e.g.
+    ///   `"untrusted-preview"`).
+    /// - `binary`: path to the `psy` binary to invoke. `None` falls
+    ///   back to the bare name `"psy"` resolved via `$PATH`.
+    /// - `extra_args`: additional argv tokens appended after `psy up`
+    ///   (e.g. `["--all"]` or `["--", "/bin/sh", "-c", "..."]`).
+    ///
+    /// Returns a [`SpawnHandle`] for the child psy process.
+    pub async fn spawn_psy_subroot(
+        &self,
+        name: impl Into<String>,
+        binary: Option<&std::path::Path>,
+        extra_args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<SpawnHandle, PsyError> {
+        let name = name.into();
+        let bin: String = match binary {
+            Some(p) => p.to_string_lossy().to_string(),
+            None => "psy".to_string(),
+        };
+        let mut argv: Vec<String> = vec![bin, "up".to_string(), "--name".to_string(), name.clone()];
+        argv.extend(extra_args.into_iter().map(Into::into));
+        self.spawn(Spawn::new(name, argv)).await
     }
 
     async fn inprocess_subroot(&self, opts: SubRootOptions) -> Result<RootHandle, PsyError> {
@@ -1117,10 +1376,11 @@ impl RootHandle {
             }
         };
 
-        let socket_override: Option<PathBuf> = match opts.bind_socket {
+        let bind_listener = !matches!(opts.bind_socket, SocketBinding::None);
+        let socket_override: Option<PathBuf> = match &opts.bind_socket {
             SocketBinding::None => None, // path is auto-derived (see below)
             SocketBinding::Auto => None, // ditto
-            SocketBinding::Path(p) => Some(p),
+            SocketBinding::Path(p) => Some(p.clone()),
         };
 
         let (shared, _exit_rx) = crate::root::PsyRoot::build_inprocess_subroot(
@@ -1149,10 +1409,17 @@ impl RootHandle {
         };
 
         // Wire up the listener / boot units. No parent_sock — this is an
-        // in-process sub-root; it doesn't register with anything.
-        crate::root::prepare_root_runtime(Arc::clone(&shared), boot_units_resolved, None)
-            .await
-            .map_err(|e| PsyError::Other(e.to_string()))?;
+        // in-process sub-root; it doesn't register with anything. Honor
+        // SocketBinding::None so multiple sub-roots in the same process
+        // don't collide on a per-PID socket path.
+        crate::root::prepare_root_runtime_with_bind(
+            Arc::clone(&shared),
+            boot_units_resolved,
+            None,
+            bind_listener,
+        )
+        .await
+        .map_err(|e| PsyError::Other(e.to_string()))?;
 
         Ok(RootHandle {
             shared,

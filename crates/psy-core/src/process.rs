@@ -134,6 +134,16 @@ pub struct ProcessEntry {
     /// Set after the sub-root registers its socket path with this parent.
     /// Clients use it to drill in via `--in <name>`.
     pub subroot_socket: Option<String>,
+    /// Optional sink for child stdout/stderr lines. Cloned from the
+    /// `SharedRoot` at spawn time; the capture tasks read it.
+    pub log_sink: Option<Arc<dyn crate::api::LogSink>>,
+    /// Per-process broadcast of `RootEvent`s scoped to this entry.
+    /// `SpawnHandle::events()` subscribes here.
+    pub events_tx: tokio::sync::broadcast::Sender<crate::api::RootEvent>,
+    /// Per-process watch of the live PID. Updates on spawn, restart,
+    /// and exit (set to `None` when the process is no longer running).
+    /// `SpawnHandle::pid_watch()` subscribes here.
+    pub pid_tx: tokio::sync::watch::Sender<Option<u32>>,
 }
 
 impl ProcessEntry {
@@ -177,6 +187,9 @@ impl ProcessEntry {
             exit_notify: Arc::new(Notify::new()),
             is_subroot: false,
             subroot_socket: None,
+            log_sink: None,
+            events_tx: tokio::sync::broadcast::channel(64).0,
+            pid_tx: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -396,13 +409,20 @@ fn spawn_child_inner(
 
     // Start output capture tasks for non-main processes
     if !entry.is_main {
+        let sink = entry.log_sink.clone();
+        let proc_name = entry.name.clone();
+        let run_id = entry.current_run_id;
         if let Some(stdout) = child.stdout.take() {
             let buf = Arc::clone(&entry.stdout_buf);
-            tokio::spawn(capture_output(stdout, buf));
+            let sink = sink.clone();
+            let name = proc_name.clone();
+            tokio::spawn(capture_output(stdout, buf, sink, name, run_id));
         }
         if let Some(stderr) = child.stderr.take() {
             let buf = Arc::clone(&entry.stderr_buf);
-            tokio::spawn(capture_stderr(stderr, buf));
+            let sink = sink.clone();
+            let name = proc_name.clone();
+            tokio::spawn(capture_stderr(stderr, buf, sink, name, run_id));
         }
     }
 
@@ -414,19 +434,51 @@ fn spawn_child_inner(
 // ---------------------------------------------------------------------------
 
 /// Read lines from a child's stdout and push them into the ring buffer.
-pub async fn capture_output(stdout: tokio::process::ChildStdout, buf: Arc<RingBuffer>) {
+/// If `sink` is set, also forward each line to it.
+pub async fn capture_output(
+    stdout: tokio::process::ChildStdout,
+    buf: Arc<RingBuffer>,
+    sink: Option<Arc<dyn crate::api::LogSink>>,
+    process_name: String,
+    run_id: u32,
+) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(ref s) = sink {
+            s.on_line(
+                &process_name,
+                run_id,
+                crate::protocol::StreamKind::Stdout,
+                chrono::Utc::now(),
+                &line,
+            );
+        }
         buf.push(Stream::Stdout, line);
     }
 }
 
 /// Read lines from a child's stderr and push them into the ring buffer.
-async fn capture_stderr(stderr: tokio::process::ChildStderr, buf: Arc<RingBuffer>) {
+/// If `sink` is set, also forward each line to it.
+async fn capture_stderr(
+    stderr: tokio::process::ChildStderr,
+    buf: Arc<RingBuffer>,
+    sink: Option<Arc<dyn crate::api::LogSink>>,
+    process_name: String,
+    run_id: u32,
+) {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(ref s) = sink {
+            s.on_line(
+                &process_name,
+                run_id,
+                crate::protocol::StreamKind::Stderr,
+                chrono::Utc::now(),
+                &line,
+            );
+        }
         buf.push(Stream::Stderr, line);
     }
 }

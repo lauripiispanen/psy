@@ -54,6 +54,8 @@ psy/
     │   └── src/lib.rs                   # send_command / follow_logs / run_attached
     ├── psy-mcp/                         # MCP JSON-RPC server (depends on psy-core + psy-client)
     │   └── src/lib.rs
+    ├── psy-macos-cleanup-sidecar/       # standalone macOS cleanup shim (v2.1) — alternative
+    │   └── src/main.rs                  # to host re-dispatch; thin wrapper over psy-core dispatch
     ├── psy/                             # thin clap CLI binary
     │   ├── src/main.rs                  # subcommand parsing + routing into psy-core
     │   └── tests/integration.rs         # cross-platform CLI integration tests
@@ -66,16 +68,28 @@ psy/
 
 ### v2.0 — Workspace + Library API
 
-- [x] Workspace split: `psy-core` / `psy-client` / `psy-mcp` / `psy` (CLI). Lockstep version 2.0.0; `[workspace.package]` shared metadata.
+- [x] Workspace split: `psy-core` / `psy-client` / `psy-mcp` / `psy` (CLI). Lockstep versioning; `[workspace.package]` shared metadata.
 - [x] `psy-core::api` curated public API: `PsyRoot::start(RootOptions) -> RootHandle`, `RootHandle` with spawn/run_unit/list/status/history/logs/stop/restart/clean/shutdown/sub_root.
-- [x] `Spawn` programmatic spawn config (builder-style, all-fields-public + `with_*` setters).
+- [x] `Spawn` programmatic spawn config (builder-style, all-fields-public + `with_*` setters), full Psyfile-equivalent surface (`cwd`, `ready: ReadyProbe`, `healthcheck: HealthCheck`, `depends_on: DependencyRef`, `metadata`).
 - [x] `SocketBinding` (None/Auto/Path), `PsyfileSource` (Auto/Path), `WaitFor` (Ready/Exit/Log).
-- [x] `PsyError` typed enum with `#[non_exhaustive]` + `Other` fallback. All public types `#[non_exhaustive]`.
+- [x] `PsyError` typed enum with `#[non_exhaustive]` + `Other` fallback. All public types `#[non_exhaustive]`. Backed by wire-protocol `ErrorCode` for SemVer-stable typed contract.
 - [x] `SidecarStrategy` (HostReDispatch/ExternalBinary/Disabled) for embedded macOS cleanup. Default `HostReDispatch` with sentinel `__psy_macos_cleanup_sidecar__`.
 - [x] `dispatch_macos_cleanup_if_invoked()` library entry point — host calls at top of `main()`. Sentinel parsing + proc-title beautification (`psy-cleanup-sidecar [parent=N]` via `_NSGetArgv`).
-- [x] In-process sub-roots: `RootHandle::sub_root(SubRootOptions)` with `SubRootKind::InProcess`. Shares parent's macOS sidecar; isolated process tables; cheap (no extra process). `OutOfProcess` returns "not yet implemented" error in v2.0.
+- [x] In-process sub-roots: `RootHandle::sub_root(SubRootOptions)` with `SubRootKind::InProcess`. Shares parent's macOS sidecar; isolated process tables; cheap (no extra process).
 - [x] CLI binary now calls `psy_core::dispatch_macos_cleanup_if_invoked()` at the top of `main()` (replaces the old hidden `Commands::MacosCleanup` clap variant).
-- [x] `embedded_fixture` example + `tests/embedded.rs` integration tests (5 tests covering smoke, runtime injection, in-process sub-root isolation, OutOfProcess rejection, host-SIGKILL-cleans-up-grandchild).
+
+### v2.1 — Observability + Runtime Injection + Standalone Sidecar
+
+- [x] `LogSink` trait + `RootOptions::with_log_sink(...)` for routing child stdout/stderr to host observability stack (in addition to ring buffer).
+- [x] `RootEvent` enum + `RootOptions::with_on_event(...)` callback for lifecycle events (SpawnStarted/SpawnReady/SpawnExited/SpawnRestarted/ProbeFailed/SubRootStarted/SubRootExited/Shutdown).
+- [x] `SpawnHandle::events() -> Stream<RootEvent>` (broadcast subscribe per process).
+- [x] `SpawnHandle::pid_watch() -> watch::Receiver<Option<u32>>` (live PID; updates on spawn/restart/exit). Implementation note: `tokio::sync::watch::Sender::send` returns Err and drops the value when no live receivers — psy uses `send_replace` (always stores) so a later subscriber sees the current pid.
+- [x] `RootOptions::with_runtime(handle)` pins long-lived background tasks (socket listener, sidecar supervisor, monitor_child, probe loops) to a specific tokio runtime via `SharedRoot::spawn` helper. Default inherits ambient `tokio::spawn` runtime.
+- [x] Standalone `psy-macos-cleanup-sidecar` binary (5th workspace member) — alternative to host re-dispatch. Hosts ship this shim alongside theirs and use `SidecarStrategy::ExternalBinary { path, sentinel }`.
+- [x] `RootHandle::spawn_psy_subroot(name, binary, extra_args)` — v2.1 escape hatch for out-of-process sub-roots before the typed `SubRootKind::OutOfProcess` lands in v2.2. Wraps `Spawn::new(...)` with proper argv.
+- [x] `RootHandle::shutdown` returns aggregate exit code from `Failed` children's `exit_status` (snapshot before teardown).
+- [x] psy-core diagnostics migrated from `eprintln!` to `tracing::warn!` / `tracing::error!` under target `psy`. CLI installs `tracing-subscriber` honoring `RUST_LOG` (defaults to `psy=warn`); embedded hosts that don't install a subscriber stay silent.
+- [x] `embedded_fixture` example + `tests/embedded.rs` integration tests (15 tests covering smoke, runtime injection (current_thread + explicit handle), in-process sub-root isolation, programmatic dependency graph, typed errors, log sink + on_event hooks, SpawnHandle streaming + events + pid_watch, host-SIGKILL cleanup (host re-dispatch + external sidecar binary), shutdown exit code propagation, spawn_psy_subroot helper, OutOfProcess rejection).
 
 ### Core Infrastructure
 - [x] `Cargo.toml` (workspace root + per-crate manifests with `version.workspace = true`)

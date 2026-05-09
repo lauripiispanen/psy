@@ -30,8 +30,9 @@ pub fn setup_root() {
         // PR_SET_CHILD_SUBREAPER = 36
         let ret = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
         if ret != 0 {
-            eprintln!(
-                "warning: prctl(PR_SET_CHILD_SUBREAPER) failed: {}",
+            tracing::warn!(
+                target: "psy",
+                "prctl(PR_SET_CHILD_SUBREAPER) failed: {}",
                 io::Error::last_os_error()
             );
         }

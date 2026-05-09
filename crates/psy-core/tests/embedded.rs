@@ -60,7 +60,7 @@ fn pid_alive(pid: u32) -> bool {
 async fn test_embedded_smoke_spawn_list_stop_shutdown() {
     use psy_core::{PsyRoot, RestartPolicy, RootOptions, Spawn};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = PsyRoot::start(RootOptions::new("smoke-host"))
         .await
         .expect("PsyRoot::start");
@@ -101,7 +101,7 @@ async fn test_embedded_runtime_injection_current_thread() {
     // the library doesn't depend on the multi-threaded runtime.
     use psy_core::{PsyRoot, RootOptions, Spawn};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = PsyRoot::start(RootOptions::new("ct-host"))
         .await
         .expect("PsyRoot::start");
@@ -114,13 +114,65 @@ async fn test_embedded_runtime_injection_current_thread() {
     root.shutdown().await.expect("shutdown");
 }
 
+/// Build a dedicated multi-threaded runtime, hand its handle to
+/// `RootOptions::with_runtime`, and verify supervision still works.
+/// This exercises the explicit-runtime path: psy-core's background
+/// tasks (sidecar supervisor, monitor_child, etc.) are spawned via
+/// `SharedRoot::spawn` which routes through the supplied handle.
+#[test]
+#[ignore]
+fn test_embedded_runtime_injection_explicit_handle() {
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Driver runtime — host's "main" runtime where it awaits PsyRoot::start.
+    let driver = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime");
+    // Dedicated runtime for psy-core's background tasks.
+    let psy_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("psy-supervisor")
+        .build()
+        .expect("psy runtime");
+    let psy_handle = psy_rt.handle().clone();
+
+    driver.block_on(async {
+        let host =
+            PsyRoot::start(RootOptions::new("rt-injection-host").with_runtime(psy_handle.clone()))
+                .await
+                .expect("start");
+
+        let h = host
+            .spawn(Spawn::new("sleeper", ["sleep", "30"]))
+            .await
+            .expect("spawn");
+
+        // pid_watch must be Some — proves spawn_process and pid_tx
+        // updates landed even though monitor/sidecar tasks are on a
+        // different runtime than the driver.
+        let pid_rx = h.pid_watch().await.expect("pid_watch");
+        assert!(pid_rx.borrow().is_some(), "pid should be set after spawn");
+
+        h.stop().await.expect("stop");
+        host.shutdown().await.expect("shutdown");
+    });
+
+    // Tear down the dedicated runtime explicitly so its background
+    // workers exit before the test process ends (cleaner shutdown).
+    psy_rt.shutdown_timeout(Duration::from_secs(2));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 #[allow(clippy::await_holding_lock)]
 async fn test_embedded_inprocess_subroot_isolation() {
     use psy_core::{PsyRoot, RootOptions, Spawn, SubRootKind, SubRootOptions};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let host = PsyRoot::start(RootOptions::new("isolation-host"))
         .await
         .expect("host start");
@@ -170,7 +222,7 @@ async fn test_embedded_programmatic_graph_with_dependency() {
     // and a dependent that waits for the listener's ready probe.
     use psy_core::{DependencyRef, PsyRoot, ReadyProbe, RootOptions, Spawn};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let host = PsyRoot::start(RootOptions::new("graph-host"))
         .await
         .expect("host start");
@@ -210,7 +262,7 @@ async fn test_embedded_programmatic_graph_with_dependency() {
 async fn test_embedded_dependency_not_running_errors() {
     use psy_core::{DependencyRef, PsyError, PsyRoot, RootOptions, Spawn};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let host = PsyRoot::start(RootOptions::new("dep-err-host"))
         .await
         .expect("host start");
@@ -239,7 +291,7 @@ async fn test_embedded_spawnhandle_streaming_and_wait() {
     use futures_util::StreamExt;
     use psy_core::{PsyRoot, RootOptions, Spawn};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let host = PsyRoot::start(RootOptions::new("stream-host"))
         .await
         .expect("host start");
@@ -287,10 +339,142 @@ async fn test_embedded_spawnhandle_streaming_and_wait() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 #[allow(clippy::await_holding_lock)]
+async fn test_embedded_spawnhandle_events_and_pid_watch() {
+    use futures_util::StreamExt;
+    use psy_core::{PsyRoot, RootEvent, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let host = PsyRoot::start(RootOptions::new("evts-host"))
+        .await
+        .expect("start");
+
+    // Long-running process so we can subscribe + observe events while
+    // it's alive, then stop it deterministically.
+    let h = host
+        .spawn(Spawn::new("transient", ["sleep", "60"]))
+        .await
+        .expect("spawn");
+
+    // pid_watch should report Some immediately after spawn returns.
+    let pid_watch = h.pid_watch().await.expect("pid_watch");
+    assert!(
+        pid_watch.borrow().is_some(),
+        "pid_watch should start with Some"
+    );
+
+    // Subscribe to events BEFORE we trigger an exit so we don't miss it.
+    let mut events = Box::pin(h.events().await.expect("events"));
+
+    h.stop().await.expect("stop");
+
+    // Drain events until we see SpawnExited (or timeout).
+    let saw_exit = tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(ev) = events.next().await {
+            if matches!(
+                ev,
+                RootEvent::SpawnExited { ref name, .. } if name == "transient"
+            ) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("timeout");
+    assert!(saw_exit, "should have observed SpawnExited");
+
+    host.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_log_sink_and_on_event() {
+    use psy_core::{LogSink, PsyRoot, RootEvent, RootOptions, Spawn};
+    use std::sync::{Arc, Mutex};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Capture every line the sink sees.
+    #[derive(Default)]
+    struct VecSink(Mutex<Vec<String>>);
+    impl LogSink for VecSink {
+        fn on_line(
+            &self,
+            process: &str,
+            _run_id: u32,
+            _stream: psy_core::StreamKind,
+            _ts: chrono::DateTime<chrono::Utc>,
+            line: &str,
+        ) {
+            self.0.lock().unwrap().push(format!("{process}: {line}"));
+        }
+    }
+    let sink = Arc::new(VecSink::default());
+
+    // Capture every event.
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_for_cb = Arc::clone(&events);
+
+    let root = PsyRoot::start(
+        RootOptions::new("hooks-host")
+            .with_log_sink(sink.clone() as Arc<dyn LogSink>)
+            .with_on_event(move |ev| {
+                let label = match &ev {
+                    RootEvent::SpawnStarted { name, .. } => format!("started:{name}"),
+                    RootEvent::SpawnExited { name, .. } => format!("exited:{name}"),
+                    RootEvent::Shutdown => "shutdown".into(),
+                    other => format!("{other:?}"),
+                };
+                events_for_cb.lock().unwrap().push(label);
+            }),
+    )
+    .await
+    .expect("start");
+
+    let _h = root
+        .spawn(Spawn::new(
+            "talker",
+            ["sh", "-c", "echo hello-from-sink && exit 0"],
+        ))
+        .await
+        .expect("spawn");
+
+    // Give the child a moment to run + exit.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let captured: Vec<String> = sink.0.lock().unwrap().clone();
+    assert!(
+        captured.iter().any(|l| l.contains("hello-from-sink")),
+        "log_sink should have seen the line; got: {captured:?}"
+    );
+
+    let evs: Vec<String> = events.lock().unwrap().clone();
+    assert!(
+        evs.iter().any(|s| s.starts_with("started:talker")),
+        "on_event should fire SpawnStarted; got: {evs:?}"
+    );
+    assert!(
+        evs.iter().any(|s| s.starts_with("exited:talker")),
+        "on_event should fire SpawnExited; got: {evs:?}"
+    );
+
+    root.shutdown().await.expect("shutdown");
+
+    let evs_after: Vec<String> = events.lock().unwrap().clone();
+    assert!(
+        evs_after.iter().any(|s| s == "shutdown"),
+        "on_event should fire Shutdown; got: {evs_after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
 async fn test_embedded_typed_error_already_exists() {
     use psy_core::{PsyError, PsyRoot, RootOptions, Spawn};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let host = PsyRoot::start(RootOptions::new("dup-host"))
         .await
         .expect("host start");
@@ -315,7 +499,7 @@ async fn test_embedded_typed_error_already_exists() {
 async fn test_embedded_inprocess_subroot_outofprocess_not_implemented() {
     use psy_core::{PsyRoot, RootOptions, SubRootKind, SubRootOptions};
 
-    let _g = ROOT_LOCK.lock().unwrap();
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let host = PsyRoot::start(RootOptions::new("oop-host"))
         .await
         .expect("host start");
@@ -337,6 +521,124 @@ async fn test_embedded_inprocess_subroot_outofprocess_not_implemented() {
     }
 
     host.shutdown().await.expect("host shutdown");
+}
+
+/// `RootHandle::shutdown` returns an aggregate exit code derived from
+/// any `Failed` processes' last exit_status. Verify clean shutdown
+/// returns 0 and a failed child surfaces its non-zero code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_shutdown_exit_code_propagation() {
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Case 1: clean shutdown — all processes still running, no failures.
+    let host = PsyRoot::start(RootOptions::new("shutdown-clean"))
+        .await
+        .expect("start");
+    let _h = host
+        .spawn(Spawn::new("idle", ["sleep", "30"]))
+        .await
+        .expect("spawn");
+    let code = host.shutdown().await.expect("shutdown");
+    assert_eq!(code, 0, "clean shutdown should return 0");
+
+    // Case 2: a child failed before shutdown; aggregate should surface it.
+    let host = PsyRoot::start(RootOptions::new("shutdown-fail"))
+        .await
+        .expect("start");
+    let _h = host
+        .spawn(Spawn::new("boom", ["sh", "-c", "exit 42"]))
+        .await
+        .expect("spawn");
+
+    // Wait until the child has finished and its exit_status is recorded.
+    let mut got_failed = false;
+    for _ in 0..40 {
+        let listing = host.list().await.expect("list");
+        if listing
+            .iter()
+            .any(|p| p.name == "boom" && p.status == "failed")
+        {
+            got_failed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(got_failed, "boom should reach Failed state before shutdown");
+
+    let code = host.shutdown().await.expect("shutdown");
+    assert_eq!(code, 42, "shutdown should surface failed child's exit code");
+}
+
+/// `spawn_psy_subroot` is the v2.1 escape hatch for hosts that need
+/// process-level isolation before typed `SubRootKind::OutOfProcess`
+/// lands in v2.2. Validates that the helper builds the right argv and
+/// returns a working SpawnHandle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_spawn_psy_subroot_helper() {
+    use psy_core::{PsyRoot, RootOptions};
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Resolve the actual psy binary built by this workspace so the
+    // child invocation finds something real even if `$PATH` doesn't
+    // include the cargo target directory.
+    let psy_bin = {
+        let mut p = std::env::current_exe().expect("test exe path");
+        p.pop(); // deps/
+        p.pop(); // <profile>/
+        p.push("psy");
+        assert!(
+            p.exists(),
+            "psy binary not built; expected at {}",
+            p.display()
+        );
+        p
+    };
+
+    let host = PsyRoot::start(RootOptions::new("oop-helper-host"))
+        .await
+        .expect("start");
+
+    // Spawn a psy sub-root that just sleeps as its main process.
+    let h = host
+        .spawn_psy_subroot("untrusted", Some(&psy_bin), ["--", "sleep", "30"])
+        .await
+        .expect("spawn_psy_subroot");
+
+    // Give the child a moment to actually exec.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The helper returns a normal SpawnHandle backed by the parent
+    // root's process table. Verify it's tracked there.
+    let listing = host.list().await.expect("list");
+    assert!(
+        listing.iter().any(|p| p.name == "untrusted"),
+        "spawned subroot should appear under parent's process table"
+    );
+
+    // pid_watch should report the spawned psy child's pid.
+    let pid_rx = h.pid_watch().await.expect("pid_watch");
+    assert!(
+        pid_rx.borrow().is_some(),
+        "spawn_psy_subroot child should have a pid"
+    );
+
+    h.stop().await.expect("stop");
+    host.shutdown().await.expect("shutdown");
+}
+
+/// Find the standalone psy-macos-cleanup-sidecar binary. Mirrors
+/// `embedded_fixture_bin` but points at the workspace bin target.
+fn standalone_sidecar_bin() -> PathBuf {
+    let mut p = std::env::current_exe().expect("test exe path");
+    p.pop(); // deps/
+    p.pop(); // <profile>/
+    p.push("psy-macos-cleanup-sidecar");
+    p
 }
 
 #[test]
@@ -396,5 +698,73 @@ fn test_embedded_host_sigkill_cleans_up_grandchild() {
     assert!(
         dead,
         "supervised child {main_pid} should be dead after embedded host SIGKILL"
+    );
+}
+
+/// Same as `test_embedded_host_sigkill_cleans_up_grandchild`, but the
+/// fixture is configured to use `SidecarStrategy::ExternalBinary`
+/// pointing at the standalone `psy-macos-cleanup-sidecar` shim. Proves
+/// that hosts which don't want their main binary re-dispatchable as
+/// the sidecar can ship the shim alongside theirs and still get the
+/// hard-kill cleanup guarantee.
+#[test]
+#[ignore]
+fn test_embedded_external_sidecar_cleans_up_grandchild() {
+    let fixture = embedded_fixture_bin();
+    let sidecar = standalone_sidecar_bin();
+    assert!(
+        fixture.exists(),
+        "embedded_fixture not built; expected at {}",
+        fixture.display()
+    );
+    assert!(
+        sidecar.exists(),
+        "psy-macos-cleanup-sidecar not built; expected at {}",
+        sidecar.display()
+    );
+
+    let mut child = Command::new(&fixture)
+        .args(["sleep", "600"])
+        .env("PSY_SIDECAR_BIN", &sidecar)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn embedded_fixture");
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut main_pid: Option<u32> = None;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if let Some(rest) = line.trim().strip_prefix("MAIN_PID=") {
+                    if let Ok(pid) = rest.parse::<u32>() {
+                        main_pid = Some(pid);
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let main_pid = main_pid.expect("fixture should announce MAIN_PID");
+    assert!(
+        pid_alive(main_pid),
+        "main child should be alive before crash"
+    );
+
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+    let _ = child.wait();
+
+    let dead = wait_until(Duration::from_secs(15), || !pid_alive(main_pid));
+    assert!(
+        dead,
+        "supervised child {main_pid} should be dead after embedded host SIGKILL \
+         (external sidecar binary path)"
     );
 }
