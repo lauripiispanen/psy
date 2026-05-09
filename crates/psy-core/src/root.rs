@@ -69,6 +69,9 @@ pub struct SharedRoot {
     /// The root's own name (defaults to `psy-<pid>`). Used as the unit name
     /// when registering as a sub-root with a parent.
     pub root_name: String,
+    /// How the macOS cleanup sidecar should be spawned. Cross-platform: on
+    /// Linux/Windows this is accepted but ignored.
+    pub sidecar_strategy: crate::macos_cleanup::SidecarStrategy,
     /// macOS cleanup sidecar handle. The supervisor may swap this in/out on
     /// respawn, so it's wrapped in a sync `Mutex` (writes are infrequent and
     /// don't need to be async).
@@ -112,7 +115,26 @@ pub struct PsyRoot {
 }
 
 impl PsyRoot {
+    /// Read-only access to the shared root state. Useful for embedded-mode
+    /// observers that want to inspect the process table directly. Most
+    /// callers should go through the `RootHandle` API instead (Phase B).
+    pub fn shared_for_test(&self) -> Arc<SharedRoot> {
+        Arc::clone(&self.shared)
+    }
+
     pub fn new(name: String, psyfile_path: Option<PathBuf>) -> RootResult<Self> {
+        Self::new_with_strategy(
+            name,
+            psyfile_path,
+            crate::macos_cleanup::SidecarStrategy::default(),
+        )
+    }
+
+    pub fn new_with_strategy(
+        name: String,
+        psyfile_path: Option<PathBuf>,
+        sidecar_strategy: crate::macos_cleanup::SidecarStrategy,
+    ) -> RootResult<Self> {
         // Platform-specific root setup (setsid / subreaper / Job Object)
         platform::setup_root();
 
@@ -167,8 +189,9 @@ impl PsyRoot {
         // watching us before we spawn any children. If it fails to start we
         // log and continue — graceful teardown still works without it.
         #[cfg(target_os = "macos")]
-        let macos_sidecar = match crate::macos_cleanup::spawn_sidecar(pid) {
-            Ok(handle) => std::sync::Mutex::new(Some(Arc::new(handle))),
+        let macos_sidecar = match crate::macos_cleanup::spawn_sidecar(pid, &sidecar_strategy) {
+            Ok(Some(handle)) => std::sync::Mutex::new(Some(Arc::new(handle))),
+            Ok(None) => std::sync::Mutex::new(None), // SidecarStrategy::Disabled
             Err(e) => {
                 eprintln!("psy: macOS cleanup sidecar failed to start: {e}");
                 std::sync::Mutex::new(None)
@@ -190,6 +213,7 @@ impl PsyRoot {
             anchor_path,
             port_allocations: Mutex::new(HashMap::new()),
             root_name: name,
+            sidecar_strategy,
             #[cfg(target_os = "macos")]
             macos_sidecar,
         });
@@ -232,103 +256,7 @@ impl PsyRoot {
             MainMode::Custom(_) => None,
         };
 
-        // Bind the socket synchronously so that sub-root registration with a
-        // parent (and any other early clients) can rely on the listener being
-        // ready. The accept loop is then spawned in the background.
-        #[cfg(unix)]
-        let listener = tokio::net::UnixListener::bind(&self.shared.socket_path)?;
-
-        #[cfg(windows)]
-        let listener = {
-            use tokio::net::windows::named_pipe::ServerOptions;
-            ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(&self.shared.socket_path)?
-        };
-
-        {
-            let root = Arc::clone(&self.shared);
-            tokio::spawn(async move {
-                if let Err(e) = run_socket_listener(root, listener).await {
-                    eprintln!("psy: socket listener error: {e}");
-                }
-            });
-        }
-
-        // macOS-only: supervise the cleanup sidecar so a crashed sidecar
-        // gets respawned rather than silently leaving us unprotected.
-        #[cfg(target_os = "macos")]
-        {
-            let root = Arc::clone(&self.shared);
-            tokio::spawn(supervise_macos_sidecar(root));
-        }
-
-        // Write the anchor file for root discovery.
-        // On Unix in direct mode (anchor == socket), the bind above created
-        // the socket file which IS the anchor — nothing more to write.
-        // On Unix in indirect mode or on Windows, write the socket/pipe path
-        // into the anchor file so clients can discover it.
-        if let Some(ref anchor) = self.shared.anchor_path {
-            let anchor_str = anchor.to_string_lossy();
-            if anchor_str != self.shared.socket_path {
-                if let Err(e) = std::fs::write(anchor, &self.shared.socket_path) {
-                    eprintln!("psy: failed to write anchor file: {e}");
-                }
-            }
-        }
-
-        // If we are a managed sub-root, register with the parent now that our
-        // own socket is ready to serve.
-        if let Some(ref psock) = parent_sock {
-            if let Err(e) = register_with_parent(
-                psock,
-                &self.shared.socket_path,
-                self.shared.psy_root_pid,
-                &self.shared.root_name,
-            )
-            .await
-            {
-                return Err(format!("sub-root registration failed: {e}").into());
-            }
-            // Expose the parent socket to inner processes for diagnostic tools
-            // that may want to walk upward.
-            std::env::set_var("PSY_PARENT_SOCK", psock);
-        }
-
-        // Start boot units from Psyfile (before main process)
-        if !boot_units.is_empty() {
-            let pf = self
-                .shared
-                .load_psyfile()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            if let Some(ref pf) = pf {
-                let start_order = psyfile::resolve_start_order(pf, &boot_units)
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-                for unit_name in &start_order {
-                    let req = Request::run(RunArgs {
-                        name: unit_name.clone(),
-                        command: vec![],
-                        restart: RestartPolicy::No,
-                        env: HashMap::new(),
-                        attach: false,
-                        interactive: false,
-                        extra_args: None,
-                        wait_for: None,
-                        wait_timeout: None,
-                        ports: vec![],
-                    });
-                    let result = handle_request(&self.shared, req).await;
-                    if let HandleResult::Response(resp) = result {
-                        if !resp.ok {
-                            eprintln!(
-                                "psy: failed to start unit '{unit_name}': {}",
-                                resp.error.unwrap_or_default()
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        prepare_root_runtime(Arc::clone(&self.shared), boot_units, parent_sock).await?;
 
         if let Some(main_cmd) = main_cmd {
             // Launch the main process
@@ -381,6 +309,108 @@ impl PsyRoot {
 
         Ok(exit_code)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared root runtime setup (used by both PsyRoot::run and PsyRoot::start)
+// ---------------------------------------------------------------------------
+
+/// Bind the IPC socket, spawn the accept loop, kick off the macOS cleanup
+/// supervisor, write the anchor file (if needed), register with the parent
+/// (if this is a sub-root), and start any requested boot units.
+///
+/// After this returns, the root is fully wired up — clients can connect via
+/// the socket and the process table is ready to accept commands. The caller
+/// is responsible for either spawning a `main` process (CLI binary) or
+/// returning a handle to the host (library API).
+pub(crate) async fn prepare_root_runtime(
+    shared: Arc<SharedRoot>,
+    boot_units: Vec<String>,
+    parent_sock: Option<String>,
+) -> RootResult<()> {
+    #[cfg(unix)]
+    let listener = tokio::net::UnixListener::bind(&shared.socket_path)?;
+
+    #[cfg(windows)]
+    let listener = {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&shared.socket_path)?
+    };
+
+    {
+        let root = Arc::clone(&shared);
+        tokio::spawn(async move {
+            if let Err(e) = run_socket_listener(root, listener).await {
+                eprintln!("psy: socket listener error: {e}");
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let root = Arc::clone(&shared);
+        tokio::spawn(supervise_macos_sidecar(root));
+    }
+
+    if let Some(ref anchor) = shared.anchor_path {
+        let anchor_str = anchor.to_string_lossy();
+        if anchor_str != shared.socket_path {
+            if let Err(e) = std::fs::write(anchor, &shared.socket_path) {
+                eprintln!("psy: failed to write anchor file: {e}");
+            }
+        }
+    }
+
+    if let Some(ref psock) = parent_sock {
+        if let Err(e) = register_with_parent(
+            psock,
+            &shared.socket_path,
+            shared.psy_root_pid,
+            &shared.root_name,
+        )
+        .await
+        {
+            return Err(format!("sub-root registration failed: {e}").into());
+        }
+        std::env::set_var("PSY_PARENT_SOCK", psock);
+    }
+
+    if !boot_units.is_empty() {
+        let pf = shared
+            .load_psyfile()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        if let Some(ref pf) = pf {
+            let start_order = psyfile::resolve_start_order(pf, &boot_units)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            for unit_name in &start_order {
+                let req = Request::run(RunArgs {
+                    name: unit_name.clone(),
+                    command: vec![],
+                    restart: RestartPolicy::No,
+                    env: HashMap::new(),
+                    attach: false,
+                    interactive: false,
+                    extra_args: None,
+                    wait_for: None,
+                    wait_timeout: None,
+                    ports: vec![],
+                });
+                let result = handle_request(&shared, req).await;
+                if let HandleResult::Response(resp) = result {
+                    if !resp.ok {
+                        eprintln!(
+                            "psy: failed to start unit '{unit_name}': {}",
+                            resp.error.unwrap_or_default()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -522,17 +552,24 @@ async fn supervise_macos_sidecar(root: Arc<SharedRoot>) {
 
         // Sidecar died unexpectedly — respawn.
         eprintln!("psy: macOS cleanup sidecar exited unexpectedly; respawning");
-        let new_handle = match crate::macos_cleanup::spawn_sidecar(root.psy_root_pid) {
-            Ok(h) => Arc::new(h),
-            Err(e) => {
-                eprintln!("psy: failed to respawn macOS cleanup sidecar: {e}");
-                // Clear so future notifies are no-ops; give up.
-                if let Ok(mut g) = root.macos_sidecar.lock() {
-                    *g = None;
+        let new_handle =
+            match crate::macos_cleanup::spawn_sidecar(root.psy_root_pid, &root.sidecar_strategy) {
+                Ok(Some(h)) => Arc::new(h),
+                Ok(None) => {
+                    // Strategy was Disabled — nothing to respawn.
+                    if let Ok(mut g) = root.macos_sidecar.lock() {
+                        *g = None;
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+                Err(e) => {
+                    eprintln!("psy: failed to respawn macOS cleanup sidecar: {e}");
+                    if let Ok(mut g) = root.macos_sidecar.lock() {
+                        *g = None;
+                    }
+                    return;
+                }
+            };
 
         // Re-announce every currently running PID so the new sidecar
         // catches up with state.
@@ -596,12 +633,12 @@ async fn wait_for_exit_or_signal(rx: &mut tokio::sync::watch::Receiver<Option<i3
 // Request handling
 // ---------------------------------------------------------------------------
 
-enum HandleResult {
+pub(crate) enum HandleResult {
     Response(Response),
     AttachSession { name: String, response: Response },
 }
 
-async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
+pub(crate) async fn handle_request(root: &Arc<SharedRoot>, req: Request) -> HandleResult {
     match req.cmd.as_str() {
         CMD_RUN => handle_run(root, &req).await,
         CMD_PS => HandleResult::Response(handle_ps(root, &req).await),

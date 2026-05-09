@@ -5,8 +5,6 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 
 use psy_client as client;
-#[cfg(target_os = "macos")]
-use psy_core::macos_cleanup;
 use psy_core::protocol::{
     self, HistoryArgs, HistoryResponse, LogsArgs, PsResponse, Request, RestartArgs, RestartPolicy,
     RunArgs, SendArgs, SendWaitArgs, StopArgs, StreamFilter,
@@ -192,13 +190,6 @@ enum Commands {
     },
     /// Print version information
     Version,
-    /// (internal) macOS cleanup sidecar — not for direct use.
-    #[cfg(target_os = "macos")]
-    #[command(hide = true)]
-    MacosCleanup {
-        #[arg(long)]
-        parent_pid: u32,
-    },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +211,14 @@ enum PsyfileCommands {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Sidecar dispatch must run before clap parses argv: when this binary
+    // is re-spawned as a macOS cleanup sidecar, argv contains a sentinel
+    // that doesn't correspond to any clap subcommand. The dispatch call
+    // intercepts those invocations and exits the process; otherwise it
+    // returns immediately and clap parsing proceeds as normal. No-op on
+    // non-macOS targets.
+    psy_core::dispatch_macos_cleanup_if_invoked();
+
     let cli = Cli::parse();
 
     // If --in <name> was supplied, resolve the named sub-root's socket via
@@ -228,11 +227,6 @@ fn main() {
     if let Some(ref subroot_name) = cli.target_subroot {
         match &cli.command {
             Commands::Up { .. } | Commands::Version | Commands::Mcp | Commands::Psyfile { .. } => {
-                eprintln!("psy: --in is not valid for this command");
-                std::process::exit(1);
-            }
-            #[cfg(target_os = "macos")]
-            Commands::MacosCleanup { .. } => {
                 eprintln!("psy: --in is not valid for this command");
                 std::process::exit(1);
             }
@@ -367,11 +361,6 @@ fn main() {
 
         Commands::Version => {
             println!("psy {}", env!("CARGO_PKG_VERSION"));
-        }
-
-        #[cfg(target_os = "macos")]
-        Commands::MacosCleanup { parent_pid } => {
-            macos_cleanup::run(parent_pid);
         }
 
         Commands::Mcp => {

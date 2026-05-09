@@ -4619,9 +4619,9 @@ sub_root = true
 
 /// Find the macOS cleanup sidecar PID for a given parent psy.
 ///
-/// The sidecar's argv contains `psy macos-cleanup --parent-pid <pid>`. We
-/// look it up via `ps` so the test is independent of how psy stores the
-/// handle internally.
+/// After v2.0 the sidecar's argv[0] is overwritten with the title
+/// `psy-cleanup-sidecar [parent=<pid>]` so it's identifiable in `ps`
+/// output regardless of which binary it was re-dispatched from.
 #[cfg(target_os = "macos")]
 fn find_macos_sidecar_pid(parent_pid: u32) -> Option<u32> {
     let out = std::process::Command::new("ps")
@@ -4629,9 +4629,9 @@ fn find_macos_sidecar_pid(parent_pid: u32) -> Option<u32> {
         .output()
         .ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let needle = format!("--parent-pid {parent_pid}");
+    let needle = format!("psy-cleanup-sidecar [parent={parent_pid}]");
     for line in stdout.lines() {
-        if !line.contains("macos-cleanup") || !line.contains(&needle) {
+        if !line.contains(&needle) {
             continue;
         }
         let mut parts = line.split_whitespace();

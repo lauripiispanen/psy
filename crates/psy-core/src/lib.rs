@@ -9,7 +9,6 @@
 //! introduces the curated `RootOptions` / `RootHandle` / `Spawn` API on top
 //! of these modules; the modules themselves stay pub for advanced use.
 
-#[cfg(target_os = "macos")]
 pub mod macos_cleanup;
 pub mod platform;
 pub mod probe;
@@ -18,3 +17,9 @@ pub mod protocol;
 pub mod psyfile;
 pub mod ring_buffer;
 pub mod root;
+
+// Convenience re-exports for the most common embedded-mode entry points.
+pub use macos_cleanup::{
+    dispatch_macos_cleanup_if_invoked, dispatch_macos_cleanup_if_invoked_with_sentinel,
+    SidecarStrategy, DEFAULT_SENTINEL,
+};
