@@ -29,15 +29,11 @@ pub type RootResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// to a caller-supplied closure on a blocking task — the CLI uses this to
 /// host the MCP JSON-RPC server in-process without `psy-core` having to know
 /// about MCP. When the closure returns, root teardown follows.
+#[derive(Default)]
 pub enum MainMode {
+    #[default]
     Default,
     Custom(Box<dyn FnOnce() + Send + 'static>),
-}
-
-impl Default for MainMode {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 // ---------------------------------------------------------------------------

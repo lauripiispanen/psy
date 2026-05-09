@@ -282,7 +282,7 @@ impl SubRootOptions {
 /// separate `psy` invocation. See the libpsy proposal's "in-process vs
 /// out-of-process" discussion for the trade-offs.
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum SubRootKind {
     /// Sub-root supervised in the host's own process. Cheap (no extra
     /// process), cheap IPC (none), shares the host's tokio runtime and
@@ -290,6 +290,7 @@ pub enum SubRootKind {
     /// so a panic in one in-process sub-root may affect siblings. The
     /// recommended default unless host-internal supervisor bugs
     /// crossing sub-root boundaries are a real concern.
+    #[default]
     InProcess,
     /// Sub-root is a separate `psy` process registered with the parent
     /// via the `psy up --parent <sock>` mechanism (v1.9). Use when the
@@ -301,12 +302,6 @@ pub enum SubRootKind {
     /// from [`RootHandle::sub_root`]. Use the existing CLI flow for now
     /// (`psy up --parent <sock>` from the host's `Spawn`).
     OutOfProcess { binary: Option<PathBuf> },
-}
-
-impl Default for SubRootKind {
-    fn default() -> Self {
-        Self::InProcess
-    }
 }
 
 /// Whether to expose an IPC socket so out-of-process clients (`psy ps`,
@@ -876,13 +871,13 @@ fn format_duration(d: Duration) -> String {
     if total_ms == 0 {
         return "0ms".into();
     }
-    if total_ms % 3_600_000 == 0 {
+    if total_ms.is_multiple_of(3_600_000) {
         return format!("{}h", total_ms / 3_600_000);
     }
-    if total_ms % 60_000 == 0 {
+    if total_ms.is_multiple_of(60_000) {
         return format!("{}m", total_ms / 60_000);
     }
-    if total_ms % 1_000 == 0 {
+    if total_ms.is_multiple_of(1_000) {
         return format!("{}s", total_ms / 1_000);
     }
     format!("{total_ms}ms")
