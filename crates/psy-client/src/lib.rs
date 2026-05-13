@@ -288,6 +288,7 @@ pub fn run_attached(
         env,
         attach: true,
         interactive: false,
+        raw_stdio: false,
         extra_args: None,
         wait_for: None,
         wait_timeout: None,

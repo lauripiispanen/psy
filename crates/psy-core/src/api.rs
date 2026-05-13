@@ -513,6 +513,12 @@ pub struct Spawn {
     pub wait_for: Option<WaitFor>,
     /// Timeout applied to `wait_for`. Default: 120 seconds.
     pub wait_timeout: Option<Duration>,
+    /// Capture child stdout / stderr as raw byte chunks in addition to
+    /// the line-tokenized ring buffer. Required for
+    /// [`SpawnHandle::stdout_bytes`] / [`SpawnHandle::stderr_bytes`].
+    /// Default `false`: the standard line-buffered capture pipeline
+    /// remains unchanged for hosts that don't need raw bytes.
+    pub raw_stdio: bool,
 }
 
 /// One-shot readiness probe. The supervisor runs this after spawning
@@ -617,6 +623,7 @@ impl Spawn {
             metadata: HashMap::new(),
             wait_for: None,
             wait_timeout: None,
+            raw_stdio: false,
         }
     }
 
@@ -684,6 +691,22 @@ impl Spawn {
 
     pub fn with_wait_timeout(mut self, d: Duration) -> Self {
         self.wait_timeout = Some(d);
+        self
+    }
+
+    /// Enable raw-byte capture of child stdout / stderr. When `true`,
+    /// the supervisor reads child output in chunks (preserving exact
+    /// byte boundaries and any non-newline-terminated framing) and
+    /// makes those chunks available via [`SpawnHandle::stdout_bytes`]
+    /// and [`SpawnHandle::stderr_bytes`]. The line-tokenized ring
+    /// buffer feeding `psy logs` is still populated in parallel.
+    ///
+    /// Default `false` keeps the standard `BufReader::lines()`
+    /// capture pipeline. Enable only for processes that drive framed
+    /// protocols (JSON-RPC with `Content-Length`, length-prefixed
+    /// binary streams, etc.) over their stdio.
+    pub fn with_raw_stdio(mut self, on: bool) -> Self {
+        self.raw_stdio = on;
         self
     }
 }
@@ -854,6 +877,151 @@ impl SpawnHandle {
         }
         #[cfg(unix)]
         Ok(())
+    }
+
+    /// Write bytes to the supervised process's stdin. The process must
+    /// have been spawned with `interactive = true` (or
+    /// [`Spawn::with_interactive(true)`]). Returns the number of bytes
+    /// written (always `data.len()` on success — psy uses `write_all`
+    /// semantics under the hood, with a 5s timeout for backpressure).
+    ///
+    /// Takes `&[u8]` rather than `&str` so callers driving framed
+    /// stdio protocols (Content-Length JSON-RPC, length-prefixed
+    /// binary, MessagePack, etc.) can send byte-exact payloads without
+    /// UTF-8 round-tripping. To send a line with the supervisor's
+    /// default newline behavior, append `b"\n"` yourself.
+    ///
+    /// Errors:
+    /// - [`PsyError::NotFound`] if the process is no longer in the table.
+    /// - [`PsyError::Other`] for "not running", "not interactive",
+    ///   "stdin already closed", attach-session conflict, or write
+    ///   timeout / I/O failure.
+    pub async fn write_stdin(&self, data: &[u8]) -> Result<usize, PsyError> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut table = self.shared.process_table.lock().await;
+        let entry = table
+            .get_mut(&self.name)
+            .ok_or_else(|| PsyError::NotFound {
+                name: self.name.clone(),
+            })?;
+
+        if entry.state != crate::process::ProcessState::Running {
+            return Err(PsyError::Other(format!(
+                "process '{}' is not running",
+                self.name
+            )));
+        }
+        if !entry.interactive {
+            return Err(PsyError::Other(format!(
+                "process '{}' was not started in interactive mode",
+                self.name
+            )));
+        }
+        if entry.stdin_closed {
+            return Err(PsyError::Other(format!(
+                "stdin for '{}' has been closed",
+                self.name
+            )));
+        }
+        let stdin = entry
+            .stdin_handle
+            .as_mut()
+            .ok_or_else(|| PsyError::Other(format!("no stdin handle for '{}'", self.name)))?;
+
+        match tokio::time::timeout(Duration::from_secs(5), async {
+            stdin.write_all(data).await?;
+            stdin.flush().await
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(data.len()),
+            Ok(Err(e)) => Err(PsyError::Other(format!("write to stdin failed: {e}"))),
+            Err(_) => Err(PsyError::Other(
+                "write to stdin timed out (pipe buffer full?)".into(),
+            )),
+        }
+    }
+
+    /// Close the supervised process's stdin (sends EOF). Subsequent
+    /// [`Self::write_stdin`] calls return an error. The pipe cannot be
+    /// reopened — equivalent to dropping `tokio::process::Child::stdin`
+    /// or calling `psy send --eof`.
+    pub async fn close_stdin(&self) -> Result<(), PsyError> {
+        let mut table = self.shared.process_table.lock().await;
+        let entry = table
+            .get_mut(&self.name)
+            .ok_or_else(|| PsyError::NotFound {
+                name: self.name.clone(),
+            })?;
+        if !entry.interactive {
+            return Err(PsyError::Other(format!(
+                "process '{}' was not started in interactive mode",
+                self.name
+            )));
+        }
+        entry.stdin_handle = None;
+        entry.stdin_closed = true;
+        Ok(())
+    }
+
+    /// Subscribe to this process's raw stdout byte chunks. Each item
+    /// is an owned `Vec<u8>` containing the bytes read from the child
+    /// pipe in one read — no line buffering, no newline stripping, no
+    /// UTF-8 normalization. Cadence and chunk boundaries follow the
+    /// kernel's pipe semantics.
+    ///
+    /// Requires the spawn to have been declared with
+    /// [`Spawn::with_raw_stdio(true)`]. Returns an error otherwise.
+    /// The stream closes when the underlying broadcast sender is
+    /// dropped (process removed from the table on `RootHandle::clean`
+    /// or shutdown, or an explicit `psy restart` reallocates senders).
+    pub async fn stdout_bytes(
+        &self,
+    ) -> Result<impl futures_core::Stream<Item = Vec<u8>> + Send, PsyError> {
+        self.subscribe_raw(true).await
+    }
+
+    /// Subscribe to this process's raw stderr byte chunks. See
+    /// [`Self::stdout_bytes`].
+    pub async fn stderr_bytes(
+        &self,
+    ) -> Result<impl futures_core::Stream<Item = Vec<u8>> + Send, PsyError> {
+        self.subscribe_raw(false).await
+    }
+
+    async fn subscribe_raw(
+        &self,
+        stdout: bool,
+    ) -> Result<impl futures_core::Stream<Item = Vec<u8>> + Send, PsyError> {
+        let rx = {
+            let table = self.shared.process_table.lock().await;
+            let entry = table.get(&self.name).ok_or_else(|| PsyError::NotFound {
+                name: self.name.clone(),
+            })?;
+            let tx = if stdout {
+                entry.raw_stdout_tx.as_ref()
+            } else {
+                entry.raw_stderr_tx.as_ref()
+            };
+            tx.ok_or_else(|| {
+                PsyError::Other(format!(
+                    "raw stdio not enabled for '{}' (set Spawn::with_raw_stdio(true))",
+                    self.name
+                ))
+            })?
+            .subscribe()
+        };
+        Ok(async_stream::stream! {
+            let mut rx = rx;
+            loop {
+                match rx.recv().await {
+                    Ok(bytes) => yield bytes,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
     }
 
     async fn subscribe_stream(
@@ -1050,6 +1218,7 @@ impl RootHandle {
             env: spawn.env,
             attach: false,
             interactive: spawn.interactive,
+            raw_stdio: spawn.raw_stdio,
             extra_args: None,
             wait_for,
             wait_timeout,
@@ -1112,6 +1281,7 @@ impl RootHandle {
             env: HashMap::new(),
             attach: false,
             interactive: false,
+            raw_stdio: false,
             extra_args: None,
             wait_for: None,
             wait_timeout: None,

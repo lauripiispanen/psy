@@ -144,6 +144,13 @@ pub struct RunArgs {
     pub attach: bool,
     #[serde(default)]
     pub interactive: bool,
+    /// Capture child stdout / stderr as raw byte chunks in addition to
+    /// the line-tokenized ring buffer. Used by the embedded API
+    /// ([`crate::api::SpawnHandle::stdout_bytes`]) for hosts that need
+    /// byte-faithful framing (Content-Length JSON-RPC, length-prefixed
+    /// binary protocols, etc.). No effect on the wire CLI/MCP paths.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_stdio: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

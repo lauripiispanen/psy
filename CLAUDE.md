@@ -91,6 +91,12 @@ psy/
 - [x] psy-core diagnostics migrated from `eprintln!` to `tracing::warn!` / `tracing::error!` under target `psy`. CLI installs `tracing-subscriber` honoring `RUST_LOG` (defaults to `psy=warn`); embedded hosts that don't install a subscriber stay silent.
 - [x] `embedded_fixture` example + `tests/embedded.rs` integration tests (15 tests covering smoke, runtime injection (current_thread + explicit handle), in-process sub-root isolation, programmatic dependency graph, typed errors, log sink + on_event hooks, SpawnHandle streaming + events + pid_watch, host-SIGKILL cleanup (host re-dispatch + external sidecar binary), shutdown exit code propagation, spawn_psy_subroot helper, OutOfProcess rejection).
 
+### v2.2 — Bidirectional Stdio
+
+- [x] `SpawnHandle::write_stdin(&[u8]) -> Result<usize, PsyError>` and `SpawnHandle::close_stdin() -> Result<(), PsyError>` — focused public stdin API. Takes raw bytes (no UTF-8 round-trip) so callers can drive framed stdio protocols (Content-Length JSON-RPC, length-prefixed binary). Bypasses the SendArgs/JSON wire-protocol detour; reaches into `entry.stdin_handle` directly under the process table lock with the same 5s backpressure timeout as `psy send`. Mirrors `tokio::process::Child::stdin` ergonomics.
+- [x] `Spawn::with_raw_stdio(bool)` opt-in flag + `SpawnHandle::stdout_bytes() / stderr_bytes() -> Stream<Vec<u8>>`. When enabled, the supervisor's capture loop switches from `BufReader::lines()` to a chunked-read pipeline that (a) broadcasts every raw read verbatim to subscribers, (b) still feeds the line-tokenized ring buffer so `psy logs` keeps working. CR is stripped from the line buffer but preserved in raw bytes. Off by default — existing line-buffered pipeline unchanged for hosts that don't need raw bytes. Plumbed through `RunArgs::raw_stdio` (serde-skipped when false) and preserved across explicit `psy restart` via the process entry.
+- [x] Pattern note: embedded hosts that can't satisfy the macOS sidecar re-dispatch contract (no `main()` they own, libtest-driven, dynamically loaded into a host they don't control) should set `SidecarStrategy::Disabled` and accept the loss of hard-kill cleanup, or ship the standalone `psy-macos-cleanup-sidecar` and use `SidecarStrategy::ExternalBinary`. README's Embedded-mode caveats section covers this.
+
 ### Core Infrastructure
 - [x] `Cargo.toml` (workspace root + per-crate manifests with `version.workspace = true`)
 - [x] `crates/psy/src/main.rs` — CLI arg parsing with clap (up, run, ps, logs, history, stop, restart, down, send, mcp, psyfile, version)

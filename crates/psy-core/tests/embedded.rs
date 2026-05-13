@@ -631,6 +631,262 @@ async fn test_embedded_spawn_psy_subroot_helper() {
     host.shutdown().await.expect("shutdown");
 }
 
+/// `SpawnHandle::write_stdin` writes raw bytes to a process's stdin
+/// when the spawn declared `interactive = true`. Spawn `cat`, write a
+/// non-newline-terminated payload followed by a marker newline, and
+/// observe the echo in the line-tokenized stdout stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_write_stdin_roundtrip() {
+    use futures_util::StreamExt;
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let host = PsyRoot::start(RootOptions::new("stdin-host"))
+        .await
+        .expect("start");
+
+    let h = host
+        .spawn(Spawn::new("echo", ["cat"]).with_interactive(true))
+        .await
+        .expect("spawn");
+
+    let mut stdout = Box::pin(h.stdout().await.expect("stdout"));
+
+    // Send a non-UTF8 payload then a newline so cat flushes it.
+    let payload: &[u8] = b"hello-via-write_stdin\n";
+    let n = h.write_stdin(payload).await.expect("write_stdin");
+    assert_eq!(n, payload.len());
+
+    let line = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+        .await
+        .expect("stdout timeout")
+        .expect("stream closed early");
+    assert!(
+        line.content.contains("hello-via-write_stdin"),
+        "expected echo; got: {}",
+        line.content
+    );
+
+    h.stop().await.expect("stop");
+    host.shutdown().await.expect("shutdown");
+}
+
+/// `write_stdin` on a non-interactive process must surface an error
+/// rather than panicking or silently dropping bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_write_stdin_rejects_non_interactive() {
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let host = PsyRoot::start(RootOptions::new("stdin-noninter"))
+        .await
+        .expect("start");
+
+    let h = host
+        .spawn(Spawn::new("idle", ["sleep", "30"]))
+        .await
+        .expect("spawn");
+
+    let result = h.write_stdin(b"data").await;
+    match result {
+        Ok(_) => panic!("write_stdin to non-interactive spawn should fail"),
+        Err(e) => {
+            let s = e.to_string();
+            assert!(
+                s.contains("interactive"),
+                "error should mention interactive mode; got: {s}"
+            );
+        }
+    }
+
+    h.stop().await.expect("stop");
+    host.shutdown().await.expect("shutdown");
+}
+
+/// `SpawnHandle::close_stdin` sends EOF to the supervised child;
+/// `cat` then exits cleanly. Verify wait() returns and subsequent
+/// write_stdin calls error out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_close_stdin_triggers_eof() {
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let host = PsyRoot::start(RootOptions::new("eof-host"))
+        .await
+        .expect("start");
+
+    let h = host
+        .spawn(Spawn::new("echo", ["cat"]).with_interactive(true))
+        .await
+        .expect("spawn");
+
+    h.write_stdin(b"line-before-eof\n")
+        .await
+        .expect("write_stdin");
+    h.close_stdin().await.expect("close_stdin");
+
+    // cat should exit when its stdin reaches EOF.
+    let status = tokio::time::timeout(Duration::from_secs(5), h.wait())
+        .await
+        .expect("wait timeout")
+        .expect("wait err");
+    assert_eq!(
+        status.exit_code,
+        Some(0),
+        "cat should exit 0 after EOF: {status:?}"
+    );
+
+    // Further write_stdin must error.
+    assert!(
+        h.write_stdin(b"never-arrives").await.is_err(),
+        "write_stdin after close_stdin must fail"
+    );
+
+    host.shutdown().await.expect("shutdown");
+}
+
+/// Without `with_raw_stdio(true)`, `stdout_bytes()` returns an error
+/// instead of silently subscribing to a never-fed channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_stdout_bytes_requires_opt_in() {
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let host = PsyRoot::start(RootOptions::new("raw-optin"))
+        .await
+        .expect("start");
+
+    let h = host
+        .spawn(Spawn::new("idle", ["sleep", "30"]))
+        .await
+        .expect("spawn");
+
+    let result = h.stdout_bytes().await;
+    match result {
+        Ok(_) => panic!("stdout_bytes without with_raw_stdio should fail"),
+        Err(e) => {
+            let s = e.to_string();
+            assert!(
+                s.contains("raw stdio"),
+                "error should mention raw stdio; got: {s}"
+            );
+        }
+    }
+
+    h.stop().await.expect("stop");
+    host.shutdown().await.expect("shutdown");
+}
+
+/// `with_raw_stdio(true)` surfaces partial (non-newline-terminated)
+/// output verbatim on `stdout_bytes()` — proving the raw stream
+/// preserves byte boundaries and isn't line-buffered like `stdout()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_stdout_bytes_delivers_partial_chunks() {
+    use futures_util::StreamExt;
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let host = PsyRoot::start(RootOptions::new("raw-bytes-host"))
+        .await
+        .expect("start");
+
+    // The child prints "partial-frame-no-newline" with no trailing \n
+    // and then sleeps. A line-tokenized stream would never yield this
+    // (no newline), but the raw byte stream must surface it.
+    let h = host
+        .spawn(
+            Spawn::new(
+                "framed",
+                ["sh", "-c", "printf partial-frame-no-newline; sleep 30"],
+            )
+            .with_raw_stdio(true),
+        )
+        .await
+        .expect("spawn");
+
+    let mut bytes = Box::pin(h.stdout_bytes().await.expect("stdout_bytes"));
+
+    // Collect raw chunks until we've seen the expected payload, with a
+    // bounded timeout. (printf may flush in one chunk on a pipe, but
+    // we don't assume that.)
+    let mut accum: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, bytes.next()).await {
+            Ok(Some(chunk)) => {
+                accum.extend_from_slice(&chunk);
+                if accum
+                    .windows(b"partial-frame-no-newline".len())
+                    .any(|w| w == b"partial-frame-no-newline")
+                {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let as_str = String::from_utf8_lossy(&accum);
+    assert!(
+        as_str.contains("partial-frame-no-newline"),
+        "raw stdout should surface the partial frame; got: {as_str:?}"
+    );
+
+    h.stop().await.expect("stop");
+    host.shutdown().await.expect("shutdown");
+}
+
+/// With `with_raw_stdio(true)`, the line-tokenized `stdout()` ring
+/// buffer must still receive newline-terminated content. Verifies the
+/// chunked-read pipeline still feeds the line splitter so `psy logs`
+/// keeps working for raw-stdio processes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+#[allow(clippy::await_holding_lock)]
+async fn test_embedded_raw_stdio_still_feeds_line_buffer() {
+    use futures_util::StreamExt;
+    use psy_core::{PsyRoot, RootOptions, Spawn};
+
+    let _g = ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let host = PsyRoot::start(RootOptions::new("raw-and-lines-host"))
+        .await
+        .expect("start");
+
+    let h = host
+        .spawn(
+            Spawn::new("dual", ["sh", "-c", "echo line-from-dual && sleep 30"])
+                .with_raw_stdio(true),
+        )
+        .await
+        .expect("spawn");
+
+    // The line-tokenized stream still works for raw-stdio processes.
+    let mut lines = Box::pin(h.stdout().await.expect("stdout"));
+    let line = tokio::time::timeout(Duration::from_secs(5), lines.next())
+        .await
+        .expect("stdout timeout")
+        .expect("stream closed early");
+    assert!(
+        line.content.contains("line-from-dual"),
+        "line buffer should still receive content; got: {}",
+        line.content
+    );
+
+    h.stop().await.expect("stop");
+    host.shutdown().await.expect("shutdown");
+}
+
 /// Find the standalone psy-macos-cleanup-sidecar binary. Mirrors
 /// `embedded_fixture_bin` but points at the workspace bin target.
 fn standalone_sidecar_bin() -> PathBuf {

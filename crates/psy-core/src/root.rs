@@ -577,6 +577,7 @@ pub(crate) async fn prepare_root_runtime_with_bind(
                     env: HashMap::new(),
                     attach: false,
                     interactive: false,
+                    raw_stdio: false,
                     extra_args: None,
                     wait_for: None,
                     wait_timeout: None,
@@ -1024,6 +1025,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
                         env: HashMap::new(),
                         attach: false,
                         interactive: false,
+                        raw_stdio: false,
                         extra_args: None,
                         wait_for: None,
                         wait_timeout: None,
@@ -1245,6 +1247,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
             ready,
             healthcheck,
             unit.sub_root,
+            args.raw_stdio,
         )
         .await;
         return apply_wait_for(
@@ -1389,6 +1392,7 @@ async fn handle_run_inner(root: &Arc<SharedRoot>, req: &Request) -> HandleResult
         ready_cfg,
         healthcheck_cfg,
         false,
+        args.raw_stdio,
     )
     .await;
     apply_wait_for(root, &req.id, &process_name, wait_for, wait_timeout, result).await
@@ -1681,6 +1685,7 @@ async fn spawn_process(
     ready_config: Option<crate::psyfile::ProbeConfig>,
     healthcheck_config: Option<crate::psyfile::ProbeConfig>,
     is_subroot: bool,
+    raw_stdio: bool,
 ) -> HandleResult {
     let mut table = root.process_table.lock().await;
 
@@ -1705,6 +1710,14 @@ async fn spawn_process(
     entry.working_dir = working_dir;
     entry.is_subroot = is_subroot;
     entry.log_sink = root.log_sink.clone();
+    if raw_stdio {
+        entry.raw_stdio = true;
+        // Capacity 256: enough headroom for short bursts before slow
+        // subscribers drop into Lagged; the stream adapter filters
+        // Lagged so subscribers self-recover without surfacing the gap.
+        entry.raw_stdout_tx = Some(tokio::sync::broadcast::channel::<Vec<u8>>(256).0);
+        entry.raw_stderr_tx = Some(tokio::sync::broadcast::channel::<Vec<u8>>(256).0);
+    }
 
     // Configure readiness probes
     let is_exit_probe = matches!(
@@ -2189,7 +2202,7 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
     let unit_def = psyfile.as_ref().and_then(|pf| pf.units.get(unit_name));
 
     // Get info needed to stop
-    let (pid, old_command, old_env, old_restart, old_working_dir) = {
+    let (pid, old_command, old_env, old_restart, old_working_dir, old_raw_stdio) = {
         let mut table = root.process_table.lock().await;
         match table.get_mut(&args.name) {
             Some(entry) => {
@@ -2200,6 +2213,7 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
                     entry.env.clone(),
                     entry.restart_policy,
                     entry.working_dir.clone(),
+                    entry.raw_stdio,
                 )
             }
             None => return Response::err(&req.id, format!("process '{}' not found", args.name)),
@@ -2352,6 +2366,11 @@ async fn handle_restart_inner(root: &Arc<SharedRoot>, req: &Request) -> Response
         entry.current_run_id = next_id;
         entry.working_dir = working_dir;
         entry.is_subroot = unit_def.map(|u| u.sub_root).unwrap_or(false);
+        if old_raw_stdio {
+            entry.raw_stdio = true;
+            entry.raw_stdout_tx = Some(tokio::sync::broadcast::channel::<Vec<u8>>(256).0);
+            entry.raw_stderr_tx = Some(tokio::sync::broadcast::channel::<Vec<u8>>(256).0);
+        }
 
         // Configure readiness probes (already interpolated above)
         let ready_config = ready_cfg;

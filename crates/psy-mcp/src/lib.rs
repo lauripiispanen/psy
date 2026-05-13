@@ -430,6 +430,7 @@ fn handle_tool_call(tool_name: &str, args: &Value) -> Result<Value, String> {
                 env,
                 attach: false,
                 interactive,
+                raw_stdio: false,
                 extra_args,
                 wait_for,
                 wait_timeout,

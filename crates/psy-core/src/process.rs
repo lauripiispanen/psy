@@ -144,6 +144,17 @@ pub struct ProcessEntry {
     /// and exit (set to `None` when the process is no longer running).
     /// `SpawnHandle::pid_watch()` subscribes here.
     pub pid_tx: tokio::sync::watch::Sender<Option<u32>>,
+    /// Whether to capture child stdout/stderr as raw byte chunks (in
+    /// addition to the line-tokenized ring buffer). Set at spawn time
+    /// and preserved across restarts so the broadcast subscribers keep
+    /// receiving from each new run without re-subscribing.
+    pub raw_stdio: bool,
+    /// Broadcast of raw stdout chunks. `Some` iff `raw_stdio` is true.
+    /// Subscribers receive owned byte vectors at the cadence the read
+    /// loop produces them (typically pipe-buffer-sized chunks).
+    pub raw_stdout_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    /// Broadcast of raw stderr chunks. See [`raw_stdout_tx`].
+    pub raw_stderr_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 }
 
 impl ProcessEntry {
@@ -190,6 +201,9 @@ impl ProcessEntry {
             log_sink: None,
             events_tx: tokio::sync::broadcast::channel(64).0,
             pid_tx: tokio::sync::watch::channel(None).0,
+            raw_stdio: false,
+            raw_stdout_tx: None,
+            raw_stderr_tx: None,
         }
     }
 
@@ -412,17 +426,44 @@ fn spawn_child_inner(
         let sink = entry.log_sink.clone();
         let proc_name = entry.name.clone();
         let run_id = entry.current_run_id;
+        let raw_stdio = entry.raw_stdio;
+        let raw_stdout_tx = entry.raw_stdout_tx.clone();
+        let raw_stderr_tx = entry.raw_stderr_tx.clone();
         if let Some(stdout) = child.stdout.take() {
             let buf = Arc::clone(&entry.stdout_buf);
             let sink = sink.clone();
             let name = proc_name.clone();
-            tokio::spawn(capture_output(stdout, buf, sink, name, run_id));
+            if raw_stdio {
+                tokio::spawn(capture_output_raw(
+                    stdout,
+                    buf,
+                    raw_stdout_tx,
+                    Stream::Stdout,
+                    sink,
+                    name,
+                    run_id,
+                ));
+            } else {
+                tokio::spawn(capture_output(stdout, buf, sink, name, run_id));
+            }
         }
         if let Some(stderr) = child.stderr.take() {
             let buf = Arc::clone(&entry.stderr_buf);
             let sink = sink.clone();
             let name = proc_name.clone();
-            tokio::spawn(capture_stderr(stderr, buf, sink, name, run_id));
+            if raw_stdio {
+                tokio::spawn(capture_output_raw(
+                    stderr,
+                    buf,
+                    raw_stderr_tx,
+                    Stream::Stderr,
+                    sink,
+                    name,
+                    run_id,
+                ));
+            } else {
+                tokio::spawn(capture_stderr(stderr, buf, sink, name, run_id));
+            }
         }
     }
 
@@ -455,6 +496,80 @@ pub async fn capture_output(
             );
         }
         buf.push(Stream::Stdout, line);
+    }
+}
+
+/// Chunked-read capture for processes with `raw_stdio = true`. Reads
+/// raw bytes from the pipe, broadcasts each chunk verbatim to `raw_tx`,
+/// and feeds the same bytes through a line splitter so the ring buffer
+/// (and `psy logs`) still works.
+///
+/// Generic over both `ChildStdout` and `ChildStderr` so a single
+/// function handles both streams.
+pub async fn capture_output_raw<R>(
+    src: R,
+    buf: Arc<RingBuffer>,
+    raw_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    stream: Stream,
+    sink: Option<Arc<dyn crate::api::LogSink>>,
+    process_name: String,
+    run_id: u32,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let mut src = src;
+    let mut chunk = [0u8; 8192];
+    let mut line_accum: Vec<u8> = Vec::with_capacity(256);
+    let sink_stream = match stream {
+        Stream::Stdout => crate::protocol::StreamKind::Stdout,
+        Stream::Stderr => crate::protocol::StreamKind::Stderr,
+        _ => crate::protocol::StreamKind::Stdout,
+    };
+    loop {
+        let n = match src.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let slice = &chunk[..n];
+
+        if let Some(ref tx) = raw_tx {
+            let _ = tx.send(slice.to_vec());
+        }
+
+        for &b in slice {
+            if b == b'\n' {
+                let line = String::from_utf8_lossy(&line_accum).into_owned();
+                if let Some(ref s) = sink {
+                    s.on_line(
+                        &process_name,
+                        run_id,
+                        sink_stream,
+                        chrono::Utc::now(),
+                        &line,
+                    );
+                }
+                buf.push(stream, line);
+                line_accum.clear();
+            } else if b != b'\r' {
+                line_accum.push(b);
+            }
+        }
+    }
+
+    if !line_accum.is_empty() {
+        let line = String::from_utf8_lossy(&line_accum).into_owned();
+        if let Some(ref s) = sink {
+            s.on_line(
+                &process_name,
+                run_id,
+                sink_stream,
+                chrono::Utc::now(),
+                &line,
+            );
+        }
+        buf.push(stream, line);
     }
 }
 
@@ -612,5 +727,108 @@ mod tests {
     fn on_failure_max_reached() {
         let entry = make_entry(RestartPolicy::OnFailure, 5);
         assert!(!should_restart(&entry, Some(1)));
+    }
+
+    // -- capture_output_raw --------------------------------------------------
+
+    /// Feed `data` through capture_output_raw and return what reached the
+    /// ring buffer (as line contents) and what reached the raw broadcast
+    /// (as a single concatenated `Vec<u8>`).
+    async fn run_raw_capture(data: &[u8]) -> (Vec<String>, Vec<u8>) {
+        use tokio::io::AsyncWriteExt;
+        let (rx, mut tx) = tokio::io::duplex(64);
+        let buf = Arc::new(RingBuffer::new());
+        let (raw_tx, mut raw_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+
+        let buf_clone = Arc::clone(&buf);
+        let handle = tokio::spawn(async move {
+            capture_output_raw(
+                rx,
+                buf_clone,
+                Some(raw_tx),
+                Stream::Stdout,
+                None,
+                "test".into(),
+                1,
+            )
+            .await;
+        });
+
+        tx.write_all(data).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let mut raw = Vec::new();
+        while let Ok(chunk) = raw_rx.try_recv() {
+            raw.extend_from_slice(&chunk);
+        }
+
+        let lines: Vec<String> = buf
+            .lines(None, Default::default(), None, None, None)
+            .into_iter()
+            .map(|l| l.content)
+            .collect();
+        (lines, raw)
+    }
+
+    #[tokio::test]
+    async fn raw_capture_splits_lines_for_ring_buffer() {
+        let (lines, raw) = run_raw_capture(b"one\ntwo\nthree\n").await;
+        assert_eq!(lines, vec!["one", "two", "three"]);
+        assert_eq!(raw, b"one\ntwo\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn raw_capture_passes_bytes_verbatim_to_broadcast() {
+        // Non-UTF8 byte (0xFF) must come through raw intact. The line
+        // buffer will lossy-decode it but the raw stream must not
+        // transform it.
+        let payload = b"\x00\x01\xffhello\nworld";
+        let (_, raw) = run_raw_capture(payload).await;
+        assert_eq!(raw, payload);
+    }
+
+    #[tokio::test]
+    async fn raw_capture_flushes_trailing_partial_line() {
+        // Final line has no \n — should still surface in the ring buffer
+        // when the read returns EOF.
+        let (lines, raw) = run_raw_capture(b"complete\npartial").await;
+        assert_eq!(lines, vec!["complete", "partial"]);
+        assert_eq!(raw, b"complete\npartial");
+    }
+
+    #[tokio::test]
+    async fn raw_capture_strips_cr_from_line_buffer_but_not_raw() {
+        // \r is dropped from the line buffer (so Windows-style \r\n
+        // doesn't produce a trailing CR in `psy logs`) but the raw
+        // stream preserves the original bytes verbatim.
+        let (lines, raw) = run_raw_capture(b"hi\r\nbye\r\n").await;
+        assert_eq!(lines, vec!["hi", "bye"]);
+        assert_eq!(raw, b"hi\r\nbye\r\n");
+    }
+
+    #[tokio::test]
+    async fn raw_capture_handles_no_sink_no_broadcast() {
+        // No LogSink, no raw broadcast: must still drain the stream
+        // and populate the ring buffer without panicking.
+        use tokio::io::AsyncWriteExt;
+        let (rx, mut tx) = tokio::io::duplex(64);
+        let buf = Arc::new(RingBuffer::new());
+
+        let buf_clone = Arc::clone(&buf);
+        let handle = tokio::spawn(async move {
+            capture_output_raw(rx, buf_clone, None, Stream::Stdout, None, "test".into(), 1).await;
+        });
+
+        tx.write_all(b"alpha\nbeta\n").await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let contents: Vec<String> = buf
+            .lines(None, Default::default(), None, None, None)
+            .into_iter()
+            .map(|l| l.content)
+            .collect();
+        assert_eq!(contents, vec!["alpha", "beta"]);
     }
 }

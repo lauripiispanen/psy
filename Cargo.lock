@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "psy"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "psy-client"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "psy-core",
  "serde_json",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "psy-core"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -579,14 +579,14 @@ dependencies = [
 
 [[package]]
 name = "psy-macos-cleanup-sidecar"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "psy-core",
 ]
 
 [[package]]
 name = "psy-mcp"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "psy-client",
  "psy-core",

@@ -523,6 +523,7 @@ command = "echo 'hello world'"
                     env,
                     attach: false,
                     interactive,
+                    raw_stdio: false,
                     extra_args: extra,
                     wait_for: wait_for_value,
                     wait_timeout: wait_timeout_value,
